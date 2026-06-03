@@ -59,11 +59,21 @@ def check_tagging() -> None:
     )
     _assert(tagging.tag_msg_type("리포트 요약", 0, "analyst") == "report", "tier=analyst → report")
     _assert(tagging.tag_msg_type("ㅎㅇ", 0, None) == "chat", "짧고 코드없음 → chat")
+    _assert(
+        tagging.tag_msg_type("삼성전자 수급 동향 정리한 긴 분석 글입니다", 1, None) == "general",
+        "코드 있고 신호 없는 글 → general(폴백)",
+    )
 
     print("  tier 휴리스틱:")
     _assert(tagging.classify_tier("[키움 반도체] 김소원") == "analyst", "증권사명 → analyst")
     _assert(tagging.classify_tier("스몰인사이트리서치") == "research", "리서치 → research")
     _assert(tagging.classify_tier("실시간 단타방") == "info", "그 외 → info")
+    _assert(tagging.classify_tier("DB증권 Tech") == "analyst", "'증권' 포함 → analyst")
+
+    print("  추출 튜닝 회귀:")
+    # 하이닉스 alias → SK하이닉스(000660). '하이닉스' 부분일치가 '이닉스' 오탐을 막음.
+    codes = {c for c, _ in extract_mentions("삼성전자와 하이닉스 수급 쏠림 격차")}
+    _assert("000660" in codes, "'하이닉스' → SK하이닉스(000660) 매칭")
 
 
 def check_tier_seed_and_manual() -> None:

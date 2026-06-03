@@ -181,7 +181,7 @@ mcp = FastMCP(
 ## 수집 메타데이터 (수집 시점 자동 태깅)
 
 각 메시지·종목 샘플에는 다음이 함께 옵니다(룰베이스, 추측 금지 원칙은 동일):
-- sentiment(positive/negative/neutral), msg_type(report/breaking/gossip/chat)
+- sentiment(positive/negative/neutral), msg_type(report/breaking/gossip/chat/general)
 - views/forwards(조회수·확산), forwarded_from(포워드 원본 채널명)
 - trending 의 baseline_ratio: 현재 일평균 언급 / 7일 일평균(1 초과면 평소보다 활발).
 - 채널 tier·weight: 같은 언급도 analyst > gossip 로 신뢰도가 다름(가중 근거).

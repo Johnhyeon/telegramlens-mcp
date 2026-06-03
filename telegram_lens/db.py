@@ -41,7 +41,7 @@ _MESSAGES_V2_COLUMNS: dict[str, str] = {
     "views": "INTEGER",
     "forwards": "INTEGER",
     "sentiment": "TEXT",       # positive | negative | neutral
-    "msg_type": "TEXT",        # report | breaking | gossip | chat
+    "msg_type": "TEXT",        # report | breaking | gossip | chat | general
 }
 
 # v3: 중복제거·원본추적용. cluster_id = 정규 클러스터 키(원본+파생본이 같은 값으로 수렴),

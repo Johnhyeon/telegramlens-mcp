@@ -18,8 +18,18 @@ from telegram_lens import db
 from telegram_lens.stocks import load_source_firms, load_stocks
 
 # ── 감성 키워드 ─────────────────────────────────────────────────────
-_POS = ("상향", "급등", "돌파", "신고가", "수혜", "매수", "강세", "호실적")
-_NEG = ("하향", "급락", "우려", "매도", "실망", "리스크", "약세", "부진")
+# 실데이터에서 neutral 85% 로 치우쳐(키워드 8개) recall 보강. 증시 텔레그램 통용어 위주로
+# 확장하되, 중립 공시 보일러플레이트를 긍/부로 오분류할 단어는 배제.
+_POS = (
+    "상향", "급등", "돌파", "신고가", "수혜", "매수", "강세", "호실적",
+    "호재", "흑자", "턴어라운드", "서프라이즈", "사상최대", "최대실적", "수주",
+    "호조", "반등", "급반등", "비중확대", "강력매수", "신고가경신", "급등주",
+)
+_NEG = (
+    "하향", "급락", "우려", "매도", "실망", "리스크", "약세", "부진",
+    "악재", "적자", "쇼크", "신저가", "손절", "폭락", "감액", "횡령",
+    "상폐", "거래정지", "비중축소", "어닝쇼크", "전환사채", "유상증자",
+)
 
 
 def tag_sentiment(text: str) -> str:
@@ -54,13 +64,15 @@ def _has_brokerage(text: str) -> bool:
 
 
 def tag_msg_type(text: str, code_count: int, tier: str | None) -> str:
-    """report / breaking / gossip / chat.
+    """report / breaking / gossip / chat / general.
 
-    우선순위: gossip(채널 tier) > breaking > report > chat(fallback).
+    우선순위: gossip(채널 tier) > breaking > report > chat(엄격) > general(나머지).
       - gossip : 채널이 찌라시 tier 로 분류된 경우(성격이 채널에 종속).
       - breaking: [속보]·❗️·시각 패턴.
       - report : TP/목표주가/투자의견·증권사명 인용·애널리스트/리서치 채널.
-      - chat   : 종목코드 없음 + 짧은 본문. (그 외 미매칭도 chat 으로 보수 기록)
+      - chat   : 종목코드 없음 + 짧은 본문(스펙 정의 그대로 엄격 적용).
+      - general: 위 어디에도 안 맞는 실속 글(종목 언급 분석·정보성). chat 폴백이 긴 글을
+                 삼키던 문제(실데이터 chat 80%, 그중 51%가 100자+)를 분리한 라벨.
     """
     text = text or ""
     if tier == "gossip":
@@ -75,7 +87,7 @@ def tag_msg_type(text: str, code_count: int, tier: str | None) -> str:
         return "report"
     if code_count == 0 and len(text) < _CHAT_MAX_LEN:
         return "chat"
-    return "chat"  # fallback — 스펙이 4종만 정의. 가장 보수적으로 chat.
+    return "general"
 
 
 # ── 채널 tier 휴리스틱 시드 ─────────────────────────────────────────
@@ -106,9 +118,11 @@ def classify_tier(title: str | None) -> str:
     """채널 title 휴리스틱 → tier. gossip 은 title 만으론 신뢰 어려워 수동에 맡긴다.
 
     analyst(증권사 운영) > research(독립리서치 신호) > info(기본값).
+    실데이터에서 info 가 137채널 중 97개로 과다 → title 에 '증권'이 들어가면 증권사
+    리서치 채널로 보고 analyst recall 을 넓힌다(명시 브로커리스트가 못 잡는 변형 표기 흡수).
     """
     t = title or ""
-    if any(b in t for b in _BROKERAGES):
+    if any(b in t for b in _BROKERAGES) or "증권" in t:
         return "analyst"
     low = t.lower()
     if any(h.lower() in low for h in _RESEARCH_HINTS):
