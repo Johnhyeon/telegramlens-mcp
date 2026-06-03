@@ -31,8 +31,11 @@ _VIEW_HORIZONS: dict[str, tuple[float, float]] = {
 # 정상 사이클(짧은 창)에서만 조회수 refresh 를 돌린다. 다운타임 캐치업/백필(큰 창)에선
 # 메시지가 많아 FloodWait 위험이 커지므로 건너뛴다.
 _VIEWS_REFRESH_MAX_WINDOW_MIN = 180
-# 조회수 refresh 사이클당 메시지 상한(FloodWait 방지).
-_VIEWS_REFRESH_CAP = 200
+# 조회수 refresh 사이클당 메시지 상한. get_messages(ids) 는 채널당 100개 배치라 요청 수가
+# 적어 FloodWait 위험이 낮다. 옛→새 데몬 전환 직후엔 collect-views 가 없는 백로그가 수천 건
+# 생기는데, 너무 낮으면 6h 윈도우(폭 3h) 안에 다 못 돌아 일부가 24h 를 넘겨 영구 NULL 이
+# 된다 → 호라이즌 안에 확실히 비우도록 상향.
+_VIEWS_REFRESH_CAP = 400
 # 베이스라인을 다시 계산할 주기(분). 이보다 오래됐으면 사이클 끝에 재계산.
 _BASELINE_REFRESH_MIN = 360
 # 복붙 중복 휴리스틱 병합을 적용할 최근 구간(시간). 교차 사이클 복사도 잡되 저렴하게.
