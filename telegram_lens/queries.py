@@ -8,12 +8,30 @@ AI에게 raw 덤프 대신 구조화 요약을 준다. 토큰 절약 + 노이즈
 from __future__ import annotations
 
 import math
+import re
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from telegram_lens import db
 
 _KST = ZoneInfo("Asia/Seoul")
+
+# 본문 속 URL. 공백·닫는 괄호·따옴표에서 끊고, 흔한 꼬리 구두점은 제거.
+_URL_RE = re.compile(r"https?://[^\s)\]>\"'》」』]+")
+
+
+def _extract_urls(text: str | None, limit: int = 5) -> list[str]:
+    """본문에서 URL 목록(중복 제거, 순서 보존). 샘플 텍스트가 잘려도 링크는 살아남게 별도 노출."""
+    if not text:
+        return []
+    out: list[str] = []
+    for u in _URL_RE.findall(text):
+        u = u.rstrip(".,;…·")
+        if u not in out:
+            out.append(u)
+        if len(out) >= limit:
+            break
+    return out
 
 
 def _cutoff(hours: float) -> str:
@@ -78,6 +96,7 @@ def _recent_snippets(
                 "date": _to_kst(r["date"]),
                 "channel": r["channel"],
                 "text": text,
+                "links": _extract_urls(r["text"]),  # 잘린 본문과 무관하게 원문 URL 보존
                 "sentiment": r["sentiment"],
                 "msg_type": r["msg_type"],
                 "views": r["views"],
@@ -248,6 +267,7 @@ def stock_buzz(code: str, name: str, hours: float = 24, samples: int = 8) -> dic
     for r in sample_rows:
         d = dict(r)
         d["date"] = _to_kst(d["date"])
+        d["links"] = _extract_urls(d.get("text"))
         samples.append(d)
     return {
         "code": code,
@@ -672,6 +692,7 @@ def recent_messages(
         d = dict(r)
         d["date"] = _to_kst(d["date"])
         d["forwarded_from"] = d.pop("fwd_from_chat_title")
+        d["links"] = _extract_urls(d.get("text"))
         out.append(d)
     return out
 
@@ -753,6 +774,7 @@ def search_messages(
                 "channel": r["channel"],
                 "username": r["username"],
                 "text": text,
+                "links": _extract_urls(r["text"]),
             }
         )
     return {

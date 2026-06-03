@@ -194,6 +194,29 @@ def check_baseline_and_views_query() -> None:
             _assert(due == [], f"갓 수집한 메시지는 {horizon} refresh 대상 아님")
 
 
+def check_link_field() -> None:
+    print("\n=== links 필드 (잘림 방지 URL 노출) ===")
+    # _extract_urls 단위
+    urls = queries._extract_urls("기사 봐 https://n.news.naver.com/abc 그리고 https://hankyung.com/x.")
+    _assert(urls == ["https://n.news.naver.com/abc", "https://hankyung.com/x"], f"URL 2개 추출(꼬리 . 제거), got {urls}")
+    _assert(queries._extract_urls("URL 없음") == [], "URL 없으면 빈 리스트")
+    # 긴 본문 + 끝에 링크 → 샘플 text는 잘려도 links엔 남아야
+    now = datetime.now(timezone.utc)
+    with db.connect() as conn:
+        db.upsert_channel(conn, 9100, "링크방", "linkch", 100)
+        long_text = "삼성전자 " + ("관련 내용 " * 50) + "원문 https://n.news.naver.com/article/123"
+        rid = db.insert_message(
+            conn, 9100, 30000, now.isoformat(), long_text,
+            cluster_id=cluster.canonical_key(9100, 30000, None, None),
+            text_sig=cluster.text_signature(long_text),
+        )
+        db.insert_mentions(conn, rid, 9100, now.isoformat(), [("005930", "삼성전자")])
+    buzz = queries.stock_buzz("005930", "삼성전자", hours=24, samples=10)
+    hit = [s for s in buzz["samples"] if s.get("links")]
+    _assert(any("n.news.naver.com/article/123" in (s["links"][0]) for s in hit),
+            "잘린 본문이어도 links에 원문 URL 보존")
+
+
 def check_text_signature() -> None:
     print("\n=== text_signature (정규화 서명) ===")
     a = "삼성전자 목표주가 상향! https://t.me/abc 🚀🚀 매수 추천드립니다"
@@ -464,6 +487,7 @@ def main() -> None:
     check_tier_seed_and_manual()
     check_pipeline()
     check_baseline_and_views_query()
+    check_link_field()
     check_text_signature()
     check_forward_clustering()
     check_heuristic_merge()
