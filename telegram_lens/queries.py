@@ -75,16 +75,18 @@ def trending(hours: float = 24, top: int = 20, samples_per_stock: int = 1) -> li
         rows = conn.execute(
             """
             SELECT men.code, men.name,
-                   COUNT(*)                      AS mentions,
+                   COUNT(DISTINCT m.cluster_id)  AS independent,
+                   COUNT(DISTINCT men.message_id) AS raw_messages,
                    COUNT(DISTINCT men.channel_id) AS channels,
-                   COUNT(DISTINCT men.message_id) AS messages,
+                   COALESCE(SUM(m.forwards), 0)  AS total_forwards,
                    MAX(men.date)                 AS last_seen,
                    b.avg_7d                      AS baseline_avg_7d
             FROM mentions men
+            JOIN messages m ON m.id = men.message_id
             LEFT JOIN stock_baseline b ON b.code = men.code
             WHERE men.date >= ?
             GROUP BY men.code
-            ORDER BY messages DESC, channels DESC
+            ORDER BY independent DESC, channels DESC
             LIMIT ?
             """,
             (cut, top),
@@ -93,10 +95,12 @@ def trending(hours: float = 24, top: int = 20, samples_per_stock: int = 1) -> li
         for r in rows:
             d = dict(r)
             d["last_seen"] = _to_kst(d["last_seen"])
-            # 이상 신호 배율: 현재 구간 일평균 언급 / 7일 일평균. baseline 없으면 None.
+            # 확산 강도: 독립 클러스터 외에 복사/포워드로 더 퍼진 양.
+            d["spread_copies"] = d["raw_messages"] - d["independent"]
+            # 이상 신호 배율: 현재 구간 독립 언급 일평균 / 7일 일평균. baseline 없으면 None.
             avg = d.pop("baseline_avg_7d", None)
             if avg and avg > 0:
-                current_daily = d["messages"] / (hours / 24)
+                current_daily = d["independent"] / (hours / 24)
                 d["baseline_avg_7d"] = round(avg, 2)
                 d["baseline_ratio"] = round(current_daily / avg, 2)
             else:
@@ -122,14 +126,18 @@ def momentum(
     base_cut = (now - timedelta(hours=baseline_hours)).isoformat()
 
     with db.connect() as conn:
+        # 독립 언급(클러스터) 기준 — 같은 글의 포워드/복붙이 spike 를 부풀리지 않게.
         recent = {
             r["code"]: dict(r)
             for r in conn.execute(
                 """
-                SELECT code, name, COUNT(DISTINCT message_id) AS m,
-                       COUNT(DISTINCT channel_id) AS ch
-                FROM mentions WHERE date >= ?
-                GROUP BY code
+                SELECT men.code, men.name,
+                       COUNT(DISTINCT m.cluster_id) AS m,
+                       COUNT(DISTINCT men.channel_id) AS ch
+                FROM mentions men
+                JOIN messages m ON m.id = men.message_id
+                WHERE men.date >= ?
+                GROUP BY men.code
                 """,
                 (recent_cut,),
             ).fetchall()
@@ -138,9 +146,11 @@ def momentum(
             r["code"]: r["m"]
             for r in conn.execute(
                 """
-                SELECT code, COUNT(DISTINCT message_id) AS m
-                FROM mentions WHERE date >= ? AND date < ?
-                GROUP BY code
+                SELECT men.code, COUNT(DISTINCT m.cluster_id) AS m
+                FROM mentions men
+                JOIN messages m ON m.id = men.message_id
+                WHERE men.date >= ? AND men.date < ?
+                GROUP BY men.code
                 """,
                 (base_cut, recent_cut),
             ).fetchall()
@@ -183,10 +193,14 @@ def stock_buzz(code: str, name: str, hours: float = 24, samples: int = 8) -> dic
     with db.connect() as conn:
         agg = conn.execute(
             """
-            SELECT COUNT(DISTINCT message_id) AS messages,
-                   COUNT(DISTINCT channel_id) AS channels,
-                   MIN(date) AS first_seen, MAX(date) AS last_seen
-            FROM mentions WHERE code = ? AND date >= ?
+            SELECT COUNT(DISTINCT m.cluster_id)  AS independent,
+                   COUNT(DISTINCT men.message_id) AS raw_messages,
+                   COUNT(DISTINCT men.channel_id) AS channels,
+                   COALESCE(SUM(m.forwards), 0)  AS total_forwards,
+                   MIN(men.date) AS first_seen, MAX(men.date) AS last_seen
+            FROM mentions men
+            JOIN messages m ON m.id = men.message_id
+            WHERE men.code = ? AND men.date >= ?
             """,
             (code, cut),
         ).fetchone()
@@ -207,6 +221,7 @@ def stock_buzz(code: str, name: str, hours: float = 24, samples: int = 8) -> dic
 
     summary = dict(agg) if agg else {}
     if summary:
+        summary["spread_copies"] = summary["raw_messages"] - summary["independent"]
         summary["first_seen"] = _to_kst(summary.get("first_seen"))
         summary["last_seen"] = _to_kst(summary.get("last_seen"))
     samples = []
@@ -221,6 +236,110 @@ def stock_buzz(code: str, name: str, hours: float = 24, samples: int = 8) -> dic
         "summary": summary,
         "samples": samples,
     }
+
+
+def _parse_ts(iso: str) -> float | None:
+    try:
+        dt = datetime.fromisoformat(iso)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    except ValueError:
+        return None
+
+
+def buzz_velocity(
+    code: str | None = None,
+    bucket_minutes: int = 30,
+    window_hours: float = 6,
+    spike_min: int = 5,
+    growth_threshold: float = 2.0,
+    top: int = 15,
+) -> list[dict]:
+    """종목별 독립 언급(클러스터)을 시간 버킷으로 집계해 직전 대비 증가율·급등을 감지.
+
+    버킷 인덱스 0 = 가장 최근 구간([now-bucket, now]), 1 = 그 직전. last_bucket(최근) 이
+    spike_min 이상이거나 growth(=last/prev) 가 growth_threshold 이상이면 급등(spike).
+    Phase 1 베이스라인(stock_baseline)과 결합해 평소 대비 배율도 함께 준다.
+
+    Args:
+        code: 특정 종목만(생략 시 최근 velocity 상위 top).
+        bucket_minutes: 시간 버킷 크기(분).
+        window_hours: 집계 윈도우(시간).
+        spike_min: 최근 버킷 독립 언급 급등 임계값(건).
+        growth_threshold: 직전 대비 증가율 급등 임계값(배).
+        top: code 미지정 시 상위 N개.
+    """
+    now = datetime.now(timezone.utc)
+    now_ts = now.timestamp()
+    window_cut = (now - timedelta(hours=window_hours)).isoformat()
+    bucket_sec = bucket_minutes * 60
+    nbuckets = int((window_hours * 60 + bucket_minutes - 1) // bucket_minutes)
+
+    with db.connect() as conn:
+        sql = """
+            SELECT men.code, men.name, men.date, m.cluster_id
+            FROM mentions men
+            JOIN messages m ON m.id = men.message_id
+            WHERE men.date >= ?
+        """
+        params: list = [window_cut]
+        if code:
+            sql += " AND men.code = ?"
+            params.append(code)
+        rows = conn.execute(sql, params).fetchall()
+        baselines = {
+            r["code"]: r["avg_7d"]
+            for r in conn.execute("SELECT code, avg_7d FROM stock_baseline")
+        }
+
+    # code → {name, buckets: {idx: set(cluster_id)}}. 버킷별 '독립' 카운트는 set 크기.
+    per: dict[str, dict] = {}
+    for r in rows:
+        ts = _parse_ts(r["date"])
+        if ts is None:
+            continue
+        idx = int((now_ts - ts) // bucket_sec)
+        if idx < 0:
+            idx = 0
+        e = per.setdefault(r["code"], {"name": r["name"], "buckets": {}})
+        e["buckets"].setdefault(idx, set()).add(r["cluster_id"])
+
+    out = []
+    for c, e in per.items():
+        counts = {i: len(s) for i, s in e["buckets"].items()}
+        last = counts.get(0, 0)
+        prev = counts.get(1, 0)
+        growth = round(last / max(prev, 1), 2)
+        total = sum(counts.values())
+        avg = baselines.get(c)
+        if avg and avg > 0:
+            baseline_ratio = round((total / (window_hours / 24)) / avg, 2)
+        else:
+            baseline_ratio = None
+        out.append(
+            {
+                "code": c,
+                "name": e["name"],
+                "bucket_minutes": bucket_minutes,
+                "window_hours": window_hours,
+                # 오래된→최신 순 시계열(독립 언급 수).
+                "series": [counts.get(i, 0) for i in range(nbuckets - 1, -1, -1)],
+                "last_bucket": last,
+                "prev_bucket": prev,
+                "delta": last - prev,
+                "growth": growth,
+                "spike": last >= spike_min or growth >= growth_threshold,
+                "window_independent": total,
+                "baseline_avg_7d": round(avg, 2) if avg else None,
+                "baseline_ratio": baseline_ratio,
+            }
+        )
+    # 급등 우선, 그다음 최근 버킷·증가율 순.
+    out.sort(key=lambda x: (x["spike"], x["last_bucket"], x["growth"]), reverse=True)
+    if not code:
+        out = out[:top]
+    return out
 
 
 def recent_messages(

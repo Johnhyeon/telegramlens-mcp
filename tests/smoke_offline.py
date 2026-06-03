@@ -6,7 +6,7 @@ Phase 1(고도화) 검증도 포함: 스키마 마이그레이션, 룰베이스 
 
 import os
 import tempfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 # 임시 데이터 디렉토리로 격리 (import 전에 설정)
 _TMP = tempfile.mkdtemp(prefix="tglens_test_")
@@ -15,7 +15,7 @@ os.environ["TELEGRAMLENS_HOME"] = _TMP
 from telegram_lens import db, queries  # noqa: E402
 from telegram_lens.stocks import refresh_stocks, _SEED  # noqa: E402
 from telegram_lens.extract import extract_mentions, reset_index  # noqa: E402
-from telegram_lens import tagging  # noqa: E402
+from telegram_lens import tagging, cluster  # noqa: E402
 
 
 def _assert(cond: bool, msg: str) -> None:
@@ -29,7 +29,7 @@ def check_schema() -> None:
     db.init_db()
     with db.connect() as conn:
         cols = {r["name"] for r in conn.execute("PRAGMA table_info(messages)")}
-        for c in db._MESSAGES_V2_COLUMNS:
+        for c in db._MESSAGES_ADDED_COLUMNS:  # v2 + v3 컬럼 전체
             _assert(c in cols, f"messages.{c} 컬럼 존재")
         tables = {
             r["name"]
@@ -109,6 +109,8 @@ def check_pipeline() -> None:
                 views=100 + i, forwards=i,
                 fwd_from_chat_title="원본채널" if i == 0 else None,
                 sentiment=sentiment, msg_type=msg_type,
+                cluster_id=cluster.canonical_key(1001, 5000 + i, None, None),
+                text_sig=cluster.text_signature(text),
             )
             print(f"  [{i}] 추출={mentions} sentiment={sentiment} type={msg_type}")
             if rid:
@@ -148,6 +150,99 @@ def check_baseline_and_views_query() -> None:
             _assert(due == [], f"갓 수집한 메시지는 {horizon} refresh 대상 아님")
 
 
+def check_text_signature() -> None:
+    print("\n=== text_signature (정규화 서명) ===")
+    a = "삼성전자 목표주가 상향! https://t.me/abc 🚀🚀 매수 추천드립니다"
+    b = "삼성전자  목표주가 상향  매수 추천드립니다"  # 공백·URL·이모지만 다름
+    _assert(cluster.text_signature(a) == cluster.text_signature(b), "장식만 다른 글 동일 서명")
+    _assert(cluster.text_signature("짧음") is None, "20자 미만 → None")
+    _assert(
+        cluster.canonical_key(7, 100, None, None) == "o:7:100", "원본 키 = 자기 자신"
+    )
+    _assert(
+        cluster.canonical_key(8, 200, 7, 100) == "o:7:100", "포워드 키 = 원본으로 수렴"
+    )
+
+
+def check_forward_clustering() -> None:
+    print("\n=== 포워드 클러스터링 (원본+포워드 = 1) ===")
+    text = "LG에너지솔루션 373220 수주 대박 소식, 강세 기대된다 함께 가자"
+    date = datetime.now(timezone.utc).isoformat()
+    with db.connect() as conn:
+        # 원본(채널 3001, msg 700) + 그 포워드(채널 3002, fwd=3001:700)
+        for ch, mid, fwd_chat, fwd_mid in [
+            (3001, 700, None, None),
+            (3002, 701, 3001, 700),
+        ]:
+            db.upsert_channel(conn, ch, f"채널{ch}", f"ch{ch}", 1000)
+            cid = cluster.canonical_key(ch, mid, fwd_chat, fwd_mid)
+            rid = db.insert_message(
+                conn, ch, mid, date, text,
+                fwd_from_chat_id=fwd_chat, fwd_from_message_id=fwd_mid,
+                cluster_id=cid, text_sig=cluster.text_signature(text),
+            )
+            db.insert_mentions(conn, rid, ch, date, extract_mentions(text))
+    trend = {t["code"]: t for t in queries.trending(hours=24, top=50)}
+    lg = trend["373220"]
+    _assert(lg["independent"] == 1, f"독립 언급=1 (원본+포워드 묶임), got {lg['independent']}")
+    _assert(lg["raw_messages"] == 2, f"raw_messages=2, got {lg['raw_messages']}")
+    _assert(lg["spread_copies"] == 1, f"spread_copies=1, got {lg['spread_copies']}")
+
+
+def check_heuristic_merge() -> None:
+    print("\n=== 휴리스틱 복붙 병합 ===")
+    base = "셀트리온 068270 단독 입수 정보입니다 오늘 장 마감 후 큰 거 터진다 매수"
+    now = datetime.now(timezone.utc)
+    with db.connect() as conn:
+        # 다른 두 채널이 거의 동일 텍스트를 10분 간격으로 복붙(포워드 메타 없음).
+        for ch, mid, mins, deco in [
+            (4001, 800, 0, ""),
+            (4002, 801, 10, " 🚀"),  # 장식만 차이 → 같은 서명
+        ]:
+            d = (now - timedelta(minutes=20 - mins)).isoformat()
+            db.upsert_channel(conn, ch, f"찌라시{ch}", f"jj{ch}", 5000)
+            text = base + deco
+            rid = db.insert_message(
+                conn, ch, mid, d, text,
+                cluster_id=cluster.canonical_key(ch, mid, None, None),
+                text_sig=cluster.text_signature(text),
+            )
+            db.insert_mentions(conn, rid, ch, d, extract_mentions(text))
+        merged = cluster.merge_heuristic_duplicates(conn, window_min=30)
+        _assert(merged == 1, f"복붙 1건 병합, got {merged}")
+    trend = {t["code"]: t for t in queries.trending(hours=24, top=50)}
+    cel = trend["068270"]
+    _assert(cel["independent"] == 1, f"복붙 → 독립 언급=1, got {cel['independent']}")
+    _assert(cel["raw_messages"] == 2, "raw_messages=2 보존")
+
+
+def check_velocity() -> None:
+    print("\n=== buzz_velocity (시간버킷 + 급등) ===")
+    now = datetime.now(timezone.utc)
+    code = "000660"  # SK하이닉스
+    with db.connect() as conn:
+        db.upsert_channel(conn, 5001, "벨로시티방", "velo", 9000)
+        # 가장 최근 30분 버킷에 6건(서로 다른 cluster_id) → spike_min=5 초과.
+        for k in range(6):
+            d = (now - timedelta(minutes=2 + k)).isoformat()
+            text = f"SK하이닉스 000660 급등 신호 {k} 매수세 유입 강하게 들어온다"
+            rid = db.insert_message(
+                conn, 5001, 9000 + k, d, text,
+                cluster_id=cluster.canonical_key(5001, 9000 + k, None, None),
+                text_sig=cluster.text_signature(text),
+            )
+            db.insert_mentions(conn, rid, 5001, d, [(code, "SK하이닉스")])
+    vel = {v["code"]: v for v in queries.buzz_velocity(bucket_minutes=30, window_hours=6)}
+    _assert(code in vel, "velocity 에 종목 포함")
+    sk = vel[code]
+    _assert(sk["last_bucket"] >= 5, f"최근 버킷 {sk['last_bucket']}건")
+    _assert(sk["spike"] is True, "급등 플래그 True")
+    _assert("baseline_ratio" in sk, "baseline_ratio 노출")
+    # 단일 종목 조회
+    one = queries.buzz_velocity(code=code, bucket_minutes=30, window_hours=6)
+    _assert(len(one) == 1 and one[0]["code"] == code, "code 지정 시 해당 종목만")
+
+
 def check_channels_tier_exposed() -> None:
     print("\n=== channels() tier 노출 ===")
     chans = queries.channels()
@@ -165,6 +260,10 @@ def main() -> None:
     check_tier_seed_and_manual()
     check_pipeline()
     check_baseline_and_views_query()
+    check_text_signature()
+    check_forward_clustering()
+    check_heuristic_merge()
+    check_velocity()
     check_channels_tier_exposed()
 
     print("\n=== status ===")

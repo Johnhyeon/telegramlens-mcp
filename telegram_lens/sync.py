@@ -12,7 +12,8 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 
 from telegram_lens.client import fetch_recent, make_client, refresh_views
-from telegram_lens import db
+from telegram_lens import cluster, db
+from telegram_lens.config import data_dir
 from telegram_lens.extract import extract_mentions
 from telegram_lens.tagging import seed_channel_tiers, tag_msg_type, tag_sentiment
 
@@ -34,6 +35,10 @@ _VIEWS_REFRESH_MAX_WINDOW_MIN = 180
 _VIEWS_REFRESH_CAP = 200
 # 베이스라인을 다시 계산할 주기(분). 이보다 오래됐으면 사이클 끝에 재계산.
 _BASELINE_REFRESH_MIN = 360
+# 복붙 중복 휴리스틱 병합을 적용할 최근 구간(시간). 교차 사이클 복사도 잡되 저렴하게.
+_MERGE_WINDOW_HOURS = 6
+# 업그레이드 이전 메시지 text_sig 1회 백필 깊이(일).
+_SIG_BACKFILL_DAYS = 30
 
 
 async def run_sync(
@@ -116,6 +121,12 @@ async def run_sync(
             tier = (tier_map.get(r["channel_id"]) or {}).get("tier")
             sentiment = tag_sentiment(r["text"])
             msg_type = tag_msg_type(r["text"], len(mentions), tier)
+            # 클러스터 키(포워드면 원본 키로 수렴) + 정규화 텍스트 서명(복붙 dedup용).
+            cluster_id = cluster.canonical_key(
+                r["channel_id"], r["msg_id"],
+                r.get("fwd_from_chat_id"), r.get("fwd_from_message_id"),
+            )
+            text_sig = cluster.text_signature(r["text"])
             msg_rowid = db.insert_message(
                 conn,
                 r["channel_id"],
@@ -130,6 +141,8 @@ async def run_sync(
                 fwd_from_date=r.get("fwd_from_date"),
                 sentiment=sentiment,
                 msg_type=msg_type,
+                cluster_id=cluster_id,
+                text_sig=text_sig,
             )
             if msg_rowid is None:
                 continue  # 이미 저장됨
@@ -144,6 +157,29 @@ async def run_sync(
                     conn, msg_rowid, r["channel_id"], r["date"], mentions
                 )
                 new_mentions += len(mentions)
+
+        # 업그레이드 이전 메시지 text_sig 1회 백필 + 그 구간 휴리스틱 병합(마커로 1회 게이트).
+        sig_backfilled = 0
+        marker = data_dir() / "text_sig_backfilled"
+        if not marker.exists():
+            hist_since = (now - timedelta(days=_SIG_BACKFILL_DAYS)).isoformat()
+            sig_backfilled = cluster.backfill_text_sig(conn, hist_since, limit=20000)
+            cluster.merge_heuristic_duplicates(conn, window_min=30, since_iso=hist_since)
+            try:
+                marker.write_text(
+                    datetime.now(timezone.utc).isoformat(), encoding="utf-8"
+                )
+            except OSError:
+                pass
+
+        # 복붙 중복 휴리스틱 병합 — 정상 사이클에서 최근 구간만(저렴). 큰 백필 사이클은 skip
+        # (위 1회 백필이 과거를, 이후 정상 사이클이 최근을 덮는다).
+        merged = 0
+        if minutes <= _VIEWS_REFRESH_MAX_WINDOW_MIN:
+            merge_since = (now - timedelta(hours=_MERGE_WINDOW_HOURS)).isoformat()
+            merged = cluster.merge_heuristic_duplicates(
+                conn, window_min=30, since_iso=merge_since
+            )
 
         # 베이스라인이 없거나 오래됐으면(>6h) 재계산. 사이클당 가벼운 집계 1회.
         baselines_computed = 0
@@ -161,6 +197,8 @@ async def run_sync(
         if new_channels
         else 0,
         "views_refreshed": views_refreshed,
+        "clusters_merged": merged,
+        "text_sig_backfilled": sig_backfilled,
         "baselines_computed": baselines_computed,
         "since": since.isoformat(),
         "window_minutes": minutes,

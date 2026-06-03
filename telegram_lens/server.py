@@ -168,6 +168,7 @@ mcp = FastMCP(
 먼저 `telegram_sync` 로 최근 메시지를 수집한 뒤 조회 도구를 쓰세요.
 - telegram_trending : 기간 내 언급량 상위 종목
 - telegram_momentum : 언급 급증(스파이크) 종목 — 새 내러티브 포착
+- telegram_velocity : 종목별 시간대별 언급 흐름·급등 감지(독립 언급 기준)
 - telegram_stock_buzz : 특정 종목의 언급 요약 + 원문 샘플
 - telegram_messages : 원문 메시지 drill-down (채널·시간 범위)
 - telegram_search : 원문 키워드 전문검색 — 종목 언급이 없는 거시·산업·테마 글까지 찾음
@@ -182,6 +183,8 @@ mcp = FastMCP(
 - views/forwards(조회수·확산), forwarded_from(포워드 원본 채널명)
 - trending 의 baseline_ratio: 현재 일평균 언급 / 7일 일평균(1 초과면 평소보다 활발).
 - 채널 tier·weight: 같은 언급도 analyst > gossip 로 신뢰도가 다름(가중 근거).
+- 중복제거: independent(독립 언급=클러스터 수)가 헤드라인. raw_messages 는 포워드/복붙
+  포함 원시 건수, spread_copies·total_forwards 는 확산 강도. 순위는 independent 기준.
 
 ## 과거 데이터 추가 수집 제안
 
@@ -377,6 +380,62 @@ async def telegram_momentum(
             "_guidance": _WHY_GUIDANCE,
             "stocks": queries.momentum(
                 hours=hours, baseline_hours=baseline_hours, top=top
+            ),
+        }
+    )
+
+
+def _resolve_code(query: str) -> tuple[str | None, str]:
+    """종목명/코드 입력을 (code, name) 으로 해석. 못 찾으면 (None, query)."""
+    by_code = load_stocks()
+    if query in by_code:
+        return query, by_code[query]
+    for c, n in by_code.items():
+        if n == query:
+            return c, n
+    for c, n in by_code.items():
+        if query in n:
+            return c, n
+    return None, query
+
+
+@mcp.tool()
+@safe_tool
+@warn_if_collecting
+async def telegram_velocity(
+    query: str | None = None,
+    bucket_minutes: int = 30,
+    window_hours: float = 6,
+    spike_min: int = 5,
+    top: int = 15,
+) -> str:
+    """종목별 언급의 시간대별 흐름과 급등(velocity)을 반환합니다.
+
+    독립 언급(같은 글의 포워드/복붙은 1건으로 묶음)을 시간 버킷으로 집계해, 직전 대비
+    증가율과 급등 여부를 봅니다. last_bucket(가장 최근 구간)이 spike_min 이상이거나
+    증가율이 임계값을 넘으면 spike=true. Phase1 베이스라인 배율(baseline_ratio)도 동봉.
+
+    Args:
+        query: 종목명/6자리 코드(생략 시 최근 velocity 상위 top 종목).
+        bucket_minutes: 시간 버킷 크기(분). 기본 30.
+        window_hours: 집계 윈도우(시간). 기본 6.
+        spike_min: 최근 버킷 급등 임계값(독립 언급 건수). 기본 5.
+        top: query 미지정 시 상위 N개. 기본 15.
+    """
+    code = None
+    if query:
+        code, _ = _resolve_code(query)
+        if code is None:
+            return f"⚠️ '{query}' 종목을 사전에서 찾지 못했습니다."
+    return _json(
+        {
+            "_guidance": _WHY_GUIDANCE,
+            "stocks": queries.buzz_velocity(
+                code=code,
+                bucket_minutes=bucket_minutes,
+                window_hours=window_hours,
+                spike_min=spike_min,
+                top=top,
             ),
         }
     )

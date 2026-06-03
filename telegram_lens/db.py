@@ -28,7 +28,8 @@ from telegram_lens.config import db_path
 # 스키마 버전. 1회성 마이그레이션을 user_version 으로 게이트한다.
 #   v1 = FTS 인덱스 도입
 #   v2 = 포워드 메타·views/forwards·sentiment/msg_type 컬럼 + tier/baseline/views_log 테이블
-_SCHEMA_VERSION = 2
+#   v3 = cluster_id/text_sig 컬럼(중복제거·원본추적) + 인덱스
+_SCHEMA_VERSION = 3
 
 # messages 에 v2 에서 추가된 컬럼(이름 → 선언). 신규 설치는 _SCHEMA 가, 기존 DB는
 # _migrate 의 ALTER 가 채운다. 한 곳에서 관리해 둘이 어긋나지 않게 한다.
@@ -43,8 +44,21 @@ _MESSAGES_V2_COLUMNS: dict[str, str] = {
     "msg_type": "TEXT",        # report | breaking | gossip | chat
 }
 
-_MESSAGES_V2_COLS_SQL = "".join(
-    f"    {name}        {decl},\n" for name, decl in _MESSAGES_V2_COLUMNS.items()
+# v3: 중복제거·원본추적용. cluster_id = 정규 클러스터 키(원본+파생본이 같은 값으로 수렴),
+# text_sig = 정규화 텍스트 서명(포워드 메타 없는 복붙 중복을 묶는 인덱스).
+_MESSAGES_V3_COLUMNS: dict[str, str] = {
+    "cluster_id": "TEXT",
+    "text_sig": "TEXT",
+}
+
+# 마이그레이션 ensure 루프가 순회할 '추가 컬럼' 전체(v2 + v3).
+_MESSAGES_ADDED_COLUMNS: dict[str, str] = {
+    **_MESSAGES_V2_COLUMNS,
+    **_MESSAGES_V3_COLUMNS,
+}
+
+_MESSAGES_ADDED_COLS_SQL = "".join(
+    f"    {name}        {decl},\n" for name, decl in _MESSAGES_ADDED_COLUMNS.items()
 )
 
 _SCHEMA = f"""
@@ -62,9 +76,10 @@ CREATE TABLE IF NOT EXISTS messages (
     msg_id      INTEGER NOT NULL,
     date        TEXT NOT NULL,                -- ISO8601 UTC
     text        TEXT NOT NULL,
-{_MESSAGES_V2_COLS_SQL}    UNIQUE(channel_id, msg_id)
+{_MESSAGES_ADDED_COLS_SQL}    UNIQUE(channel_id, msg_id)
 );
 CREATE INDEX IF NOT EXISTS idx_messages_date ON messages(date);
+-- cluster_id/text_sig 인덱스는 컬럼 ALTER 이후라야 만들 수 있어 _migrate 에서 생성.
 
 -- 채널 성격 분류 + 버즈스코어 가중치. source='manual' 은 휴리스틱 재시드가 덮어쓰지 않음.
 CREATE TABLE IF NOT EXISTS channel_tier (
@@ -138,7 +153,9 @@ END;
 CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages BEGIN
     INSERT INTO messages_fts(messages_fts, rowid, text) VALUES('delete', old.id, old.text);
 END;
-CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE ON messages BEGIN
+-- text 가 바뀔 때만 재색인. views/cluster_id/sentiment 등 비-text 컬럼 UPDATE(매 사이클
+-- 발생하는 조회수 갱신·클러스터 병합)에서 불필요한 FTS 재색인이 일어나지 않게 한다.
+CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE OF text ON messages BEGIN
     INSERT INTO messages_fts(messages_fts, rowid, text) VALUES('delete', old.id, old.text);
     INSERT INTO messages_fts(rowid, text) VALUES (new.id, new.text);
 END;
@@ -182,12 +199,50 @@ def _migrate(conn: sqlite3.Connection) -> None:
     if ver < 1:
         conn.execute("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')")
 
-    # v2: messages 의 포워드/조회수/태그 컬럼. 신규 DB 는 _SCHEMA 에 이미 있고, 기존 DB 만
-    # 여기서 채워진다. 항상 검사(idempotent)해 부분 마이그레이션 상태도 자가 치유.
+    # v2+v3: messages 의 추가 컬럼(포워드/조회수/태그 + cluster_id/text_sig). 신규 DB 는
+    # _SCHEMA 에 이미 있고, 기존 DB 만 여기서 채워진다. 항상 검사(idempotent)해 부분
+    # 마이그레이션 상태도 자가 치유한다.
     existing = {r["name"] for r in conn.execute("PRAGMA table_info(messages)")}
-    for name, decl in _MESSAGES_V2_COLUMNS.items():
+    for name, decl in _MESSAGES_ADDED_COLUMNS.items():
         if name not in existing:
             conn.execute(f"ALTER TABLE messages ADD COLUMN {name} {decl}")
+
+    # v3: cluster_id/text_sig 컬럼이 확보됐으니 인덱스 생성(idempotent). _SCHEMA 가 아니라
+    # 여기 두는 이유는 v2 DB executescript 시점엔 컬럼이 아직 없어 인덱스가 깨지기 때문.
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_cluster ON messages(cluster_id)")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_messages_textsig ON messages(text_sig, date)"
+    )
+
+    # v3: 기존 DB 의 messages_au 트리거를 'AFTER UPDATE OF text' 버전으로 교체. 옛 트리거는
+    # 모든 컬럼 UPDATE 에 재색인이 걸려, 아래 cluster_id 백필·매 사이클 조회수 갱신에서
+    # 전체 FTS 가 불필요하게 재구성된다(대량 DB 에선 느리고, 부분색인 DB 에선 오류 위험).
+    if ver < 3:
+        conn.execute("DROP TRIGGER IF EXISTS messages_au")
+        conn.execute(
+            """
+            CREATE TRIGGER messages_au AFTER UPDATE OF text ON messages BEGIN
+                INSERT INTO messages_fts(messages_fts, rowid, text)
+                    VALUES('delete', old.id, old.text);
+                INSERT INTO messages_fts(rowid, text) VALUES (new.id, new.text);
+            END
+            """
+        )
+
+    # v3: cluster_id 1회 백필(set-based SQL). 포워드 메타가 있으면 원본 키, 없으면 자기
+    # 자신이 원본 → 원본+포워드가 같은 키로 수렴(COUNT DISTINCT cluster_id = 독립 언급).
+    # text_sig(정규화 텍스트 서명)는 Python 정규화가 필요해 여기선 비우고, 수집/데몬이
+    # 신규 메시지부터 채우고 최근분만 backfill_text_sig 로 보충한다.
+    if ver < 3:
+        conn.execute(
+            """
+            UPDATE messages SET cluster_id =
+              CASE WHEN fwd_from_chat_id IS NOT NULL AND fwd_from_message_id IS NOT NULL
+                   THEN 'o:' || fwd_from_chat_id || ':' || fwd_from_message_id
+                   ELSE 'o:' || channel_id || ':' || msg_id END
+            WHERE cluster_id IS NULL
+            """
+        )
 
     if ver < _SCHEMA_VERSION:
         conn.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
@@ -235,10 +290,13 @@ def insert_message(
     fwd_from_date: str | None = None,
     sentiment: str | None = None,
     msg_type: str | None = None,
+    cluster_id: str | None = None,
+    text_sig: str | None = None,
 ) -> int | None:
     """메시지 저장. 새로 들어가면 rowid 반환, 중복이면 None.
 
-    포워드 메타·조회수·룰베이스 태그는 키워드 인자로 함께 저장한다(수집 시점 snapshot).
+    포워드 메타·조회수·룰베이스 태그·클러스터 키/서명을 키워드 인자로 함께 저장한다
+    (수집 시점 snapshot).
     """
     cur = conn.execute(
         """
@@ -246,15 +304,15 @@ def insert_message(
             channel_id, msg_id, date, text,
             views, forwards,
             fwd_from_chat_id, fwd_from_chat_title, fwd_from_message_id, fwd_from_date,
-            sentiment, msg_type
+            sentiment, msg_type, cluster_id, text_sig
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             channel_id, msg_id, date_iso, text,
             views, forwards,
             fwd_from_chat_id, fwd_from_chat_title, fwd_from_message_id, fwd_from_date,
-            sentiment, msg_type,
+            sentiment, msg_type, cluster_id, text_sig,
         ),
     )
     if cur.rowcount == 0:
@@ -476,3 +534,35 @@ def baselines_age_minutes(conn: sqlite3.Connection) -> float | None:
         return (datetime.now(timezone.utc) - dt).total_seconds() / 60
     except ValueError:
         return None
+
+
+# ── 클러스터(중복제거·원본추적) ─────────────────────────────────────
+
+def update_cluster_id(
+    conn: sqlite3.Connection, message_id: int, cluster_id: str
+) -> None:
+    """휴리스틱 병합 시 파생본의 cluster_id 를 원본 키로 재할당."""
+    conn.execute(
+        "UPDATE messages SET cluster_id = ? WHERE id = ?", (cluster_id, message_id)
+    )
+
+
+def messages_missing_text_sig(
+    conn: sqlite3.Connection, since_iso: str, limit: int
+) -> list[dict]:
+    """text_sig 가 아직 없는 최근 메시지 (id, text). 업그레이드 이전 메시지 백필용."""
+    rows = conn.execute(
+        """
+        SELECT id, text FROM messages
+        WHERE text_sig IS NULL AND date >= ?
+        ORDER BY date DESC LIMIT ?
+        """,
+        (since_iso, limit),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def set_text_sig(conn: sqlite3.Connection, message_id: int, text_sig: str) -> None:
+    conn.execute(
+        "UPDATE messages SET text_sig = ? WHERE id = ?", (text_sig, message_id)
+    )
