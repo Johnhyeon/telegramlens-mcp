@@ -74,6 +74,13 @@ def check_tagging() -> None:
     # 하이닉스 alias → SK하이닉스(000660). '하이닉스' 부분일치가 '이닉스' 오탐을 막음.
     codes = {c for c, _ in extract_mentions("삼성전자와 하이닉스 수급 쏠림 격차")}
     _assert("000660" in codes, "'하이닉스' → SK하이닉스(000660) 매칭")
+    # 2글자 영문 홀딩스·NEW 이름단독 차단 등록(영어속보 부분일치 오탐 방지).
+    from telegram_lens.stocks import load_ambiguous
+    amb = load_ambiguous()
+    _assert(
+        all(c in amb for c in ("006260", "034730", "078930", "000210", "093050", "160550")),
+        "LS/SK/GS/DL/LF/NEW 모호어 차단 등록",
+    )
 
 
 def check_tier_seed_and_manual() -> None:
