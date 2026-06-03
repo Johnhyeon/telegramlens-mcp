@@ -293,6 +293,78 @@ def check_buzz_score() -> None:
     _assert(rep[code]["tier_factor"] >= full[code]["tier_factor"], "report-only tier_factor 더 높음")
 
 
+def check_timeline() -> None:
+    print("\n=== stock_timeline (종목 종단 전개) ===")
+    now = datetime.now(timezone.utc)
+    code = "035420"  # NAVER
+    with db.connect() as conn:
+        db.upsert_channel(conn, 7001, "최초채널", "firstch", 3000)
+        db.upsert_channel(conn, 7002, "확산채널", "spreadch", 4000)
+        # 90분 전(최초) 1건, 10분 전 2건(다른 채널) — 서로 다른 버킷·채널.
+        plan = [(7001, 13000, 90), (7002, 13001, 10), (7001, 13002, 8)]
+        for ch, mid, mins in plan:
+            d = (now - timedelta(minutes=mins)).isoformat()
+            text = f"NAVER 035420 클라우드 수주 소식 {mid} 강세 기대 매수세 유입"
+            rid = db.insert_message(
+                conn, ch, mid, d, text,
+                cluster_id=cluster.canonical_key(ch, mid, None, None),
+                text_sig=cluster.text_signature(text),
+            )
+            db.insert_mentions(conn, rid, ch, d, [(code, "NAVER")])
+        db.compute_baselines(conn, days=7)
+
+    tl = queries.stock_timeline(code, "NAVER", hours=72, bucket_minutes=60)
+    _assert(tl["first_mention"] is not None, "first_mention 존재")
+    _assert(tl["first_mention"]["channel"] == "최초채널", "최초 언급 채널 정확")
+    _assert(len(tl["timeline"]) == 72, f"버킷 72개(72h/60m), got {len(tl['timeline'])}")
+    _assert(tl["summary"]["independent"] == 3, f"독립 언급 3, got {tl['summary']['independent']}")
+    _assert(tl["summary"]["spreading_channels"] == 2, "확산 채널 2")
+    _assert("baseline_ratio" in tl["summary"], "summary 에 baseline_ratio")
+    # 최근(10분 이내) 버킷에 언급이 잡혀야 함.
+    _assert(tl["timeline"][-1]["independent"] >= 1, "최근 버킷 independent>=1")
+
+
+def check_http_endpoint() -> None:
+    print("\n=== HTTP 외부 조회 엔드포인트 ===")
+    import json as _json_mod
+    import threading
+    import urllib.request
+    import urllib.error
+    import urllib.parse
+    from telegram_lens import api
+
+    httpd = api.make_server("127.0.0.1", 0)  # 포트 0 → 임시 포트
+    port = httpd.server_address[1]
+    t = threading.Thread(target=httpd.serve_forever, daemon=True)
+    t.start()
+    base = f"http://127.0.0.1:{port}"
+
+    def get(path):
+        path = urllib.parse.quote(path, safe="/?=&")  # 한글 종목명 경로 인코딩
+        try:
+            with urllib.request.urlopen(base + path, timeout=5) as r:
+                return r.status, _json_mod.loads(r.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            return e.code, _json_mod.loads(e.read().decode("utf-8"))
+
+    try:
+        st, body = get("/health")
+        _assert(st == 200 and body.get("ok") is True, "GET /health 200 ok")
+        st, body = get("/trending?hours=24&top=5")
+        _assert(st == 200 and "stocks" in body, "GET /trending 200 + stocks")
+        st, body = get("/timeline/035420?hours=72")
+        _assert(st == 200 and "timeline" in body, "GET /timeline/<code> 200 + timeline")
+        st, body = get("/timeline/NAVER")
+        _assert(st == 200 and body["code"] == "035420", "종목명으로도 해석(NAVER→035420)")
+        st, body = get("/nope")
+        _assert(st == 404 and "error" in body, "알 수 없는 경로 404")
+        st, body = get("/timeline/없는종목xyz123")
+        _assert(st == 400 and "error" in body, "미해석 종목 400")
+    finally:
+        httpd.shutdown()
+    _assert(True, "서버 정상 종료")
+
+
 def check_channels_tier_exposed() -> None:
     print("\n=== channels() tier 노출 ===")
     chans = queries.channels()
@@ -315,6 +387,8 @@ def main() -> None:
     check_heuristic_merge()
     check_velocity()
     check_buzz_score()
+    check_timeline()
+    check_http_endpoint()
     check_channels_tier_exposed()
 
     print("\n=== status ===")

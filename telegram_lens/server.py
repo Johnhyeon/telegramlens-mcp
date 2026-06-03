@@ -20,7 +20,7 @@ from telegram_lens.classify import run_classification
 from telegram_lens.config import data_dir, is_logged_in
 from telegram_lens.client import NoCredentialsError, NotLoggedInError
 from telegram_lens.extract import reset_index
-from telegram_lens.stocks import add_alias, add_ambiguous, load_stocks
+from telegram_lens.stocks import add_alias, add_ambiguous, load_stocks, resolve_code
 from telegram_lens.sync import run_sync
 
 _LOG = logging.getLogger("telegramlens.server")
@@ -170,6 +170,7 @@ mcp = FastMCP(
 - telegram_momentum : 언급 급증(스파이크) 종목 — 새 내러티브 포착
 - telegram_velocity : 종목별 시간대별 언급 흐름·급등 감지(독립 언급 기준)
 - telegram_buzz_score : 종합 버즈 스코어(독립 언급×tier×확산×velocity, 감성/유형 필터)
+- telegram_timeline : 특정 종목의 버즈 전개(최초 언급→시간대별 확산→베이스라인 배율)
 - telegram_stock_buzz : 특정 종목의 언급 요약 + 원문 샘플
 - telegram_messages : 원문 메시지 drill-down (채널·시간 범위)
 - telegram_search : 원문 키워드 전문검색 — 종목 언급이 없는 거시·산업·테마 글까지 찾음
@@ -387,17 +388,8 @@ async def telegram_momentum(
 
 
 def _resolve_code(query: str) -> tuple[str | None, str]:
-    """종목명/코드 입력을 (code, name) 으로 해석. 못 찾으면 (None, query)."""
-    by_code = load_stocks()
-    if query in by_code:
-        return query, by_code[query]
-    for c, n in by_code.items():
-        if n == query:
-            return c, n
-    for c, n in by_code.items():
-        if query in n:
-            return c, n
-    return None, query
+    """종목명/코드 입력을 (code, name) 으로 해석. 못 찾으면 (None, query). (stocks 공용)"""
+    return resolve_code(query)
 
 
 @mcp.tool()
@@ -437,6 +429,36 @@ async def telegram_velocity(
                 window_hours=window_hours,
                 spike_min=spike_min,
                 top=top,
+            ),
+        }
+    )
+
+
+@mcp.tool()
+@safe_tool
+@warn_if_collecting
+async def telegram_timeline(
+    query: str, hours: float = 72, bucket_minutes: int = 60
+) -> str:
+    """특정 종목의 버즈 전개(타임라인)를 반환합니다.
+
+    '어떤 종목들'(trending/velocity)이 아니라 '이 종목이 언제 어느 채널에서 처음 터져
+    어떻게 번졌나'(종단)를 봅니다: 최초 언급 채널·시각, 시간대별 독립 언급·확산 채널 수·
+    velocity, 베이스라인 대비 배율, 원문 샘플.
+
+    Args:
+        query: 종목명 또는 6자리 종목코드.
+        hours: 윈도우(시간). 기본 72.
+        bucket_minutes: 시간 버킷 크기(분). 기본 60.
+    """
+    code, name = _resolve_code(query)
+    if code is None:
+        return f"⚠️ '{query}' 종목을 사전에서 찾지 못했습니다."
+    return _json(
+        {
+            "_guidance": _WHY_GUIDANCE,
+            "timeline": queries.stock_timeline(
+                code=code, name=name, hours=hours, bucket_minutes=bucket_minutes
             ),
         }
     )

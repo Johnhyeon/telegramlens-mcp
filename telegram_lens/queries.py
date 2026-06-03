@@ -478,6 +478,131 @@ def buzz_score(
     return out
 
 
+def stock_timeline(
+    code: str,
+    name: str | None = None,
+    hours: float = 72,
+    bucket_minutes: int = 60,
+    samples: int = 3,
+) -> dict:
+    """한 종목의 버즈 전개(종단) — 최초 언급 → 시간대별 확산 → 베이스라인 배율.
+
+    trending/velocity/buzz_score 가 '어떤 종목들'(횡단)이라면, 타임라인은 '이 종목이
+    언제 어디서 터져 어떻게 번졌나'(종단)를 한 번에 본다.
+
+    Args:
+        code: 6자리 종목코드.
+        name: 표시명(없으면 사전에서 보충).
+        hours: 윈도우(시간).
+        bucket_minutes: 버킷 크기(분).
+        samples: 동봉할 최근 원문 샘플 수(근거용).
+    """
+    now = datetime.now(timezone.utc)
+    now_ts = now.timestamp()
+    cut = (now - timedelta(hours=hours)).isoformat()
+    bucket_sec = bucket_minutes * 60
+    nbuckets = int((hours * 60 + bucket_minutes - 1) // bucket_minutes)
+
+    with db.connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT men.date, men.message_id, men.channel_id, m.cluster_id, m.forwards
+            FROM mentions men
+            JOIN messages m ON m.id = men.message_id
+            WHERE men.code = ? AND men.date >= ?
+            """,
+            (code, cut),
+        ).fetchall()
+        first = conn.execute(
+            """
+            SELECT men.date, c.title AS channel, c.username, m.cluster_id
+            FROM mentions men
+            JOIN messages m ON m.id = men.message_id
+            LEFT JOIN channels c ON c.id = men.channel_id
+            WHERE men.code = ? AND men.date >= ?
+            ORDER BY men.date ASC LIMIT 1
+            """,
+            (code, cut),
+        ).fetchone()
+        brow = conn.execute(
+            "SELECT avg_7d FROM stock_baseline WHERE code = ?", (code,)
+        ).fetchone()
+        sample_list = _recent_snippets(conn, code, cut, samples)
+
+    # 버킷 인덱스 0 = 가장 최근. idx → {clusters, channels, messages{mid:forwards}}
+    buckets: dict[int, dict] = {}
+    all_clusters: set = set()
+    all_channels: set = set()
+    all_messages: dict = {}
+    for r in rows:
+        ts = _parse_ts(r["date"])
+        if ts is None:
+            continue
+        idx = int((now_ts - ts) // bucket_sec)
+        if idx < 0:
+            idx = 0
+        b = buckets.setdefault(idx, {"clusters": set(), "channels": set(), "messages": {}})
+        b["clusters"].add(r["cluster_id"])
+        b["channels"].add(r["channel_id"])
+        b["messages"][r["message_id"]] = r["forwards"] or 0
+        all_clusters.add(r["cluster_id"])
+        all_channels.add(r["channel_id"])
+        all_messages[r["message_id"]] = r["forwards"] or 0
+
+    # 오래된→최신 순으로 timeline 구성, velocity = 직전 버킷 대비 독립 언급 증감.
+    timeline = []
+    prev_independent = 0
+    for i in range(nbuckets - 1, -1, -1):
+        b = buckets.get(i)
+        independent = len(b["clusters"]) if b else 0
+        bucket_start = now - timedelta(seconds=(i + 1) * bucket_sec)
+        timeline.append(
+            {
+                "bucket_start": _to_kst(bucket_start.isoformat()),
+                "independent": independent,
+                "raw": len(b["messages"]) if b else 0,
+                "channels": len(b["channels"]) if b else 0,
+                "velocity": independent - prev_independent,
+            }
+        )
+        prev_independent = independent
+
+    independent_total = len(all_clusters)
+    raw_total = len(all_messages)
+    avg = brow["avg_7d"] if brow else None
+    baseline_ratio = (
+        round((independent_total / (hours / 24)) / avg, 2) if avg and avg > 0 else None
+    )
+
+    return {
+        "code": code,
+        "name": name or code,
+        "window_hours": hours,
+        "bucket_minutes": bucket_minutes,
+        "first_mention": (
+            {
+                "date": _to_kst(first["date"]),
+                "channel": first["channel"],
+                "username": first["username"],
+                "cluster_id": first["cluster_id"],
+            }
+            if first
+            else None
+        ),
+        "summary": {
+            "independent": independent_total,
+            "raw_messages": raw_total,
+            "spread_copies": raw_total - independent_total,
+            "total_forwards": sum(all_messages.values()),
+            "spreading_channels": len(all_channels),
+            "baseline_avg_7d": round(avg, 2) if avg else None,
+            "baseline_ratio": baseline_ratio,
+        },
+        "timeline": timeline,
+        "samples": sample_list,
+    }
+
+
 def recent_messages(
     channel_username: str | None = None,
     hours: float = 6,

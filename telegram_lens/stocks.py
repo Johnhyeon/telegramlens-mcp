@@ -247,6 +247,23 @@ def add_ambiguous(code: str, note: str = "") -> dict:
     return {"code": code, "name": by_code.get(code), "note": note}
 
 
+def resolve_code(query: str) -> tuple[str | None, str]:
+    """종목명/6자리 코드 입력을 (code, name) 으로 해석. 못 찾으면 (None, query).
+
+    코드 정확일치 → 종목명 정확일치 → 종목명 부분일치 순. server·api 공용.
+    """
+    by_code = load_stocks()
+    if query in by_code:
+        return query, by_code[query]
+    for c, n in by_code.items():
+        if n == query:
+            return c, n
+    for c, n in by_code.items():
+        if query in n:
+            return c, n
+    return None, query
+
+
 def _cli_refresh() -> None:
     """`telegramlens-refresh-stocks` 엔트리포인트."""
     data = refresh_stocks()
