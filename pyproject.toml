@@ -32,6 +32,7 @@ telegramlens-login = "telegram_lens.login_cli:main"
 telegramlens-setup = "telegram_lens.setup_claude:main"
 telegramlens-daemon = "telegram_lens.daemon:main"
 telegramlens-api = "telegram_lens.api:main"
+telegramlens-reindex = "telegram_lens.reindex:main"
 telegramlens-refresh-stocks = "telegram_lens.stocks:_cli_refresh"
 telegramlens-export-channels = "telegram_lens.export_channels:main"
 

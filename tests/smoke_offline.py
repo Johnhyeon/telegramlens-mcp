@@ -375,6 +375,41 @@ def check_http_endpoint() -> None:
     _assert(True, "서버 정상 종료")
 
 
+def check_reindex() -> None:
+    print("\n=== reindex (과거 데이터 소급 재색인) ===")
+    from telegram_lens import reindex as rx
+    now = datetime.now(timezone.utc)
+    with db.connect() as conn:
+        db.upsert_channel(conn, 8001, "[키움 리서치] 반도체", "kiwoomrx", 2000)
+        # 옛 코드처럼 태그·mentions·text_sig 없이 메시지만 삽입(raw insert).
+        for mid, text in [
+            (21000, "삼성전자 005930 목표주가 상향, 강세 기대 매수 추천 의견입니다"),
+            (21001, "그냥 짧은 잡담"),
+        ]:
+            conn.execute(
+                "INSERT OR IGNORE INTO messages (channel_id,msg_id,date,text) VALUES (?,?,?,?)",
+                (8001, mid, now.isoformat(), text),
+            )
+        # 재색인 전: 이 메시지들엔 mentions·sentiment 없음
+        pre = conn.execute(
+            "SELECT COUNT(*) FROM messages WHERE channel_id=8001 AND sentiment IS NULL"
+        ).fetchone()[0]
+        _assert(pre == 2, "재색인 전 sentiment 비어있음")
+        res = rx.reindex(conn)
+        _assert(res["messages"] >= 2 and res["mentions"] >= 1, "reindex 처리 결과 반환")
+        # 재색인 후: 태그·추출 채워짐
+        row = conn.execute(
+            "SELECT sentiment, msg_type, text_sig, cluster_id FROM messages WHERE channel_id=8001 AND msg_id=21000"
+        ).fetchone()
+        _assert(row["sentiment"] == "positive", "재색인: 감성 채워짐(positive)")
+        _assert(row["msg_type"] == "report", "재색인: msg_type 채워짐(report, 목표주가)")
+        _assert(row["text_sig"] is not None and row["cluster_id"], "재색인: text_sig/cluster_id 채워짐")
+        men = conn.execute(
+            "SELECT COUNT(*) FROM mentions WHERE channel_id=8001"
+        ).fetchone()[0]
+        _assert(men >= 1, "재색인: mentions 재추출됨")
+
+
 def check_channels_tier_exposed() -> None:
     print("\n=== channels() tier 노출 ===")
     chans = queries.channels()
@@ -399,6 +434,7 @@ def main() -> None:
     check_buzz_score()
     check_timeline()
     check_http_endpoint()
+    check_reindex()
     check_channels_tier_exposed()
 
     print("\n=== status ===")
