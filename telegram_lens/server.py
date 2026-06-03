@@ -225,6 +225,10 @@ async def telegram_status() -> str:
         s = db.stats(conn)
     s["logged_in"] = is_logged_in()
     s["stocks_loaded"] = len(load_stocks())
+    # 사용자에게 보이는 시각은 KST 로(저장은 UTC). 한국 사용자가 status 의 UTC 보고
+    # 헷갈리던 부분 — 다른 조회 도구는 이미 _to_kst 로 변환해 노출한다.
+    s["last_synced"] = queries._to_kst(s.get("last_synced"))
+    s["baselines_computed"] = queries._to_kst(s.get("baselines_computed"))
 
     # 백그라운드 수집 데몬(별도 자식 프로세스)의 하트비트.
     hb = data_dir() / "daemon_status.json"
@@ -235,13 +239,16 @@ async def telegram_status() -> str:
         except (json.JSONDecodeError, OSError):
             beat = None
     if beat and _daemon_pid_alive(beat.get("pid")):
+        last_result = beat.get("last_result")
+        if isinstance(last_result, dict) and last_result.get("since"):
+            last_result = {**last_result, "since": queries._to_kst(last_result["since"])}
         s["collector"] = {
             "running": True,
             "mode": "별도 자식 프로세스 (Claude 켜진 동안 백그라운드 수집)",
             "state": beat.get("state"),
             "interval_minutes": beat.get("interval_minutes"),
-            "last_run": beat.get("last_run"),
-            "last_result": beat.get("last_result"),
+            "last_run": queries._to_kst(beat.get("last_run")),
+            "last_result": last_result,
         }
     else:
         s["collector"] = {
