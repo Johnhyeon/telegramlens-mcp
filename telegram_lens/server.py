@@ -169,6 +169,7 @@ mcp = FastMCP(
 - telegram_trending : 기간 내 언급량 상위 종목
 - telegram_momentum : 언급 급증(스파이크) 종목 — 새 내러티브 포착
 - telegram_velocity : 종목별 시간대별 언급 흐름·급등 감지(독립 언급 기준)
+- telegram_buzz_score : 종합 버즈 스코어(독립 언급×tier×확산×velocity, 감성/유형 필터)
 - telegram_stock_buzz : 특정 종목의 언급 요약 + 원문 샘플
 - telegram_messages : 원문 메시지 drill-down (채널·시간 범위)
 - telegram_search : 원문 키워드 전문검색 — 종목 언급이 없는 거시·산업·테마 글까지 찾음
@@ -435,6 +436,46 @@ async def telegram_velocity(
                 bucket_minutes=bucket_minutes,
                 window_hours=window_hours,
                 spike_min=spike_min,
+                top=top,
+            ),
+        }
+    )
+
+
+@mcp.tool()
+@safe_tool
+@warn_if_collecting
+async def telegram_buzz_score(
+    window_hours: float = 24,
+    only_types: list[str] | None = None,
+    exclude_gossip: bool = False,
+    sentiment: str | None = None,
+    top: int = 20,
+) -> str:
+    """종목별 종합 버즈 스코어를 반환합니다(중복제거·채널 tier·확산·velocity 결합).
+
+    score = 독립 언급 수 × 채널 tier 품질 × 확산 강도 × velocity 배율.
+    - 독립 언급(independent): 같은 글의 포워드/복붙은 1건으로 묶음.
+    - tier_factor: 운반 채널 신뢰도 평균(analyst 1.0 … gossip 0.3).
+    - spread_factor: 복사본·포워드로 퍼진 정도.
+    - velocity_mult: 지금 가속 중일수록 가점(1.0~3.0).
+    감성·유형 필터로 '리포트만', 'gossip 제외', '긍정 글만' 같은 관점을 줄 수 있습니다.
+
+    Args:
+        window_hours: 집계 윈도우(시간). 기본 24.
+        only_types: 포함할 메시지 유형만(예: ["report"]). 생략 시 전체.
+        exclude_gossip: only_types 미지정 시 gossip(찌라시) 유형 제외. 기본 False.
+        sentiment: 특정 감성만(positive/negative/neutral). 생략 시 전체.
+        top: 상위 N개. 기본 20.
+    """
+    return _json(
+        {
+            "_guidance": _WHY_GUIDANCE,
+            "stocks": queries.buzz_score(
+                window_hours=window_hours,
+                only_types=only_types,
+                exclude_gossip=exclude_gossip,
+                sentiment=sentiment,
                 top=top,
             ),
         }

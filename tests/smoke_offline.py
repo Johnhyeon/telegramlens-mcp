@@ -243,6 +243,56 @@ def check_velocity() -> None:
     _assert(len(one) == 1 and one[0]["code"] == code, "code 지정 시 해당 종목만")
 
 
+def check_buzz_score() -> None:
+    print("\n=== buzz_score (종합 스코어 + 필터) ===")
+    now = datetime.now(timezone.utc)
+    code = "207940"  # 삼성바이오로직스
+    with db.connect() as conn:
+        # analyst 채널(가중 1.0)에서 report 3건 + gossip 채널에서 1건.
+        db.upsert_channel(conn, 6001, "[키움] 바이오 김OO", "kiwoombio", 5000)
+        db.upsert_channel(conn, 6002, "찌라시속보방", "jjsok", 8000)
+        tagging.seed_channel_tiers(conn, only_missing=True)
+        db.upsert_channel_tier(conn, 6002, "gossip", 0.3, source="manual")
+        for k in range(3):
+            d = (now - timedelta(minutes=3 + k)).isoformat()
+            text = f"삼성바이오로직스 207940 목표주가 상향 리포트 {k} 투자의견 매수 유지"
+            rid = db.insert_message(
+                conn, 6001, 11000 + k, d, text,
+                msg_type="report", sentiment="positive",
+                cluster_id=cluster.canonical_key(6001, 11000 + k, None, None),
+                text_sig=cluster.text_signature(text),
+            )
+            db.insert_mentions(conn, rid, 6001, d, [(code, "삼성바이오로직스")])
+        # gossip 1건
+        dg = (now - timedelta(minutes=5)).isoformat()
+        gtext = "삼성바이오로직스 207940 단독 찌라시 카더라 통신 받은 정보 살포"
+        rid = db.insert_message(
+            conn, 6002, 12000, dg, gtext,
+            msg_type="gossip", sentiment="neutral",
+            cluster_id=cluster.canonical_key(6002, 12000, None, None),
+            text_sig=cluster.text_signature(gtext),
+        )
+        db.insert_mentions(conn, rid, 6002, dg, [(code, "삼성바이오로직스")])
+        db.compute_baselines(conn, days=7)
+
+    full = {s["code"]: s for s in queries.buzz_score(window_hours=24, top=50)}
+    _assert(code in full, "buzz_score 에 종목 포함")
+    s = full[code]
+    _assert(s["independent"] == 4, f"독립 언급 4 (report3+gossip1), got {s['independent']}")
+    _assert(s["buzz_score"] > 0, "스코어 양수")
+    for key in ("tier_factor", "spread_factor", "velocity_mult", "baseline_ratio"):
+        _assert(key in s, f"컴포넌트 {key} 노출")
+
+    # report 만 필터 → gossip 1건 제외, 독립 3.
+    rep = {s["code"]: s for s in queries.buzz_score(window_hours=24, only_types=["report"], top=50)}
+    _assert(rep[code]["independent"] == 3, f"only report → 독립 3, got {rep[code]['independent']}")
+    # gossip 제외 필터도 동일하게 3.
+    nog = {s["code"]: s for s in queries.buzz_score(window_hours=24, exclude_gossip=True, top=50)}
+    _assert(nog[code]["independent"] == 3, f"exclude_gossip → 독립 3, got {nog[code]['independent']}")
+    # report-only(analyst 1.0) tier_factor 가 전체(gossip 섞임)보다 높아야 함.
+    _assert(rep[code]["tier_factor"] >= full[code]["tier_factor"], "report-only tier_factor 더 높음")
+
+
 def check_channels_tier_exposed() -> None:
     print("\n=== channels() tier 노출 ===")
     chans = queries.channels()
@@ -264,6 +314,7 @@ def main() -> None:
     check_forward_clustering()
     check_heuristic_merge()
     check_velocity()
+    check_buzz_score()
     check_channels_tier_exposed()
 
     print("\n=== status ===")

@@ -7,6 +7,7 @@ AI에게 raw 덤프 대신 구조화 요약을 준다. 토큰 절약 + 노이즈
 
 from __future__ import annotations
 
+import math
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -339,6 +340,141 @@ def buzz_velocity(
     out.sort(key=lambda x: (x["spike"], x["last_bucket"], x["growth"]), reverse=True)
     if not code:
         out = out[:top]
+    return out
+
+
+def _clamp(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(x, hi))
+
+
+def buzz_score(
+    window_hours: float = 24,
+    only_types: list[str] | None = None,
+    exclude_gossip: bool = False,
+    sentiment: str | None = None,
+    bucket_minutes: int = 30,
+    top: int = 20,
+    samples_per_stock: int = 1,
+) -> list[dict]:
+    """종목별 종합 버즈 스코어 (Phase 2-3).
+
+    score = independent × tier_factor × spread_factor × velocity_mult
+      - independent   : 윈도우 내 독립 언급(클러스터) 수 — 포워드/복붙 1건 취급(2-1).
+      - tier_factor   : 운반 채널 tier weight 평균(0.3~1.0, 미분류 0.5) — '누가 말했나' 품질.
+      - spread_factor : 1 + log1p(spread_copies + total_forwards) — 확산 강도(2-1).
+      - velocity_mult : clamp(최근 버킷/직전 버킷, 1.0~3.0) — '지금 가속 중인가'(2-2).
+    감성·유형 필터를 적용할 수 있다(예: report 만, gossip 제외, positive 만).
+
+    Args:
+        window_hours: 집계 윈도우(시간).
+        only_types: 포함할 msg_type 목록(예: ["report"]). 주면 이 유형만.
+        exclude_gossip: only_types 미지정 시, msg_type='gossip' 제외.
+        sentiment: 특정 감성만(positive/negative/neutral).
+        bucket_minutes: velocity 버킷 크기(분).
+        top: 상위 N개.
+        samples_per_stock: 종목별 원문 샘플 수(근거용).
+    """
+    now = datetime.now(timezone.utc)
+    now_ts = now.timestamp()
+    cut = (now - timedelta(hours=window_hours)).isoformat()
+    bucket_sec = bucket_minutes * 60
+
+    where = ["men.date >= ?"]
+    params: list = [cut]
+    if only_types:
+        where.append("m.msg_type IN (%s)" % ",".join("?" * len(only_types)))
+        params += list(only_types)
+    elif exclude_gossip:
+        where.append("(m.msg_type IS NULL OR m.msg_type != 'gossip')")
+    if sentiment:
+        where.append("m.sentiment = ?")
+        params.append(sentiment)
+
+    with db.connect() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT men.code, men.name, men.date, men.message_id, men.channel_id,
+                   m.cluster_id, m.forwards
+            FROM mentions men
+            JOIN messages m ON m.id = men.message_id
+            WHERE {' AND '.join(where)}
+            """,
+            params,
+        ).fetchall()
+        tier_w = {
+            cid: (t.get("weight") if t.get("weight") is not None else 0.5)
+            for cid, t in db.channel_tiers(conn).items()
+        }
+        baselines = {
+            r["code"]: r["avg_7d"]
+            for r in conn.execute("SELECT code, avg_7d FROM stock_baseline")
+        }
+
+        agg: dict[str, dict] = {}
+        for r in rows:
+            e = agg.setdefault(
+                r["code"],
+                {
+                    "name": r["name"],
+                    "clusters": set(),
+                    "messages": {},   # message_id -> forwards (중복합산 방지)
+                    "channels": set(),
+                    "b0": set(),      # 최근 버킷 클러스터
+                    "b1": set(),      # 직전 버킷 클러스터
+                },
+            )
+            e["clusters"].add(r["cluster_id"])
+            e["messages"][r["message_id"]] = r["forwards"] or 0
+            e["channels"].add(r["channel_id"])
+            ts = _parse_ts(r["date"])
+            if ts is not None:
+                idx = int((now_ts - ts) // bucket_sec)
+                if idx == 0:
+                    e["b0"].add(r["cluster_id"])
+                elif idx == 1:
+                    e["b1"].add(r["cluster_id"])
+
+        out = []
+        for c, e in agg.items():
+            independent = len(e["clusters"])
+            raw_messages = len(e["messages"])
+            spread_copies = raw_messages - independent
+            total_forwards = sum(e["messages"].values())
+            tier_factor = (
+                sum(tier_w.get(ch, 0.5) for ch in e["channels"]) / len(e["channels"])
+                if e["channels"]
+                else 0.5
+            )
+            spread_factor = 1 + math.log1p(spread_copies + total_forwards)
+            last, prev = len(e["b0"]), len(e["b1"])
+            growth = last / max(prev, 1)
+            velocity_mult = _clamp(growth, 1.0, 3.0)
+            score = independent * tier_factor * spread_factor * velocity_mult
+            avg = baselines.get(c)
+            baseline_ratio = (
+                round((independent / (window_hours / 24)) / avg, 2)
+                if avg and avg > 0
+                else None
+            )
+            out.append(
+                {
+                    "code": c,
+                    "name": e["name"],
+                    "buzz_score": round(score, 2),
+                    "independent": independent,
+                    "spread_copies": spread_copies,
+                    "total_forwards": total_forwards,
+                    "channels": len(e["channels"]),
+                    "tier_factor": round(tier_factor, 2),
+                    "spread_factor": round(spread_factor, 2),
+                    "velocity_mult": round(velocity_mult, 2),
+                    "baseline_ratio": baseline_ratio,
+                }
+            )
+        out.sort(key=lambda x: x["buzz_score"], reverse=True)
+        out = out[:top]
+        for d in out:
+            d["samples"] = _recent_snippets(conn, d["code"], cut, samples_per_stock)
     return out
 
 
