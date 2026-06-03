@@ -584,10 +584,10 @@ def stock_timeline(
         timeline.append(
             {
                 "bucket_start": _to_kst(bucket_start.isoformat()),
-                "independent": independent,
-                "raw": len(b["messages"]) if b else 0,
+                "independent": independent,                  # 주축: 그 구간 독립 언급 수
+                "raw": len(b["messages"]) if b else 0,       # 포워드/복붙 포함 원시 건수
                 "channels": len(b["channels"]) if b else 0,
-                "velocity": independent - prev_independent,
+                "delta": independent - prev_independent,     # 보조: 직전 버킷 대비 증감(±)
             }
         )
         prev_independent = independent
@@ -604,6 +604,13 @@ def stock_timeline(
         "name": name or code,
         "window_hours": hours,
         "bucket_minutes": bucket_minutes,
+        # 차트/해석 가이드 — 주축은 independent(언급 '수'). delta 는 보조(증감).
+        "_fields": {
+            "independent": "그 구간 독립 언급 수(포워드/복붙 1건). ★차트 주축",
+            "raw": "포워드/복붙 포함 원시 건수(raw≥independent, 차이=확산 복사본)",
+            "channels": "그 구간 언급 채널 수(확산 폭)",
+            "delta": "직전 버킷 대비 independent 증감(±, 보조지표 — 음수=감소이지 '하락'이 아님)",
+        },
         "first_mention": (
             {
                 "date": _to_kst(first["date"]),
