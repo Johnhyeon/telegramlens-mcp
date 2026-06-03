@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Virtualenvs
+.venv/
+venv/
+env/
+
+# 로컬 런타임 데이터(세션·DB·자격증명)는 ~/.telegramlens 에 저장되지만 혹시 모를 유출 방지
+*.session
+*.session-journal
+credentials.json
+telegramlens.db
+telegramlens.db-*
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
