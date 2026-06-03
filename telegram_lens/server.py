@@ -108,45 +108,19 @@ def _daemon_pid_alive(pid) -> bool:
 
 
 def _collecting_notice() -> str | None:
-    """다운타임 후 '캐치업' 수집이 진행 중일 때만 안내 문자열, 아니면 None.
+    """DB가 완전히 비어있을 때(최초 수집 전)만 안내, 그 외엔 항상 답하게 None.
 
-    정상 주기 사이클(작은 창)에서는 차단하지 않는다 — 데이터는 이미 가장 최신이고, 조용한
-    장/주말엔 newest 가 자연히 오래돼도 '수집할 게 없을 뿐'이라 차단이 오발동했었다. 이제는
-    데몬이 '큰 창 소급(catching_up)'을 돌릴 때만(진짜 누락 백필) 차단한다.
+    이전엔 '수집 중 + DB가 오래됨'이면 차단했는데, 조용한 장/주말엔 새 글이 없어 newest 가
+    자연히 오래돼도(=수집창이 커져도) 차단이 오발동했다. 'catching_up(큰 창)'으로 한정하려
+    했지만, 수집창은 마지막 메시지 이후를 덮으므로 조용한 장에서도 커져 구분이 안 됐다.
+    → 결론: DB 에 메시지가 하나라도 있으면 '가장 최신 가용 데이터'로 그냥 답한다(신선도는
+    결과에 찍힌 KST 시각으로 드러남). 진짜 막아야 할 경우는 'DB가 텅 빈 최초 수집' 뿐.
     """
-    hb = data_dir() / "daemon_status.json"
-    if not hb.exists():
-        return None
-    try:
-        beat = json.loads(hb.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return None
-    # 데몬이 지금 사이클을 돌리는 중(running) + 그게 캐치업(큰 창)일 때만 의미 있다.
-    if beat.get("state") != "running" or not _daemon_pid_alive(beat.get("pid")):
-        return None
-    if not beat.get("catching_up"):
-        return None  # 정상 사이클 — 차단하지 않고 최신 데이터로 답한다.
     with db.connect() as conn:
         newest = db.newest_message_date(conn)
-    if not newest:
+    if newest is None:
         return "⏳ 텔레그램 데이터를 처음 수집하는 중입니다. 잠시 후(약 1분) 다시 물어봐 주세요."
-    try:
-        dt = datetime.fromisoformat(newest)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        gap_min = (datetime.now(timezone.utc) - dt).total_seconds() / 60
-    except ValueError:
-        return None
-    # 여기까지 온 건 catching_up(큰 창 소급) 사이클 — 갭이 작아도(이미 최신) 굳이 막지 않는다.
-    if gap_min <= 30:
-        return None
-    hours = int(gap_min // 60)
-    span = f"약 {hours}시간 전" if hours >= 1 else f"약 {int(gap_min)}분 전"
-    return (
-        f"⏳ 백그라운드에서 누락분을 수집 중입니다(현재 DB는 {span}까지 반영). "
-        "첫 수집 사이클이 끝나면 최신이 반영됩니다 — 잠시 후 다시 물어봐 주세요. "
-        "(`telegram_status` 의 collector.last_run 으로 완료 확인)"
-    )
+    return None
 
 
 def warn_if_collecting(func):
