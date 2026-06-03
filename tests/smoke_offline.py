@@ -57,7 +57,11 @@ def check_tagging() -> None:
         tagging.tag_msg_type("삼성전자 목표주가 10만원", 1, None) == "report",
         "목표주가 → report",
     )
-    _assert(tagging.tag_msg_type("리포트 요약", 0, "analyst") == "report", "tier=analyst → report")
+    # tier(누가)는 msg_type(내용)과 분리 — analyst 채널의 뉴스단신은 report 아님
+    _assert(
+        tagging.tag_msg_type("그냥 뉴스 한 줄 링크 첨부 https://x.com", 1, "analyst") != "report",
+        "analyst tier 만으론 report 아님(내용 기반)",
+    )
     _assert(tagging.tag_msg_type("ㅎㅇ", 0, None) == "chat", "짧고 코드없음 → chat")
     _assert(
         tagging.tag_msg_type("삼성전자 수급 동향 정리한 긴 분석 글입니다", 1, None) == "general",
@@ -89,6 +93,16 @@ def check_tagging() -> None:
         all(c in amb for c in ("006260", "034730", "078930", "000210", "093050", "160550")),
         "LS/SK/GS/DL/LF/NEW 모호어 차단 등록",
     )
+    # 모회사·자회사 이름 포함관계: 자식명(두산로보틱스)만 있으면 코드미확인 부모(두산) 제외
+    from telegram_lens.stocks import load_stocks as _ls
+    _bc = _ls()
+    if "454910" in _bc and "000150" in _bc:
+        c2 = {c for c, _ in extract_mentions("젠슨 황 방한, 두산로보틱스와 두산 그룹 로봇 동맹")}
+        _assert("454910" in c2 and "000150" not in c2, "자회사만 있으면 모회사(두산) 미집계")
+        c3 = {c for c, _ in extract_mentions("두산로보틱스 그리고 두산(000150) 별도 언급")}
+        _assert("000150" in c3, "모회사 코드 동반 시 집계 유지")
+    else:
+        print("  (두산 코드 미적재 — 포함관계 테스트 skip)")
 
 
 def check_tier_seed_and_manual() -> None:
@@ -341,7 +355,10 @@ def check_timeline() -> None:
     tl = queries.stock_timeline(code, "NAVER", hours=72, bucket_minutes=60)
     _assert(tl["first_mention"] is not None, "first_mention 존재")
     _assert(tl["first_mention"]["channel"] == "최초채널", "최초 언급 채널 정확")
-    _assert(len(tl["timeline"]) == 72, f"버킷 72개(72h/60m), got {len(tl['timeline'])}")
+    # 벽시계 정렬이라 경계 위치에 따라 72~73개(now 가 시간 중간이면 +1).
+    _assert(72 <= len(tl["timeline"]) <= 73, f"버킷 72~73개(72h/60m), got {len(tl['timeline'])}")
+    # 버킷 시작이 벽시계 정렬(60분 → 분 '00')인지 확인
+    _assert(tl["timeline"][0]["bucket_start"].endswith(":00 KST"), "버킷 경계 정시 정렬")
     _assert(tl["summary"]["independent"] == 3, f"독립 언급 3, got {tl['summary']['independent']}")
     _assert(tl["summary"]["spreading_channels"] == 2, "확산 채널 2")
     _assert("baseline_ratio" in tl["summary"], "summary 에 baseline_ratio")

@@ -33,21 +33,40 @@ def _to_kst(iso: str | None) -> str | None:
         return iso
 
 
-def _recent_snippets(conn, code: str, cut: str, n: int) -> list[dict]:
-    """특정 종목의 최근 원문 스니펫 n개. '왜 언급됐나'를 근거로 쓰게 하는 용도."""
+def _recent_snippets(
+    conn, code: str, cut: str, n: int,
+    only_types: list[str] | None = None, exclude_gossip: bool = False,
+    sentiment: str | None = None,
+) -> list[dict]:
+    """특정 종목의 최근 원문 스니펫 n개. '왜 언급됐나'를 근거로 쓰게 하는 용도.
+
+    only_types/exclude_gossip/sentiment 를 주면 그 필터에 맞는 원문만 샘플로 보여준다
+    (예: report 필터 결과의 샘플이 report 글이도록 — 필터-샘플 불일치 방지).
+    """
     if n <= 0:
         return []
+    where = ["men.code = ?", "men.date >= ?"]
+    params: list = [code, cut]
+    if only_types:
+        where.append("m.msg_type IN (%s)" % ",".join("?" * len(only_types)))
+        params += list(only_types)
+    elif exclude_gossip:
+        where.append("(m.msg_type IS NULL OR m.msg_type != 'gossip')")
+    if sentiment:
+        where.append("m.sentiment = ?")
+        params.append(sentiment)
+    params.append(n)
     rows = conn.execute(
-        """
+        f"""
         SELECT m.date, m.text, m.sentiment, m.msg_type, m.views, m.forwards,
                m.fwd_from_chat_title, c.title AS channel
         FROM mentions men
         JOIN messages m ON m.id = men.message_id
         LEFT JOIN channels c ON c.id = men.channel_id
-        WHERE men.code = ? AND men.date >= ?
+        WHERE {' AND '.join(where)}
         ORDER BY m.date DESC LIMIT ?
         """,
-        (code, cut, n),
+        params,
     ).fetchall()
     out = []
     for r in rows:
@@ -474,7 +493,12 @@ def buzz_score(
         out.sort(key=lambda x: x["buzz_score"], reverse=True)
         out = out[:top]
         for d in out:
-            d["samples"] = _recent_snippets(conn, d["code"], cut, samples_per_stock)
+            # 샘플도 동일 필터를 적용 — report 필터 결과엔 report 원문만 보이게(신뢰도).
+            d["samples"] = _recent_snippets(
+                conn, d["code"], cut, samples_per_stock,
+                only_types=only_types, exclude_gossip=exclude_gossip,
+                sentiment=sentiment,
+            )
     return out
 
 
@@ -501,7 +525,6 @@ def stock_timeline(
     now_ts = now.timestamp()
     cut = (now - timedelta(hours=hours)).isoformat()
     bucket_sec = bucket_minutes * 60
-    nbuckets = int((hours * 60 + bucket_minutes - 1) // bucket_minutes)
 
     with db.connect() as conn:
         rows = conn.execute(
@@ -529,7 +552,9 @@ def stock_timeline(
         ).fetchone()
         sample_list = _recent_snippets(conn, code, cut, samples)
 
-    # 버킷 인덱스 0 = 가장 최근. idx → {clusters, channels, messages{mid:forwards}}
+    # 벽시계 정렬 버킷: 버킷 키 = floor(epoch / bucket_sec). now-상대가 아니라 절대 경계
+    # (예: 60분 버킷 → 매시 정각, 30분 → :00/:30)라 first_mention 시각과 버킷이 어긋나지
+    # 않고 "12:00~13:00 구간" 처럼 읽힌다.
     buckets: dict[int, dict] = {}
     all_clusters: set = set()
     all_channels: set = set()
@@ -538,10 +563,8 @@ def stock_timeline(
         ts = _parse_ts(r["date"])
         if ts is None:
             continue
-        idx = int((now_ts - ts) // bucket_sec)
-        if idx < 0:
-            idx = 0
-        b = buckets.setdefault(idx, {"clusters": set(), "channels": set(), "messages": {}})
+        bk = int(ts // bucket_sec)
+        b = buckets.setdefault(bk, {"clusters": set(), "channels": set(), "messages": {}})
         b["clusters"].add(r["cluster_id"])
         b["channels"].add(r["channel_id"])
         b["messages"][r["message_id"]] = r["forwards"] or 0
@@ -549,13 +572,15 @@ def stock_timeline(
         all_channels.add(r["channel_id"])
         all_messages[r["message_id"]] = r["forwards"] or 0
 
-    # 오래된→최신 순으로 timeline 구성, velocity = 직전 버킷 대비 독립 언급 증감.
+    # 윈도우 첫 버킷~현재 버킷을 절대 경계로 순회(오래된→최신).
+    first_bk = int((now_ts - hours * 3600) // bucket_sec)
+    last_bk = int(now_ts // bucket_sec)
     timeline = []
     prev_independent = 0
-    for i in range(nbuckets - 1, -1, -1):
-        b = buckets.get(i)
+    for bk in range(first_bk, last_bk + 1):
+        b = buckets.get(bk)
         independent = len(b["clusters"]) if b else 0
-        bucket_start = now - timedelta(seconds=(i + 1) * bucket_sec)
+        bucket_start = datetime.fromtimestamp(bk * bucket_sec, tz=timezone.utc)
         timeline.append(
             {
                 "bucket_start": _to_kst(bucket_start.isoformat()),

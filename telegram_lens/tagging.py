@@ -46,7 +46,11 @@ def tag_sentiment(text: str) -> str:
 # ── 메시지 유형 ─────────────────────────────────────────────────────
 # 속보 시간 패턴(예: "09:31 속보", "[14:05]"). 분 단위까지 붙은 시각.
 _TIME_RE = re.compile(r"(?<!\d)\d{1,2}:\d{2}(?!\d)")
-_REPORT_KEYWORDS = ("TP", "목표주가", "투자의견")
+# 본문에 실제로 등장해야 report. 채널 tier(누가)와 분리 — '애널 채널이 올린 뉴스단신'을
+# report 로 오분류하던 문제(실데이터 report 의 41%가 tier 만으로 잡힘) 때문.
+_REPORT_KEYWORDS = (
+    "TP", "목표주가", "목표가", "적정주가", "투자의견", "커버리지", "투자포인트",
+)
 
 # 본문이 너무 짧고 종목코드도 없으면 잡담으로 본다(자 단위).
 _CHAT_MAX_LEN = 100
@@ -69,21 +73,19 @@ def tag_msg_type(text: str, code_count: int, tier: str | None) -> str:
     우선순위: gossip(채널 tier) > breaking > report > chat(엄격) > general(나머지).
       - gossip : 채널이 찌라시 tier 로 분류된 경우(성격이 채널에 종속).
       - breaking: [속보]·❗️·시각 패턴.
-      - report : TP/목표주가/투자의견·증권사명 인용·애널리스트/리서치 채널.
+      - report : 본문에 리포트 신호(목표주가/투자의견/적정주가/커버리지 등) 또는 증권사명
+                 인용. **채널 tier 와 무관** — 누가 올렸나(tier)는 별도 축이라, 애널 채널의
+                 뉴스단신까지 report 로 잡지 않는다(필터 신뢰도). tier=analyst 여부는
+                 channel_tier 로 따로 본다.
       - chat   : 종목코드 없음 + 짧은 본문(스펙 정의 그대로 엄격 적용).
-      - general: 위 어디에도 안 맞는 실속 글(종목 언급 분석·정보성). chat 폴백이 긴 글을
-                 삼키던 문제(실데이터 chat 80%, 그중 51%가 100자+)를 분리한 라벨.
+      - general: 위 어디에도 안 맞는 실속 글(종목 언급 분석·정보성).
     """
     text = text or ""
     if tier == "gossip":
         return "gossip"
     if "[속보]" in text or "❗️" in text or _TIME_RE.search(text):
         return "breaking"
-    if (
-        any(k in text for k in _REPORT_KEYWORDS)
-        or tier in ("analyst", "research")
-        or _has_brokerage(text)
-    ):
+    if any(k in text for k in _REPORT_KEYWORDS) or _has_brokerage(text):
         return "report"
     if code_count == 0 and len(text) < _CHAT_MAX_LEN:
         return "chat"

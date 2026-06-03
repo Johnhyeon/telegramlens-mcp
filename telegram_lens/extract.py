@@ -95,12 +95,14 @@ def extract_mentions(text: str) -> list[tuple[str, str]]:
     by_code = load_stocks()
     source_firms = load_source_firms()
     found: dict[str, str] = {}  # code -> name
+    confirmed: set[str] = set()  # 6자리 코드로 확인된 종목(부모 억제에서 보호)
 
     # 1) 6자리 코드 — 사전 검증. 코드 동반은 출처가 아니라 실제 종목 언급.
     for m in _CODE_RE.finditer(text):
         code = m.group(1)
         if code in by_code:
             found[code] = by_code[code]
+            confirmed.add(code)
 
     # 2) 종목명 부분일치 — 이미 코드로 잡힌 종목 위치는 그대로 두되,
     #    이름이 등장하면 추가. 긴 이름 우선으로 같은 영역 중복 카운트 방지.
@@ -123,5 +125,16 @@ def extract_mentions(text: str) -> list[tuple[str, str]]:
                 for i in span:
                     consumed[i] = True
             start = idx + 1
+
+    # 3) 모회사·자회사 이름 포함관계 억제: 자식 이름(예: '두산로보틱스')이 함께 잡혔으면,
+    #    코드로 확인되지 않은 부모(예: '두산')는 제거한다. '두산로보틱스 … 두산 그룹'처럼
+    #    자회사 글에 bare 모회사명이 묻어 중복 집계되는 것을 막는다(코드 동반 시는 보존).
+    if len(found) > 1:
+        names = list(found.values())
+        for code, name in list(found.items()):
+            if code in confirmed:
+                continue
+            if any(other != name and other.startswith(name) for other in names):
+                del found[code]
 
     return list(found.items())
