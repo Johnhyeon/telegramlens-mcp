@@ -92,15 +92,21 @@ def tag_msg_type(text: str, code_count: int, tier: str | None) -> str:
 
 # ── 채널 tier 휴리스틱 시드 ─────────────────────────────────────────
 # 증권사명(=analyst 후보). 변형 표기 포함. title 부분일치로 검사한다.
+# 짧은 형(KB/미래/하나/한화/신한/한투/키움 등)도 포함 — 애널 채널 제목이 보통
+# "[하나 Global ETF] 박승진", "KB전략 이은택", "한화 유통 이진협"처럼 증권사 짧은 이름 +
+# 섹터 + 애널이름 구조라, '증권' 접미사가 없어 info 로 새던 것을 흡수한다.
 _BROKERAGES = (
-    "키움", "미래에셋", "신한", "한국투자", "한투", "메리츠", "하나증권", "하나금투",
-    "DB금투", "DB증권", "대신증권", "NH투자", "NH증권", "KB증권", "삼성증권",
-    "유진투자", "교보증권", "하이투자", "SK증권", "IBK투자", "유안타", "다올투자",
-    "다올증권", "현대차증권", "상상인", "BNK투자", "한양증권", "흥국증권", "케이프",
-    "신영증권", "이베스트", "유화증권", "부국증권", "DAOL", "DB Tech",
+    "키움", "미래에셋", "미래", "신한", "한국투자", "한투", "메리츠", "하나증권",
+    "하나금투", "하나", "DB금투", "DB증권", "대신증권", "대신", "NH투자", "NH증권",
+    "NH", "KB증권", "KB", "삼성증권", "유진투자", "교보증권", "교보", "하이투자",
+    "SK증권", "IBK투자", "IBK", "유안타", "다올투자", "다올증권", "현대차증권",
+    "상상인", "BNK투자", "한양증권", "한화투자", "한화", "흥국증권", "케이프",
+    "신영증권", "신영", "이베스트", "유화증권", "부국증권", "DAOL", "DB Tech",
 )
 # 독립리서치 신호(증권사명 없을 때). title 부분일치.
 _RESEARCH_HINTS = ("리서치", "리포트", "레포트", "research", "insight", "리뷰")
+# 찌라시/정보방 신호 → gossip(가장 낮은 신뢰 가중). 보수적으로 명확한 표현만.
+_GOSSIP_HINTS = ("찌라시", "지라시", "받았슈", "돌았슈", "카더라", "정보방")
 
 _TIER_WEIGHTS = {
     "analyst": 1.0,
@@ -115,13 +121,17 @@ def tier_weight(tier: str) -> float:
 
 
 def classify_tier(title: str | None) -> str:
-    """채널 title 휴리스틱 → tier. gossip 은 title 만으론 신뢰 어려워 수동에 맡긴다.
+    """채널 title 휴리스틱 → tier.
 
-    analyst(증권사 운영) > research(독립리서치 신호) > info(기본값).
-    실데이터에서 info 가 137채널 중 97개로 과다 → title 에 '증권'이 들어가면 증권사
-    리서치 채널로 보고 analyst recall 을 넓힌다(명시 브로커리스트가 못 잡는 변형 표기 흡수).
+    우선순위: gossip(찌라시 신호) > analyst(증권사) > research(독립리서치) > info(기본).
+    - gossip : 찌라시/정보방 표현 — 가장 낮은 신뢰 가중(weight 0.3)으로 차별화.
+    - analyst: 증권사 짧은/긴 이름 또는 '증권' 접미사 포함.
+    - research: 독립리서치 신호.
+    찌라시 채널엔 증권사명이 없으므로 gossip 을 먼저 본다.
     """
     t = title or ""
+    if any(g in t for g in _GOSSIP_HINTS):
+        return "gossip"
     if any(b in t for b in _BROKERAGES) or "증권" in t:
         return "analyst"
     low = t.lower()

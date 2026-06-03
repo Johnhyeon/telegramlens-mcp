@@ -42,8 +42,10 @@ def reindex(
     """
     reset_index()  # 사전/별칭/차단어 캐시 무효화 — 최신 규칙으로 추출
 
-    # tier 행이 없는 채널 시드(태깅의 msg_type 이 tier 를 쓴다). 수동 분류는 보존.
-    seed_channel_tiers(conn, only_missing=True)
+    # tier 강제 재분류(only_missing=False) — 재색인은 '현재 규칙을 과거 전체에 재적용'이
+    # 목적이므로 기존 heuristic 분류도 갱신한다(수동 분류 source='manual' 은 보존).
+    # 태깅의 msg_type 이 tier(gossip 등)를 쓰므로 재추출 전에 먼저 갱신해야 한다.
+    seed_channel_tiers(conn, only_missing=False)
     tier_map = db.channel_tiers(conn)
 
     msgs = conn.execute(

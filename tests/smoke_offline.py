@@ -69,6 +69,14 @@ def check_tagging() -> None:
     _assert(tagging.classify_tier("스몰인사이트리서치") == "research", "리서치 → research")
     _assert(tagging.classify_tier("실시간 단타방") == "info", "그 외 → info")
     _assert(tagging.classify_tier("DB증권 Tech") == "analyst", "'증권' 포함 → analyst")
+    # analyst recall: 짧은 증권사명(증권 접미사 없음)도 잡아야 함
+    _assert(tagging.classify_tier("[하나 Global ETF] 박승진") == "analyst", "짧은명 '하나' → analyst")
+    _assert(tagging.classify_tier("KB전략 이은택의 그림 전략") == "analyst", "짧은명 'KB' → analyst")
+    _assert(tagging.classify_tier("한화 유통/의류/지주 이진협") == "analyst", "짧은명 '한화' → analyst")
+    # gossip tier: 찌라시/정보방 신호
+    _assert(tagging.classify_tier("[찌라시!] 가장 빠른 찌라시") == "gossip", "찌라시 → gossip")
+    _assert(tagging.classify_tier("빠르고 정확한 주식정보방") == "gossip", "정보방 → gossip")
+    _assert(tagging.tier_weight("gossip") < tagging.tier_weight("info"), "gossip weight < info")
 
     print("  추출 튜닝 회귀:")
     # 하이닉스 alias → SK하이닉스(000660). '하이닉스' 부분일치가 '이닉스' 오탐을 막음.
