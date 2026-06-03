@@ -107,13 +107,12 @@ def _daemon_pid_alive(pid) -> bool:
         return False
 
 
-# 데이터가 이만큼 오래되면 "신선하지 않음"으로 본다(분). 정상 10분 사이클 여유 위.
-_STALE_MIN = 30
-
-
 def _collecting_notice() -> str | None:
-    """초기 캐치업 진행 중(데몬이 수집 중 + DB가 아직 오래됨)이면 안내 문자열,
-    아니면 None. 조회 도구가 옛 데이터를 조용히 내보내는 대신 '수집 중'을 알리게 한다.
+    """다운타임 후 '캐치업' 수집이 진행 중일 때만 안내 문자열, 아니면 None.
+
+    정상 주기 사이클(작은 창)에서는 차단하지 않는다 — 데이터는 이미 가장 최신이고, 조용한
+    장/주말엔 newest 가 자연히 오래돼도 '수집할 게 없을 뿐'이라 차단이 오발동했었다. 이제는
+    데몬이 '큰 창 소급(catching_up)'을 돌릴 때만(진짜 누락 백필) 차단한다.
     """
     hb = data_dir() / "daemon_status.json"
     if not hb.exists():
@@ -122,9 +121,11 @@ def _collecting_notice() -> str | None:
         beat = json.loads(hb.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
         return None
-    # 데몬이 지금 한 사이클을 돌리는 중일 때만(= state running) 의미 있음.
+    # 데몬이 지금 사이클을 돌리는 중(running) + 그게 캐치업(큰 창)일 때만 의미 있다.
     if beat.get("state") != "running" or not _daemon_pid_alive(beat.get("pid")):
         return None
+    if not beat.get("catching_up"):
+        return None  # 정상 사이클 — 차단하지 않고 최신 데이터로 답한다.
     with db.connect() as conn:
         newest = db.newest_message_date(conn)
     if not newest:
@@ -136,8 +137,9 @@ def _collecting_notice() -> str | None:
         gap_min = (datetime.now(timezone.utc) - dt).total_seconds() / 60
     except ValueError:
         return None
-    if gap_min <= _STALE_MIN:
-        return None  # 이미 충분히 최신 — 그냥 답해도 됨
+    # 여기까지 온 건 catching_up(큰 창 소급) 사이클 — 갭이 작아도(이미 최신) 굳이 막지 않는다.
+    if gap_min <= 30:
+        return None
     hours = int(gap_min // 60)
     span = f"약 {hours}시간 전" if hours >= 1 else f"약 {int(gap_min)}분 전"
     return (

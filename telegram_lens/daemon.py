@@ -50,12 +50,22 @@ def _setup_logging() -> None:
     _LOG.addHandler(stream)
 
 
-def _write_heartbeat(state: str, interval_min: int, last_result: dict | None) -> None:
+def _write_heartbeat(
+    state: str,
+    interval_min: int,
+    last_result: dict | None,
+    catching_up: bool = False,
+    window_minutes: int | None = None,
+) -> None:
     now = datetime.now(timezone.utc)
     data = {
         "pid": os.getpid(),
         "state": state,  # running | sleeping | error
         "interval_minutes": interval_min,
+        # catching_up: 이번 'running' 사이클이 다운타임 후 큰 창을 소급 수집 중인지.
+        # 정상 사이클(작은 창)은 False — 조회 도구가 정상 사이클엔 '수집 중' 차단을 안 한다.
+        "catching_up": catching_up,
+        "window_minutes": window_minutes,
         "last_run": now.isoformat(),
         "last_result": last_result,
     }
@@ -285,8 +295,13 @@ async def _loop(
         else:
             window_min = _catchup_window(min_window, max_window)
         eff_limit = _catchup_limit(window_min, per_channel_limit)
+        # 큰 창(평소보다 깊은 소급) = 다운타임 캐치업. 사용자 요청 백필도 캐치업으로 본다.
+        catching_up = bool(req_days) or window_min > min_window
         try:
-            _write_heartbeat("running", interval_min, None)
+            _write_heartbeat(
+                "running", interval_min, None,
+                catching_up=catching_up, window_minutes=window_min,
+            )
             if window_min > min_window:
                 _LOG.info(
                     "캐치업 — %d분 소급 수집(채널당 최대 %d개)", window_min, eff_limit
