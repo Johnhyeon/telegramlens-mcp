@@ -26,6 +26,36 @@ _CODE_RE = re.compile(r"(?<!\d)(\d{6})(?!\d)")
 # 이름 매칭에서 제외할 너무 흔하거나 짧은 토큰
 _MIN_NAME_LEN = 2
 
+# R2a(한글 앞경계)를 적용할 짧은 한글 이름 길이 상한. 2글자 이름이 한글 음절 바로 뒤에
+# 오면 단어 중간(바이오텍의 '오텍', 지도부의 '도부')으로 보고 거른다. 3글자 이상 distinctive
+# 이름은 오히려 정상 매칭이 많아 제외.
+_HANGUL_BOUNDARY_MAXLEN = 2
+
+
+def _is_hangul(ch: str) -> bool:
+    return bool(ch) and "가" <= ch <= "힣"
+
+
+def _embedded_match(text: str, idx: int, term: str) -> bool:
+    """이름이 '토큰'이 아니라 더 큰 단어 '속에 박혀' 매칭됐는지(=오탐) 판정.
+
+    R1(영문 경계): ASCII 영숫자 이름이 ASCII 영숫자에 인접 → 영어 단어 일부(ROLLS←LS).
+    R2a(한글 앞경계): 짧은 한글 이름 바로 앞이 한글 음절 → 한글 단어 중간(바이[오텍]).
+      한글은 조사가 뒤에 붙어(삼성전자+가) '뒤경계'로는 못 거르므로 '앞'만 본다.
+    """
+    n = len(term)
+    before = text[idx - 1] if idx > 0 else ""
+    after = text[idx + n] if idx + n < len(text) else ""
+    # R1: 영문 substring 박힘 (앞 또는 뒤가 ASCII 영숫자)
+    if term[:1].isascii() and term[:1].isalnum() and before.isascii() and before.isalnum():
+        return True
+    if term[-1:].isascii() and term[-1:].isalnum() and after.isascii() and after.isalnum():
+        return True
+    # R2a: 짧은 한글 이름이 한글 음절 바로 뒤 (단어 중간)
+    if n <= _HANGUL_BOUNDARY_MAXLEN and _is_hangul(term[0]) and _is_hangul(before):
+        return True
+    return False
+
 # 증권사 등 '출처'가 인용 문맥으로 쓰일 때의 신호어(이 이름 직후 등장).
 _CITATION_WORDS = (
     "리서치", "리포트", "레포트", "보고서", "자료", "코멘트", "데일리",
@@ -115,15 +145,19 @@ def extract_mentions(text: str) -> list[tuple[str, str]]:
                 break
             span = range(idx, idx + len(term))
             if not any(consumed[i] for i in span):
+                # 경계 규칙: 이름이 더 큰 단어 속에 박힌 매칭(ROLLS←LS, 바이오텍←오텍)은 오탐.
+                # code 동반(found 에 이미 코드로 있음)이면 보존.
+                if code not in found and _embedded_match(text, idx, term):
+                    pass  # 박힌 매칭 — 카운트 안 함(consumed 도 안 함: 다른 매칭 방해 X)
                 # 증권사 등 출처성 종목: 인용 문맥이면 제외(코드 동반이면 1)에서 이미 채택됨)
-                if code in source_firms and code not in found and _is_citation(
+                elif code in source_firms and code not in found and _is_citation(
                     text, idx, len(term)
                 ):
                     pass  # 인용 → 종목으로 카운트하지 않음
                 else:
                     found[code] = by_code.get(code, term)
-                for i in span:
-                    consumed[i] = True
+                    for i in span:
+                        consumed[i] = True
             start = idx + 1
 
     # 3) 모회사·자회사 이름 포함관계 억제: 자식 이름(예: '두산로보틱스')이 함께 잡혔으면,

@@ -91,12 +91,17 @@ def check_tagging() -> None:
     if "010120" in _ls2():
         c4 = {c for c, _ in extract_mentions("LS일렉트릭 수주 호조 기대")}
         _assert("010120" in c4, "'LS일렉트릭' 별칭 → 010120 매칭")
-    # 2글자 영문 홀딩스·NEW 이름단독 차단 등록(영어속보 부분일치 오탐 방지).
+    # standalone 일반명사/영문토큰 FP는 차단 유지(경계로 못 거름).
     from telegram_lens.stocks import load_ambiguous
     amb = load_ambiguous()
     _assert(
-        all(c in amb for c in ("006260", "034730", "078930", "000210", "093050", "160550")),
-        "LS/SK/GS/DL/LF/NEW 모호어 차단 등록",
+        all(c in amb for c in ("160550", "267790", "217500", "285800", "088790")),
+        "standalone FP(NEW/배럴/러셀/진영/진도) 차단 유지",
+    )
+    # 박힘 FP(LS/SK/오텍/도부 등)는 경계 규칙이 처리 → 차단 해제(목록에서 빠짐)
+    _assert(
+        not any(c in amb for c in ("006260", "034730", "067170", "227420")),
+        "박힘 FP(LS/SK/오텍/도부)는 경계규칙으로 처리 — 차단 목록에서 제외",
     )
     # 모회사·자회사 이름 포함관계: 자식명(두산로보틱스)만 있으면 코드미확인 부모(두산) 제외
     from telegram_lens.stocks import load_stocks as _ls
@@ -108,6 +113,24 @@ def check_tagging() -> None:
         _assert("000150" in c3, "모회사 코드 동반 시 집계 유지")
     else:
         print("  (두산 코드 미적재 — 포함관계 테스트 skip)")
+
+
+def check_boundary_match() -> None:
+    print("\n=== 경계 규칙 (박힌 매칭 vs 토큰) ===")
+    from telegram_lens.extract import _embedded_match as emb
+    # R1 영문: ROLLS의 LS는 박힘, 'LS는'/'LS전선'의 LS는 토큰
+    _assert(emb("ROLLS-ROYCE", 3, "LS") is True, "ROLLS의 LS → 박힘(FP)")
+    _assert(emb("LS는 강세", 0, "LS") is False, "'LS는'의 LS → 토큰(정상)")
+    _assert(emb("LS전선 수주", 0, "LS") is False, "'LS전선'의 LS → 토큰(정상)")
+    _assert(emb("ARKX ETF", 2, "KX") is True, "ARKX의 KX → 박힘(FP)")
+    # R2a 한글 앞경계: 바이오텍/지도부의 2글자 이름은 박힘, 앞이 공백이면 토큰
+    _assert(emb("바이오텍 임상", 2, "오텍") is True, "바이오텍의 오텍 → 박힘(FP)")
+    _assert(emb("오텍 에어컨 신제품", 0, "오텍") is False, "'오텍 '의 오텍 → 토큰(정상)")
+    _assert(emb("이란 최고지도부", 6, "도부") is True, "지도부의 도부 → 박힘(FP)")
+    # 한글 조사는 '뒤'라 정상 매칭 보존돼야(삼성전자가 → 삼성전자)
+    _assert(emb("삼성전자가 강세", 0, "삼성전자") is False, "'삼성전자가' → 조사 뒤, 정상 매칭")
+    # 알려진 한계: 테스트의 테스(뒤가 한글)는 자동으로 못 거름 → 타깃 차단으로 남김
+    _assert(emb("테스트 결과", 0, "테스") is False, "테스트의 테스 → 경계로는 못 거름(한계, 타깃차단 유지)")
 
 
 def check_tier_seed_and_manual() -> None:
@@ -515,6 +538,7 @@ def main() -> None:
 
     check_schema()
     check_tagging()
+    check_boundary_match()
     check_tier_seed_and_manual()
     check_pipeline()
     check_baseline_and_views_query()
