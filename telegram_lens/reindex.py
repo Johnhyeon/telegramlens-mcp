@@ -82,6 +82,10 @@ def reindex(
     merged = cluster.merge_heuristic_duplicates(
         conn, window_min=merge_window_min, since_iso="2000-01-01"
     )
+    # 같은 채널의 동일 종목 반복 버스트도 묶는다(한 채널의 자기 반복 = 한 source).
+    merged += cluster.merge_same_channel_bursts(
+        conn, window_min=merge_window_min, since_iso="2000-01-01"
+    )
     n_base = db.compute_baselines(conn, days=baseline_days)
 
     return {

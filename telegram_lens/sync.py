@@ -183,6 +183,9 @@ async def run_sync(
             merged = cluster.merge_heuristic_duplicates(
                 conn, window_min=30, since_iso=merge_since
             )
+            merged += cluster.merge_same_channel_bursts(
+                conn, window_min=30, since_iso=merge_since
+            )
 
         # 베이스라인이 없거나 오래됐으면(>6h) 재계산. 사이클당 가벼운 집계 1회.
         baselines_computed = 0

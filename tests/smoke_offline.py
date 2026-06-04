@@ -283,6 +283,37 @@ def check_heuristic_merge() -> None:
     _assert(cel["raw_messages"] == 2, "raw_messages=2 보존")
 
 
+def check_channel_burst_merge() -> None:
+    print("\n=== 같은 채널 동일종목 버스트 병합 ===")
+    now = datetime.now(timezone.utc)
+    code = "051910"  # LG화학 (시드 사전에 존재)
+    with db.connect() as conn:
+        db.upsert_channel(conn, 9200, "반복방", "repeatch", 100)
+        # 한 채널이 같은 종목을 5분 간격으로 4번(문구 다름 → text_sig 다름)
+        ids = []
+        for k in range(4):
+            d = (now - timedelta(minutes=20 - k * 5)).isoformat()
+            text = f"LG화학 ESG 보고서 발간 소식 {k}번째 출처 다른 헤드라인 버전"
+            rid = db.insert_message(
+                conn, 9200, 31000 + k, d, text,
+                cluster_id=cluster.canonical_key(9200, 31000 + k, None, None),
+                text_sig=cluster.text_signature(text),
+            )
+            db.insert_mentions(conn, rid, 9200, d, [(code, "LG화학")])
+            ids.append(rid)
+        # 병합 전: 4개 독립 클러스터
+        pre = conn.execute(
+            "SELECT COUNT(DISTINCT cluster_id) FROM messages WHERE channel_id=9200"
+        ).fetchone()[0]
+        _assert(pre == 4, f"병합 전 독립 4, got {pre}")
+        m = cluster.merge_same_channel_bursts(conn, window_min=30, since_iso="2000-01-01")
+        _assert(m == 3, f"4개 → 1클러스터(3건 병합), got {m}")
+        post = conn.execute(
+            "SELECT COUNT(DISTINCT cluster_id) FROM messages WHERE channel_id=9200"
+        ).fetchone()[0]
+        _assert(post == 1, f"병합 후 독립 1, got {post}")
+
+
 def check_velocity() -> None:
     print("\n=== buzz_velocity (시간버킷 + 급등) ===")
     now = datetime.now(timezone.utc)
@@ -491,6 +522,7 @@ def main() -> None:
     check_text_signature()
     check_forward_clustering()
     check_heuristic_merge()
+    check_channel_burst_merge()
     check_velocity()
     check_buzz_score()
     check_timeline()

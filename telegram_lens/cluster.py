@@ -150,6 +150,74 @@ def merge_heuristic_duplicates(
     return merged
 
 
+def merge_same_channel_bursts(
+    conn: sqlite3.Connection,
+    window_min: int = 30,
+    since_iso: str | None = None,
+) -> int:
+    """같은 채널이 같은 종목(집합)을 짧은 시간에 반복 게시한 '버스트'를 한 클러스터로 병합.
+
+    text_sig 병합(exact 복붙)이 못 잡는 케이스: 한 채널이 같은 이슈를 *출처만 다른 헤드라인*
+    으로 20분 새 7~8번 올리면 본문이 조금씩 달라(서명도 다) 독립 언급으로 뻥튀기된다.
+    스펙 2-1의 '30분 이내 + 동일 종목' 경로 — 같은 채널 + 동일 mention 집합 + 시간창이면
+    가장 이른 메시지의 cluster_id 로 묶는다. 한 채널의 한 burst = 한 source 로 본다.
+
+    교차 채널 확산(여러 방이 같은 글)은 건드리지 않는다(그건 text_sig/forward 가 담당하고,
+    오히려 '확산'은 보존해야 할 신호). 여기서 줄이는 건 '단일 채널의 자기 반복'뿐.
+
+    반환: cluster_id 가 바뀐(병합된) 메시지 수.
+    """
+    cut = since_iso or (
+        datetime.now(timezone.utc) - timedelta(days=1)
+    ).isoformat()
+    rows = conn.execute(
+        """
+        SELECT m.id, m.channel_id, m.date, m.cluster_id,
+               (SELECT group_concat(men.code) FROM mentions men
+                WHERE men.message_id = m.id) AS codes
+        FROM messages m
+        WHERE m.date >= ?
+          AND EXISTS (SELECT 1 FROM mentions men WHERE men.message_id = m.id)
+        ORDER BY m.channel_id, m.date ASC
+        """,
+        (cut,),
+    ).fetchall()
+
+    # (채널, 종목코드 집합) → 시간순 메시지. 같은 키 안에서 시간창 연쇄를 묶는다.
+    from collections import defaultdict
+
+    groups: dict = defaultdict(list)
+    for r in rows:
+        codeset = frozenset((r["codes"] or "").split(","))
+        if not codeset:
+            continue
+        groups[(r["channel_id"], codeset)].append(r)
+
+    window = timedelta(minutes=window_min)
+    merged = 0
+    for msgs in groups.values():
+        if len(msgs) < 2:
+            continue
+        anchor_cluster: str | None = None
+        anchor_time: datetime | None = None
+        for r in msgs:
+            try:
+                t = datetime.fromisoformat(r["date"])
+                if t.tzinfo is None:
+                    t = t.replace(tzinfo=timezone.utc)
+            except ValueError:
+                continue
+            if anchor_cluster is None or anchor_time is None or t - anchor_time > window:
+                anchor_cluster = r["cluster_id"]
+                anchor_time = t
+                continue
+            if r["cluster_id"] != anchor_cluster:
+                db.update_cluster_id(conn, r["id"], anchor_cluster)
+                merged += 1
+            anchor_time = t  # 연쇄 — 마지막 본 시각으로 전진(30분 연쇄 유지)
+    return merged
+
+
 def backfill_text_sig(
     conn: sqlite3.Connection, since_iso: str, limit: int = 5000
 ) -> int:
