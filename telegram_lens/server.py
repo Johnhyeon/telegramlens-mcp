@@ -85,6 +85,20 @@ def _json(data) -> str:
     return json.dumps(data, ensure_ascii=False, indent=2)
 
 
+def _stocks_payload(stocks: list) -> dict:
+    """리스트형 결과 공통 포장 — 종목코드 배열(codes)을 맨 위에 같이 준다.
+
+    텔레그램 버즈 결과의 종목들을 외부 시세·수급 도구(예: StockLens get_multi_stocks /
+    get_flow_batch)로 한 번에 넘길 때, stocks 를 재파싱하지 않고 codes 를 그대로 배치 입력에
+    쓰라고 노출한다. 순서는 결과 정렬(상위 버즈 먼저)을 유지한다.
+    """
+    return {
+        "_guidance": _WHY_GUIDANCE,
+        "codes": [s["code"] for s in stocks],
+        "stocks": stocks,
+    }
+
+
 # 트렌딩/모멘텀은 '빈도'만 알려준다. '왜'는 동봉된 samples(원문)에서만 와야 한다.
 _WHY_GUIDANCE = (
     "이 목록의 수치는 '무엇이 얼마나' 언급됐는지(빈도)일 뿐, 급등/트렌드의 '이유'가 "
@@ -163,6 +177,13 @@ mcp = FastMCP(
 - 채널 tier·weight: 같은 언급도 analyst > gossip 로 신뢰도가 다름(가중 근거).
 - 중복제거: independent(독립 언급=클러스터 수)가 헤드라인. raw_messages 는 포워드/복붙
   포함 원시 건수, spread_copies·total_forwards 는 확산 강도. 순위는 independent 기준.
+
+## 종목코드 배치 연계 (codes)
+
+trending·momentum·velocity·buzz_score·search 결과 맨 위에 `codes` 배열(등장 종목코드,
+순위 순)이 있습니다. 이 종목들의 시세·수급을 외부 도구로 확인할 때는 **종목당 개별 호출
+대신** `codes` 를 그대로 배치 도구(예: StockLens get_multi_stocks / get_flow_batch)에
+한 번에 넘기세요(토큰 절약). 버즈(심리) 위에 시세·수급(데이터)을 얹는 흐름.
 
 ## 과거 데이터 추가 수집 제안
 
@@ -342,9 +363,7 @@ async def telegram_trending(hours: float = 24, top: int = 20) -> str:
         hours: 집계 시간 범위(시간). 기본 24.
         top: 상위 N개. 기본 20.
     """
-    return _json(
-        {"_guidance": _WHY_GUIDANCE, "stocks": queries.trending(hours=hours, top=top)}
-    )
+    return _json(_stocks_payload(queries.trending(hours=hours, top=top)))
 
 
 @mcp.tool()
@@ -361,12 +380,9 @@ async def telegram_momentum(
         top: 상위 N개. 기본 15.
     """
     return _json(
-        {
-            "_guidance": _WHY_GUIDANCE,
-            "stocks": queries.momentum(
-                hours=hours, baseline_hours=baseline_hours, top=top
-            ),
-        }
+        _stocks_payload(
+            queries.momentum(hours=hours, baseline_hours=baseline_hours, top=top)
+        )
     )
 
 
@@ -404,16 +420,15 @@ async def telegram_velocity(
         if code is None:
             return f"⚠️ '{query}' 종목을 사전에서 찾지 못했습니다."
     return _json(
-        {
-            "_guidance": _WHY_GUIDANCE,
-            "stocks": queries.buzz_velocity(
+        _stocks_payload(
+            queries.buzz_velocity(
                 code=code,
                 bucket_minutes=bucket_minutes,
                 window_hours=window_hours,
                 spike_min=spike_min,
                 top=top,
-            ),
-        }
+            )
+        )
     )
 
 
@@ -474,16 +489,15 @@ async def telegram_buzz_score(
         top: 상위 N개. 기본 20.
     """
     return _json(
-        {
-            "_guidance": _WHY_GUIDANCE,
-            "stocks": queries.buzz_score(
+        _stocks_payload(
+            queries.buzz_score(
                 window_hours=window_hours,
                 only_types=only_types,
                 exclude_gossip=exclude_gossip,
                 sentiment=sentiment,
                 top=top,
-            ),
-        }
+            )
+        )
     )
 
 

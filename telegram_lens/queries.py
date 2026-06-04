@@ -763,9 +763,16 @@ def search_messages(
             params.append(limit)
             rows = conn.execute(sql, params).fetchall()
 
+    from telegram_lens.extract import extract_mentions
+
     out = []
+    codes: list[str] = []  # 검색 결과에 등장한 종목코드(첫 등장 순서, 중복 제거)
     for r in rows:
-        text = " ".join((r["text"] or "").split())
+        full = r["text"] or ""
+        for code, _ in extract_mentions(full):
+            if code not in codes:
+                codes.append(code)
+        text = " ".join(full.split())
         if len(text) > 300:
             text = text[:300] + "…"
         out.append(
@@ -774,13 +781,14 @@ def search_messages(
                 "channel": r["channel"],
                 "username": r["username"],
                 "text": text,
-                "links": _extract_urls(r["text"]),
+                "links": _extract_urls(full),
             }
         )
     return {
         "query": query,
         "match_mode": "fts" if use_fts else "like",
         "matched": len(out),
+        "codes": codes,  # 검색결과 종목들 → 외부 시세·수급 배치 입력용
         "results": out,
     }
 

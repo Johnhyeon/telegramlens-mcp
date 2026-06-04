@@ -524,6 +524,20 @@ def check_reindex() -> None:
         _assert(men >= 1, "재색인: mentions 재추출됨")
 
 
+def check_codes_array() -> None:
+    print("\n=== codes 배열 (배치 연계용) ===")
+    import telegram_lens.server as srv
+    # _stocks_payload: stocks 의 code 를 순서대로 codes 로
+    stocks = queries.trending(hours=24, top=5, samples_per_stock=0)
+    payload = srv._stocks_payload(stocks)
+    _assert("codes" in payload, "_stocks_payload 에 codes 키")
+    _assert(payload["codes"] == [s["code"] for s in stocks], "codes 가 stocks 순서·코드와 일치")
+    # search 결과에도 codes
+    res = queries.search_messages("삼성전자", hours=24)
+    _assert("codes" in res, "search 결과에 codes 키")
+    _assert(isinstance(res["codes"], list), "search codes 는 리스트")
+
+
 def check_channels_tier_exposed() -> None:
     print("\n=== channels() tier 노출 ===")
     chans = queries.channels()
@@ -549,6 +563,7 @@ def main() -> None:
     check_channel_burst_merge()
     check_velocity()
     check_buzz_score()
+    check_codes_array()
     check_timeline()
     check_http_endpoint()
     check_reindex()
