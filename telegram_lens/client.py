@@ -11,7 +11,14 @@ import logging
 from datetime import datetime, timezone
 
 from telethon import TelegramClient
-from telethon.tl.types import Channel, Chat, PeerChannel, PeerChat, PeerUser
+from telethon.tl.types import (
+    Channel,
+    Chat,
+    MessageMediaWebPage,
+    PeerChannel,
+    PeerChat,
+    PeerUser,
+)
 
 from telegram_lens import db
 from telegram_lens.config import get_credentials, session_path
@@ -120,6 +127,7 @@ async def fetch_recent(
             if not text.strip():
                 continue
             fwd = getattr(msg, "fwd_from", None)
+            media_type, file_name = _media_meta(msg)
             results.append(
                 {
                     "channel_id": ent.id,
@@ -135,6 +143,8 @@ async def fetch_recent(
                     "fwd_from_chat_title": _fwd_title(msg, fwd),
                     "fwd_from_message_id": getattr(fwd, "channel_post", None),
                     "fwd_from_date": _iso(getattr(fwd, "date", None)),
+                    "media_type": media_type,
+                    "file_name": file_name,
                 }
             )
     return results, channels
@@ -151,6 +161,24 @@ def _peer_id(peer) -> int | None:
     if isinstance(peer, PeerUser):
         return peer.user_id
     return None
+
+
+def _media_meta(msg) -> tuple[str | None, str | None]:
+    """첨부 메타데이터만(다운로드 X). (media_type, file_name).
+
+    media_type: photo | document | webpage | None. 문서면 file_name 도(리포트 PDF 등).
+    '이 글에 파일/이미지 있음'을 알려 텔레그램 원문으로 유도하는 용도.
+    """
+    try:
+        if getattr(msg, "photo", None) is not None:
+            return "photo", None
+        if getattr(msg, "document", None) is not None:
+            return "document", getattr(getattr(msg, "file", None), "name", None)
+        if isinstance(getattr(msg, "media", None), MessageMediaWebPage):
+            return "webpage", None
+    except Exception:  # noqa: BLE001 — 미디어 메타 파싱 실패는 무시(텍스트 수집이 우선)
+        pass
+    return None, None
 
 
 def _iso(dt) -> str | None:

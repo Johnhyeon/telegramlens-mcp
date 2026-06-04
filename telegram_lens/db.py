@@ -29,7 +29,8 @@ from telegram_lens.config import db_path
 #   v1 = FTS 인덱스 도입
 #   v2 = 포워드 메타·views/forwards·sentiment/msg_type 컬럼 + tier/baseline/views_log 테이블
 #   v3 = cluster_id/text_sig 컬럼(중복제거·원본추적) + 인덱스
-_SCHEMA_VERSION = 3
+#   v4 = media_type/file_name 컬럼(첨부 파일·이미지 인지)
+_SCHEMA_VERSION = 4
 
 # messages 에 v2 에서 추가된 컬럼(이름 → 선언). 신규 설치는 _SCHEMA 가, 기존 DB는
 # _migrate 의 ALTER 가 채운다. 한 곳에서 관리해 둘이 어긋나지 않게 한다.
@@ -51,10 +52,18 @@ _MESSAGES_V3_COLUMNS: dict[str, str] = {
     "text_sig": "TEXT",
 }
 
-# 마이그레이션 ensure 루프가 순회할 '추가 컬럼' 전체(v2 + v3).
+# v4: 첨부 인지. media_type = photo|document|webpage|None, file_name = 문서 파일명(있으면).
+# 다운로드 없이 메타데이터만 — "이 글에 PDF/이미지 있음"을 알려 텔레그램 원문으로 유도.
+_MESSAGES_V4_COLUMNS: dict[str, str] = {
+    "media_type": "TEXT",
+    "file_name": "TEXT",
+}
+
+# 마이그레이션 ensure 루프가 순회할 '추가 컬럼' 전체(v2 + v3 + v4).
 _MESSAGES_ADDED_COLUMNS: dict[str, str] = {
     **_MESSAGES_V2_COLUMNS,
     **_MESSAGES_V3_COLUMNS,
+    **_MESSAGES_V4_COLUMNS,
 }
 
 _MESSAGES_ADDED_COLS_SQL = "".join(
@@ -292,6 +301,8 @@ def insert_message(
     msg_type: str | None = None,
     cluster_id: str | None = None,
     text_sig: str | None = None,
+    media_type: str | None = None,
+    file_name: str | None = None,
 ) -> int | None:
     """메시지 저장. 새로 들어가면 rowid 반환, 중복이면 None.
 
@@ -304,15 +315,15 @@ def insert_message(
             channel_id, msg_id, date, text,
             views, forwards,
             fwd_from_chat_id, fwd_from_chat_title, fwd_from_message_id, fwd_from_date,
-            sentiment, msg_type, cluster_id, text_sig
+            sentiment, msg_type, cluster_id, text_sig, media_type, file_name
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             channel_id, msg_id, date_iso, text,
             views, forwards,
             fwd_from_chat_id, fwd_from_chat_title, fwd_from_message_id, fwd_from_date,
-            sentiment, msg_type, cluster_id, text_sig,
+            sentiment, msg_type, cluster_id, text_sig, media_type, file_name,
         ),
     )
     if cur.rowcount == 0:

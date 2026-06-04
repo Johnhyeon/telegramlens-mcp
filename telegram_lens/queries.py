@@ -20,6 +20,24 @@ _KST = ZoneInfo("Asia/Seoul")
 _URL_RE = re.compile(r"https?://[^\s)\]>\"'》」』]+")
 
 
+def _tg_link(username: str | None, channel_id, msg_id) -> str | None:
+    """텔레그램 메시지 딥링크. 공개채널은 t.me/<username>/<msg_id>, 아니면 t.me/c/<id>/<msg_id>."""
+    if not msg_id:
+        return None
+    if username:
+        return f"https://t.me/{username}/{msg_id}"
+    if channel_id:
+        return f"https://t.me/c/{channel_id}/{msg_id}"
+    return None
+
+
+def _media_field(media_type, file_name):
+    """첨부 인지 필드. 없으면 None(키 자체 생략하지 않고 None 으로 일관)."""
+    if not media_type:
+        return None
+    return {"type": media_type, "file_name": file_name}
+
+
 def _extract_urls(text: str | None, limit: int = 5) -> list[str]:
     """본문에서 URL 목록(중복 제거, 순서 보존). 샘플 텍스트가 잘려도 링크는 살아남게 별도 노출."""
     if not text:
@@ -77,7 +95,8 @@ def _recent_snippets(
     rows = conn.execute(
         f"""
         SELECT m.date, m.text, m.sentiment, m.msg_type, m.views, m.forwards,
-               m.fwd_from_chat_title, c.title AS channel
+               m.fwd_from_chat_title, m.msg_id, m.channel_id, m.media_type, m.file_name,
+               c.title AS channel, c.username
         FROM mentions men
         JOIN messages m ON m.id = men.message_id
         LEFT JOIN channels c ON c.id = men.channel_id
@@ -97,6 +116,8 @@ def _recent_snippets(
                 "channel": r["channel"],
                 "text": text,
                 "links": _extract_urls(r["text"]),  # 잘린 본문과 무관하게 원문 URL 보존
+                "telegram_link": _tg_link(r["username"], r["channel_id"], r["msg_id"]),
+                "media": _media_field(r["media_type"], r["file_name"]),
                 "sentiment": r["sentiment"],
                 "msg_type": r["msg_type"],
                 "views": r["views"],
@@ -247,7 +268,8 @@ def stock_buzz(code: str, name: str, hours: float = 24, samples: int = 8) -> dic
         sample_rows = conn.execute(
             """
             SELECT m.date, m.text, m.sentiment, m.msg_type, m.views, m.forwards,
-                   m.fwd_from_chat_title, c.title AS channel, c.username
+                   m.fwd_from_chat_title, m.msg_id, m.channel_id, m.media_type,
+                   m.file_name, c.title AS channel, c.username
             FROM mentions men
             JOIN messages m ON m.id = men.message_id
             LEFT JOIN channels c ON c.id = men.channel_id
@@ -268,6 +290,8 @@ def stock_buzz(code: str, name: str, hours: float = 24, samples: int = 8) -> dic
         d = dict(r)
         d["date"] = _to_kst(d["date"])
         d["links"] = _extract_urls(d.get("text"))
+        d["telegram_link"] = _tg_link(d.pop("username"), d.pop("channel_id"), d.pop("msg_id"))
+        d["media"] = _media_field(d.pop("media_type"), d.pop("file_name"))
         samples.append(d)
     return {
         "code": code,
@@ -665,7 +689,8 @@ def recent_messages(
     with db.connect() as conn:
         cols = (
             "m.date, m.text, m.sentiment, m.msg_type, m.views, m.forwards, "
-            "m.fwd_from_chat_title, c.title AS channel, c.username"
+            "m.fwd_from_chat_title, m.msg_id, m.channel_id, m.media_type, m.file_name, "
+            "c.title AS channel, c.username"
         )
         if channel_username:
             rows = conn.execute(
@@ -693,6 +718,8 @@ def recent_messages(
         d["date"] = _to_kst(d["date"])
         d["forwarded_from"] = d.pop("fwd_from_chat_title")
         d["links"] = _extract_urls(d.get("text"))
+        d["telegram_link"] = _tg_link(d.pop("username"), d.pop("channel_id"), d.pop("msg_id"))
+        d["media"] = _media_field(d.pop("media_type"), d.pop("file_name"))
         out.append(d)
     return out
 
@@ -728,7 +755,8 @@ def search_messages(
     with db.connect() as conn:
         if use_fts:
             sql = """
-                SELECT m.date, m.text, c.title AS channel, c.username
+                SELECT m.date, m.text, m.msg_id, m.channel_id, m.media_type,
+                       m.file_name, c.title AS channel, c.username
                 FROM messages_fts f
                 JOIN messages m ON m.id = f.rowid
                 LEFT JOIN channels c ON c.id = m.channel_id
@@ -747,7 +775,8 @@ def search_messages(
                 return t.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
             sql = """
-                SELECT m.date, m.text, c.title AS channel, c.username
+                SELECT m.date, m.text, m.msg_id, m.channel_id, m.media_type,
+                       m.file_name, c.title AS channel, c.username
                 FROM messages m
                 LEFT JOIN channels c ON c.id = m.channel_id
                 WHERE m.date >= ?
@@ -782,6 +811,8 @@ def search_messages(
                 "username": r["username"],
                 "text": text,
                 "links": _extract_urls(full),
+                "telegram_link": _tg_link(r["username"], r["channel_id"], r["msg_id"]),
+                "media": _media_field(r["media_type"], r["file_name"]),
             }
         )
     return {

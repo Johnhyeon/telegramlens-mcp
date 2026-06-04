@@ -173,6 +173,9 @@ mcp = FastMCP(
 각 메시지·종목 샘플에는 다음이 함께 옵니다(룰베이스, 추측 금지 원칙은 동일):
 - sentiment(positive/negative/neutral), msg_type(report/breaking/gossip/chat/general)
 - views/forwards(조회수·확산), forwarded_from(포워드 원본 채널명)
+- telegram_link: 그 메시지의 텔레그램 딥링크(t.me/...) — 원문·첨부를 바로 열어볼 수 있음
+- media: 첨부 인지 {type: photo|document|webpage, file_name}. 리포트 PDF·차트 이미지가 있으면
+  표시되니, 본문에 안 담긴 내용은 telegram_link 로 안내하라(다운로드·본문읽기는 안 함)
 - trending 의 baseline_ratio: 현재 일평균 언급 / 7일 일평균(1 초과면 평소보다 활발).
 - 채널 tier·weight: 같은 언급도 analyst > gossip 로 신뢰도가 다름(가중 근거).
 - 중복제거: independent(독립 언급=클러스터 수)가 헤드라인. raw_messages 는 포워드/복붙

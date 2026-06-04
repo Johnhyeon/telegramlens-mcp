@@ -240,6 +240,33 @@ def check_link_field() -> None:
             "잘린 본문이어도 links에 원문 URL 보존")
 
 
+def check_link_and_media() -> None:
+    print("\n=== telegram_link + media 필드 ===")
+    _assert(
+        queries._tg_link("mootda", 123, 88971) == "https://t.me/mootda/88971",
+        "공개채널 → t.me/<username>/<msg_id>",
+    )
+    _assert(
+        queries._tg_link(None, 12345, 7) == "https://t.me/c/12345/7",
+        "username 없음 → t.me/c/<id>/<msg_id>",
+    )
+    _assert(queries._tg_link("x", 1, None) is None, "msg_id 없으면 링크 None")
+    _assert(queries._media_field("document", "리포트.pdf") == {"type": "document", "file_name": "리포트.pdf"}, "문서 media 필드")
+    _assert(queries._media_field(None, None) is None, "첨부 없으면 media None")
+    # 통합: media/telegram_link 가진 메시지 삽입 → recent_messages 노출
+    now = datetime.now(timezone.utc)
+    with db.connect() as conn:
+        db.upsert_channel(conn, 9300, "리포트방", "reportroom", 500)
+        db.insert_message(
+            conn, 9300, 55555, now.isoformat(), "삼성전자 분석 리포트 첨부합니다",
+            cluster_id=cluster.canonical_key(9300, 55555, None, None),
+            media_type="document", file_name="삼성전자_2026.pdf",
+        )
+    msgs = [m for m in queries.recent_messages(channel_username="reportroom", hours=24, limit=10)]
+    _assert(msgs and msgs[0]["telegram_link"] == "https://t.me/reportroom/55555", "recent_messages telegram_link")
+    _assert(msgs[0]["media"]["file_name"] == "삼성전자_2026.pdf", "recent_messages media.file_name")
+
+
 def check_text_signature() -> None:
     print("\n=== text_signature (정규화 서명) ===")
     a = "삼성전자 목표주가 상향! https://t.me/abc 🚀🚀 매수 추천드립니다"
@@ -557,6 +584,7 @@ def main() -> None:
     check_pipeline()
     check_baseline_and_views_query()
     check_link_field()
+    check_link_and_media()
     check_text_signature()
     check_forward_clustering()
     check_heuristic_merge()

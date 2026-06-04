@@ -146,6 +146,8 @@ async def run_sync(
                 msg_type=msg_type,
                 cluster_id=cluster_id,
                 text_sig=text_sig,
+                media_type=r.get("media_type"),
+                file_name=r.get("file_name"),
             )
             if msg_rowid is None:
                 continue  # 이미 저장됨
