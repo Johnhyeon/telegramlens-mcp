@@ -44,16 +44,12 @@ jobs:
           python -m pip install --upgrade twine
           twine check dist/*
 
-      # Option A: Trusted Publishing (OIDC) — 토큰 불필요, PyPI 측 설정 필요(권장)
+      # Trusted Publishing (OIDC) — 토큰 불필요. PyPI 측 pending publisher 등록 필요.
       # https://docs.pypi.org/trusted-publishers/
-      # - name: Publish to PyPI (Trusted Publishing)
-      #   uses: pypa/gh-action-pypi-publish@release/v1
-
-      # Option B: API 토큰 (현재 활성) — 간단, secrets.PYPI_API_TOKEN 등록 필요
-      - name: Publish to PyPI
+      #   PyPI Project Name: telegramlens-mcp / Owner: Johnhyeon
+      #   Repository: telegramlens-mcp / Workflow: release.yml / Environment: (비움)
+      - name: Publish to PyPI (Trusted Publishing)
         uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          password: ${{ secrets.PYPI_API_TOKEN }}
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
