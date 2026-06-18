@@ -284,13 +284,11 @@ async def telegram_status() -> str:
 async def telegram_collect_history(days: int = 7) -> str:
     """더 오래된 과거 데이터를 소급 수집하도록 백그라운드 데몬에 요청합니다.
 
-    자동 수집은 기본 7일까지만 합니다. 그보다 오래 비웠을 때(telegram_status 의
-    backfill_offer 참고) **사용자가 동의하면** 이 도구로 더 깊은 백필을 요청하세요.
-    데몬이 다음 사이클(보통 ~15초 내)에 처리하며, 그동안 telegram_status 로 진행을
-    확인할 수 있습니다. 무거운 작업이라 사용자 동의 없이 호출하지 마세요.
+    자동 수집은 기본 7일까지. 더 오래 비웠을 때(telegram_status 의 backfill_offer)
+    **사용자 동의 시에만** 호출하세요. 무거운 작업이라 동의 없이 호출 금지.
 
     Args:
-        days: 소급 수집할 일수(1~90). 예: 14면 최근 14일치를 소급 수집.
+        days: 소급 수집할 일수(1~90). 예: 14면 최근 14일치.
     """
     days = max(1, min(int(days), 90))
     (data_dir() / "backfill_request.json").write_text(
@@ -410,15 +408,14 @@ async def telegram_velocity(
 ) -> str:
     """종목별 언급의 시간대별 흐름과 급등(velocity)을 반환합니다.
 
-    독립 언급(같은 글의 포워드/복붙은 1건으로 묶음)을 시간 버킷으로 집계해, 직전 대비
-    증가율과 급등 여부를 봅니다. last_bucket(가장 최근 구간)이 spike_min 이상이거나
-    증가율이 임계값을 넘으면 spike=true. Phase1 베이스라인 배율(baseline_ratio)도 동봉.
+    시간 버킷별 독립 언급을 집계해 직전 대비 증가율과 spike 여부를 봅니다.
+    베이스라인 배율(baseline_ratio) 동봉.
 
     Args:
-        query: 종목명/6자리 코드(생략 시 최근 velocity 상위 top 종목).
+        query: 종목명/6자리 코드(생략 시 velocity 상위 top 종목).
         bucket_minutes: 시간 버킷 크기(분). 기본 30.
         window_hours: 집계 윈도우(시간). 기본 6.
-        spike_min: 최근 버킷 급등 임계값(독립 언급 건수). 기본 5.
+        spike_min: 최근 버킷 급등 임계값(건수). 기본 5.
         top: query 미지정 시 상위 N개. 기본 15.
     """
     code = None
@@ -447,9 +444,8 @@ async def telegram_timeline(
 ) -> str:
     """특정 종목의 버즈 전개(타임라인)를 반환합니다.
 
-    '어떤 종목들'(trending/velocity)이 아니라 '이 종목이 언제 어느 채널에서 처음 터져
-    어떻게 번졌나'(종단)를 봅니다: 최초 언급 채널·시각, 시간대별 독립 언급·확산 채널 수·
-    velocity, 베이스라인 대비 배율, 원문 샘플.
+    이 종목이 언제 어느 채널에서 처음 터져 어떻게 번졌나(종단): 최초 언급 채널·시각,
+    시간대별 독립 언급·확산 채널 수·velocity·베이스라인 배율·원문 샘플.
 
     Args:
         query: 종목명 또는 6자리 종목코드.
@@ -479,20 +475,13 @@ async def telegram_buzz_score(
     sentiment: str | None = None,
     top: int = 20,
 ) -> str:
-    """종목별 종합 버즈 스코어를 반환합니다(중복제거·채널 tier·확산·velocity 결합).
-
-    score = 독립 언급 수 × 채널 tier 품질 × 확산 강도 × velocity 배율.
-    - 독립 언급(independent): 같은 글의 포워드/복붙은 1건으로 묶음.
-    - tier_factor: 운반 채널 신뢰도 평균(analyst 1.0 … gossip 0.3).
-    - spread_factor: 복사본·포워드로 퍼진 정도.
-    - velocity_mult: 지금 가속 중일수록 가점(1.0~3.0).
-    감성·유형 필터로 '리포트만', 'gossip 제외', '긍정 글만' 같은 관점을 줄 수 있습니다.
+    """종목별 종합 버즈 스코어(독립언급×tier×확산×velocity). 감성·유형 필터 지원.
 
     Args:
         window_hours: 집계 윈도우(시간). 기본 24.
-        only_types: 포함할 메시지 유형만(예: ["report"]). 생략 시 전체.
-        exclude_gossip: only_types 미지정 시 gossip(찌라시) 유형 제외. 기본 False.
-        sentiment: 특정 감성만(positive/negative/neutral). 생략 시 전체.
+        only_types: 포함할 메시지 유형(예: ["report"]). 생략 시 전체.
+        exclude_gossip: only_types 미지정 시 gossip 제외. 기본 False.
+        sentiment: positive/negative/neutral 중 하나만. 생략 시 전체.
         top: 상위 N개. 기본 20.
     """
     return _json(
@@ -561,15 +550,10 @@ async def telegram_messages(
 async def telegram_search(
     query: str, hours: float = 72, limit: int = 30, channel: str | None = None
 ) -> str:
-    """원문 메시지를 키워드/주제로 전문검색합니다.
+    """원문 메시지를 키워드/주제로 전문검색합니다('내용' 축 도구).
 
-    trending·stock_buzz 가 '종목' 축의 도구라면, 이건 '내용' 축의 도구입니다.
-    종목 언급이 없는 거시경제 뉴스·반도체 산업 설명글·테마 흐름 등 종목코드가
-    안 붙은 글도 본문 키워드로 찾습니다(예: "반도체 HBM", "금리 인하", "관세").
-
-    여러 단어는 공백으로 구분하면 모두 포함(AND)하는 글을 찾습니다. 3글자 이상
-    키워드가 더 정확·빠릅니다(2글자 이하는 자동으로 부분일치 폴백). 결과는 실제
-    텔레그램 원문이므로, 내용을 설명할 때는 이 원문에 적힌 것만 근거로 쓰세요.
+    종목코드가 안 붙은 거시·산업·테마 글도 본문 키워드로 찾습니다(예: "반도체 HBM",
+    "금리 인하"). 여러 단어는 공백 구분 AND 매칭, 3글자 이상이 정확·빠름.
 
     Args:
         query: 검색 키워드(여러 단어는 공백 구분, AND 매칭).
@@ -589,10 +573,8 @@ async def telegram_classify_channels(
 ) -> str:
     """가입한 모든 채널을 스캔해 채널별 '종목 언급 밀도'를 측정·리포트합니다.
 
-    어느 채널이 종목 위주이고 어느 채널이 거시·뉴스·잡담 위주인지 보여주는 진단
-    도구입니다. 수집 자체는 가입된 모든 브로드캐스트 채널을 대상으로 하므로(새 채널
-    자동 포함), 이 분류가 수집 대상을 제한하지는 않습니다.
-    (전 채널을 훑으므로 시간이 걸립니다. 필요할 때만 실행하세요.)
+    어느 채널이 종목 위주이고 어느 채널이 거시·잡담 위주인지 보여주는 진단 도구.
+    수집 대상을 제한하지는 않습니다(전 채널 자동 포함). 전 채널을 훑어 느리니 필요할 때만.
 
     Args:
         sample: 채널당 샘플링 메시지 수. 기본 80.
@@ -631,19 +613,14 @@ _VALID_TIERS = ("analyst", "research", "info", "gossip")
 async def telegram_set_tier(
     channel: str, tier: str, weight: float | None = None, note: str = ""
 ) -> str:
-    """채널의 tier(성격 분류)를 수동 지정합니다. 휴리스틱 자동시드를 덮어쓰고 보존됩니다.
+    """채널 tier(성격)를 수동 지정합니다. 자동시드를 덮어쓰며 이후 재시드가 보존합니다.
 
-    tier 는 버즈 집계의 채널 가중치 근거입니다(analyst 가장 신뢰, gossip 가장 낮음).
-    수동 지정(source='manual')은 이후 자동 재시드가 절대 덮어쓰지 않습니다.
+    tier 는 버즈 집계의 채널 가중치 근거입니다.
 
     Args:
         channel: 채널 username(@ 제외) 또는 6자리가 아닌 숫자 channel_id.
-        tier: analyst | research | info | gossip 중 하나.
-            - analyst : 증권사 애널리스트 채널
-            - research: 독립리서치 채널
-            - info    : 종합정보·속보 채널
-            - gossip  : 찌라시·커뮤니티 채널
-        weight: 가중 계수(생략 시 tier 기본값 analyst1.0/research0.8/info0.5/gossip0.3).
+        tier: analyst(애널리스트) | research(독립리서치) | info(종합·속보) | gossip(찌라시).
+        weight: 가중 계수(생략 시 기본 analyst1.0/research0.8/info0.5/gossip0.3).
         note: 메모(선택).
     """
     tier = tier.strip().lower()
