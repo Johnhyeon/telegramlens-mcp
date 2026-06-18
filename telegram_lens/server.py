@@ -19,6 +19,7 @@ from telegram_lens import db, discover, queries
 from telegram_lens.classify import run_classification
 from telegram_lens.config import data_dir, is_logged_in
 from telegram_lens.client import NoCredentialsError, NotLoggedInError
+from telegram_lens.licensing import is_licensed, LOCKED_MESSAGE
 from telegram_lens.extract import reset_index
 from telegram_lens.stocks import add_alias, add_ambiguous, load_stocks, resolve_code
 from telegram_lens.sync import run_sync
@@ -65,10 +66,13 @@ async def _lifespan(_server):
 
 
 def safe_tool(func):
-    """예외를 사용자 친화 메시지로 변환."""
+    """예외를 사용자 친화 메시지로 변환. 아울러 라이선스 게이트를 적용한다 —
+    모든 도구가 이 래퍼를 거치므로, 미활성화 시 조회 없이 안내 메시지를 반환한다."""
 
     @functools.wraps(func)
     async def wrapper(*args, **kwargs):
+        if not is_licensed():
+            return LOCKED_MESSAGE
         try:
             return await func(*args, **kwargs)
         except NoCredentialsError as e:

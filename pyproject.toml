@@ -30,6 +30,7 @@ dependencies = [
 [project.scripts]
 telegramlens = "telegram_lens.server:main"
 telegramlens-login = "telegram_lens.login_cli:main"
+telegramlens-activate = "telegram_lens.licensing:activate_cli"
 telegramlens-setup = "telegram_lens.setup_claude:main"
 telegramlens-daemon = "telegram_lens.daemon:main"
 telegramlens-api = "telegram_lens.api:main"
