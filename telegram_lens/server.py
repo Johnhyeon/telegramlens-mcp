@@ -373,7 +373,7 @@ async def telegram_sync(minutes: int = 60, per_channel_limit: int = 500) -> str:
 @mcp.tool()
 @safe_tool
 @warn_if_collecting
-async def telegram_trending(hours: float = 24, top: int = 20) -> str:
+async def telegram_trending(hours: float = 24, top: int = 20, kind: str = "all") -> str:
     """기간 내 텔레그램 언급량 상위 종목을 반환합니다.
 
     종목코드 매칭 전용 — 거시·지정학·테마(예: "미국 이란", "금리") 질문은 telegram_search 사용.
@@ -381,15 +381,16 @@ async def telegram_trending(hours: float = 24, top: int = 20) -> str:
     Args:
         hours: 집계 시간 범위(시간). 기본 24.
         top: 상위 N개. 기본 20.
+        kind: 종목 종류 — "stock"(개별주만)/"etf"(ETF만)/"all"(전체). 기본 all.
     """
-    return _json(_stocks_payload(queries.trending(hours=hours, top=top)))
+    return _json(_stocks_payload(queries.trending(hours=hours, top=top, kind=kind)))
 
 
 @mcp.tool()
 @safe_tool
 @warn_if_collecting
 async def telegram_momentum(
-    hours: float = 6, baseline_hours: float = 72, top: int = 15
+    hours: float = 6, baseline_hours: float = 72, top: int = 15, kind: str = "all"
 ) -> str:
     """최근 언급이 기준 구간 대비 급증한 종목(새 내러티브)을 반환합니다.
 
@@ -399,10 +400,13 @@ async def telegram_momentum(
         hours: 최근 구간(시간). 기본 6.
         baseline_hours: 비교 기준 구간(시간). 기본 72.
         top: 상위 N개. 기본 15.
+        kind: 종목 종류 — "stock"(개별주만)/"etf"(ETF만)/"all"(전체). 기본 all.
     """
     return _json(
         _stocks_payload(
-            queries.momentum(hours=hours, baseline_hours=baseline_hours, top=top)
+            queries.momentum(
+                hours=hours, baseline_hours=baseline_hours, top=top, kind=kind
+            )
         )
     )
 
@@ -493,6 +497,7 @@ async def telegram_buzz_score(
     exclude_gossip: bool = False,
     sentiment: str | None = None,
     top: int = 20,
+    kind: str = "all",
 ) -> str:
     """종목별 종합 버즈 스코어(독립언급×tier×확산×velocity). 감성·유형 필터 지원.
 
@@ -504,6 +509,7 @@ async def telegram_buzz_score(
         exclude_gossip: only_types 미지정 시 gossip 제외. 기본 False.
         sentiment: positive/negative/neutral 중 하나만. 생략 시 전체.
         top: 상위 N개. 기본 20.
+        kind: 종목 종류 — "stock"(개별주만)/"etf"(ETF만)/"all"(전체). 기본 all.
     """
     return _json(
         _stocks_payload(
@@ -513,6 +519,7 @@ async def telegram_buzz_score(
                 exclude_gossip=exclude_gossip,
                 sentiment=sentiment,
                 top=top,
+                kind=kind,
             )
         )
     )

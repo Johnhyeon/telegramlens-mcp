@@ -13,8 +13,24 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from telegram_lens import db
+from telegram_lens.stocks import load_etf_codes
 
 _KST = ZoneInfo("Asia/Seoul")
+
+
+def _kind_predicate(kind: str):
+    """종목 종류 필터. kind='stock'(개별주만)/'etf'(ETF만)/'all'(전체).
+
+    반환: code→통과여부 함수, 또는 필터 불필요(all·미지원값)면 None.
+    개별주와 ETF는 언급 성격이 달라(종목 재료 vs 섹터·테마·자금흐름) 분리 조회를 지원한다.
+    """
+    if kind == "etf":
+        etf = load_etf_codes()
+        return lambda code: code in etf
+    if kind == "stock":
+        etf = load_etf_codes()
+        return lambda code: code not in etf
+    return None
 
 # 본문 속 URL. 공백·닫는 괄호·따옴표에서 끊고, 흔한 꼬리 구두점은 제거.
 _URL_RE = re.compile(r"https?://[^\s)\]>\"'》」』]+")
@@ -128,10 +144,18 @@ def _recent_snippets(
     return out
 
 
-def trending(hours: float = 24, top: int = 20, samples_per_stock: int = 1) -> list[dict]:
-    """기간 내 언급량 상위 종목 (각 종목의 최근 원문 샘플 동봉)."""
+def trending(
+    hours: float = 24, top: int = 20, samples_per_stock: int = 1, kind: str = "all"
+) -> list[dict]:
+    """기간 내 언급량 상위 종목 (각 종목의 최근 원문 샘플 동봉).
+
+    kind='stock'/'etf'/'all' 로 개별주·ETF 를 분리 조회한다(언급 성격이 달라서).
+    """
     cut = _cutoff(hours)
+    pred = _kind_predicate(kind)
     with db.connect() as conn:
+        # 정렬은 SQL, 종류 필터·top 자르기는 Python(필터를 top 전에 적용해야 정원이 참).
+        # 샘플 서브쿼리는 자른 뒤에만 돌려 비용을 top 개로 묶는다.
         rows = conn.execute(
             """
             SELECT men.code, men.name,
@@ -147,10 +171,12 @@ def trending(hours: float = 24, top: int = 20, samples_per_stock: int = 1) -> li
             WHERE men.date >= ?
             GROUP BY men.code
             ORDER BY independent DESC, channels DESC
-            LIMIT ?
             """,
-            (cut, top),
+            (cut,),
         ).fetchall()
+        if pred:
+            rows = [r for r in rows if pred(r["code"])]
+        rows = rows[:top]
         out = []
         for r in rows:
             d = dict(r)
@@ -176,11 +202,14 @@ def momentum(
     baseline_hours: float = 72,
     top: int = 15,
     samples_per_stock: int = 2,
+    kind: str = "all",
 ) -> list[dict]:
     """최근 구간 언급이 기준 구간 평균 대비 급증한 종목 (급증 구간 원문 샘플 동봉).
 
     spike = recent_rate / baseline_rate (시간당 언급 비율 비교)
+    kind='stock'/'etf'/'all' 로 개별주·ETF 를 분리 조회한다.
     """
+    pred = _kind_predicate(kind)
     now = datetime.now(timezone.utc)
     recent_cut = (now - timedelta(hours=hours)).isoformat()
     base_cut = (now - timedelta(hours=baseline_hours)).isoformat()
@@ -219,6 +248,8 @@ def momentum(
     out = []
     base_span = max(baseline_hours - hours, 1e-9)
     for code, r in recent.items():
+        if pred and not pred(code):
+            continue
         recent_rate = r["m"] / hours
         base_count = base.get(code, 0)
         base_rate = base_count / base_span
@@ -418,6 +449,7 @@ def buzz_score(
     bucket_minutes: int = 30,
     top: int = 20,
     samples_per_stock: int = 1,
+    kind: str = "all",
 ) -> list[dict]:
     """종목별 종합 버즈 스코어 (Phase 2-3).
 
@@ -441,6 +473,7 @@ def buzz_score(
     now_ts = now.timestamp()
     cut = (now - timedelta(hours=window_hours)).isoformat()
     bucket_sec = bucket_minutes * 60
+    pred = _kind_predicate(kind)
 
     where = ["men.date >= ?"]
     params: list = [cut]
@@ -499,6 +532,8 @@ def buzz_score(
 
         out = []
         for c, e in agg.items():
+            if pred and not pred(c):
+                continue
             independent = len(e["clusters"])
             raw_messages = len(e["messages"])
             spread_copies = raw_messages - independent
