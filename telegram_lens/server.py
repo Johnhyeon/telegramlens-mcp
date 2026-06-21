@@ -364,6 +364,8 @@ async def telegram_sync(minutes: int = 60, per_channel_limit: int = 500) -> str:
 async def telegram_trending(hours: float = 24, top: int = 20) -> str:
     """기간 내 텔레그램 언급량 상위 종목을 반환합니다.
 
+    종목코드 매칭 전용 — 거시·지정학·테마(예: "미국 이란", "금리") 질문은 telegram_search 사용.
+
     Args:
         hours: 집계 시간 범위(시간). 기본 24.
         top: 상위 N개. 기본 20.
@@ -378,6 +380,8 @@ async def telegram_momentum(
     hours: float = 6, baseline_hours: float = 72, top: int = 15
 ) -> str:
     """최근 언급이 기준 구간 대비 급증한 종목(새 내러티브)을 반환합니다.
+
+    종목코드 매칭 전용 — 거시·지정학·테마(예: "미국 이란", "금리") 질문은 telegram_search 사용.
 
     Args:
         hours: 최근 구간(시간). 기본 6.
@@ -447,6 +451,8 @@ async def telegram_timeline(
     이 종목이 언제 어느 채널에서 처음 터져 어떻게 번졌나(종단): 최초 언급 채널·시각,
     시간대별 독립 언급·확산 채널 수·velocity·베이스라인 배율·원문 샘플.
 
+    종목코드 매칭 전용 — 거시·지정학·테마(예: "미국 이란", "금리") 질문은 telegram_search 사용.
+
     Args:
         query: 종목명 또는 6자리 종목코드.
         hours: 윈도우(시간). 기본 72.
@@ -476,6 +482,8 @@ async def telegram_buzz_score(
     top: int = 20,
 ) -> str:
     """종목별 종합 버즈 스코어(독립언급×tier×확산×velocity). 감성·유형 필터 지원.
+
+    종목코드 매칭 전용 — 거시·지정학·테마(예: "미국 이란", "금리") 질문은 telegram_search 사용.
 
     Args:
         window_hours: 집계 윈도우(시간). 기본 24.
