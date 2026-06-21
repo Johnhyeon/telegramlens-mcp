@@ -21,7 +21,13 @@ from telegram_lens.config import data_dir, is_logged_in
 from telegram_lens.client import NoCredentialsError, NotLoggedInError
 from telegram_lens.licensing import is_licensed, LOCKED_MESSAGE
 from telegram_lens.extract import reset_index
-from telegram_lens.stocks import add_alias, add_ambiguous, load_stocks, resolve_code
+from telegram_lens.stocks import (
+    add_alias,
+    add_ambiguous,
+    load_etf_codes,
+    load_stocks,
+    resolve_code,
+)
 from telegram_lens.sync import run_sync
 
 _LOG = logging.getLogger("telegramlens.server")
@@ -95,10 +101,16 @@ def _stocks_payload(stocks: list) -> dict:
     텔레그램 버즈 결과의 종목들을 외부 시세·수급 도구(예: StockLens get_multi_stocks /
     get_flow_batch)로 한 번에 넘길 때, stocks 를 재파싱하지 않고 codes 를 그대로 배치 입력에
     쓰라고 노출한다. 순서는 결과 정렬(상위 버즈 먼저)을 유지한다.
+
+    각 종목에 is_etf 를 달고, ETF 코드만 모은 etf_codes 도 별도로 준다(주식/ETF 구분용).
     """
+    etf = load_etf_codes()
+    for s in stocks:
+        s["is_etf"] = s["code"] in etf
     return {
         "_guidance": _WHY_GUIDANCE,
         "codes": [s["code"] for s in stocks],
+        "etf_codes": [s["code"] for s in stocks if s["code"] in etf],
         "stocks": stocks,
     }
 
@@ -464,6 +476,7 @@ async def telegram_timeline(
     return _json(
         {
             "_guidance": _WHY_GUIDANCE,
+            "is_etf": code in load_etf_codes(),
             "timeline": queries.stock_timeline(
                 code=code, name=name, hours=hours, bucket_minutes=bucket_minutes
             ),
@@ -533,7 +546,10 @@ async def telegram_stock_buzz(query: str, hours: float = 24, samples: int = 8) -
                     break
     if code is None:
         return f"⚠️ '{query}' 종목을 사전에서 찾지 못했습니다."
-    return _json(queries.stock_buzz(code=code, name=name, hours=hours, samples=samples))
+    result = queries.stock_buzz(code=code, name=name, hours=hours, samples=samples)
+    if isinstance(result, dict):
+        result["is_etf"] = code in load_etf_codes()
+    return _json(result)
 
 
 @mcp.tool()

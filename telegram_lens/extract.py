@@ -21,7 +21,10 @@ from telegram_lens.stocks import (
     load_stocks,
 )
 
-_CODE_RE = re.compile(r"(?<!\d)(\d{6})(?!\d)")
+# 단축코드: 6자리 숫자(전통) 또는 신형 영숫자(DDDDAD). 영숫자 코드가 더 큰 영숫자
+# 토큰 속에 박혀 오탐 나는 걸 막으려 양옆 경계를 영숫자(ASCII)로 둔다. 사전 검증
+# (code in by_code)이 뒤따르므로 과매칭은 걸러진다.
+_CODE_RE = re.compile(r"(?<![0-9A-Za-z])(\d{4}[0-9A-Z]\d)(?![0-9A-Za-z])")
 
 # 이름 매칭에서 제외할 너무 흔하거나 짧은 토큰
 _MIN_NAME_LEN = 2

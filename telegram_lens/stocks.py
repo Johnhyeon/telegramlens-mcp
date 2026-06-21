@@ -29,6 +29,10 @@ _KRX_URL = "https://kind.krx.co.kr/corpgeneral/corpList.do"
 # 실패해도 회사 사전은 유지(ETF만 건너뜀).
 _KRX_ETF_URL = "http://data.krx.co.kr/comm/bldAttendant/getJsonData.cmd"
 
+# KRX 단축코드 패턴 — 6자리 숫자(전통) 또는 신형 영숫자(DDDDAD: 4숫자+1대문자+1숫자).
+# 숫자 코드 고갈로 신규 상장 종목·ETF에 영숫자 코드가 발급된다(회사 51개·ETF 269개 관측).
+_SHORT_CODE = r"\d{4}[0-9A-Z]\d"
+
 # 네트워크 불가 시 최소 동작용 시드(대형주 일부).
 _SEED: dict[str, str] = {
     "005930": "삼성전자",
@@ -54,9 +58,11 @@ _SEED: dict[str, str] = {
 }
 
 _cache: dict[str, str] | None = None
+_etf_cache: set[str] | None = None
 
 
-def _load_file() -> dict[str, str] | None:
+def _load_file() -> dict | None:
+    """stocks.json 원본(dict)을 반환. by_code 가 비어있으면 None."""
     p = stocks_path()
     if not p.exists():
         return None
@@ -64,16 +70,20 @@ def _load_file() -> dict[str, str] | None:
         data = json.loads(p.read_text(encoding="utf-8"))
         by_code = data.get("by_code")
         if isinstance(by_code, dict) and by_code:
-            return {str(k): str(v) for k, v in by_code.items()}
+            return data
     except (json.JSONDecodeError, OSError):
         return None
     return None
 
 
-def _save_file(by_code: dict[str, str]) -> None:
+def _save_file(by_code: dict[str, str], etf_codes: set[str]) -> None:
     stocks_path().write_text(
         json.dumps(
-            {"updated": datetime.now(timezone.utc).isoformat(), "by_code": by_code},
+            {
+                "updated": datetime.now(timezone.utc).isoformat(),
+                "by_code": by_code,
+                "etf_codes": sorted(etf_codes),
+            },
             ensure_ascii=False,
             indent=0,
         ),
@@ -130,9 +140,11 @@ def refresh_stocks() -> dict[str, str]:
             ]
             if len(cells) < 2:
                 continue
-            # 첫 셀이 회사명, 행 어딘가에 6자리 종목코드가 있다.
+            # 첫 셀이 회사명, 행 어딘가에 단축코드(숫자 또는 신형 영숫자)가 있다.
             name = cells[0]
-            code_raw = next((c for c in cells[1:] if re.fullmatch(r"\d{6}", c)), None)
+            code_raw = next(
+                (c for c in cells[1:] if re.fullmatch(_SHORT_CODE, c)), None
+            )
             if code_raw and name:
                 by_code[code_raw] = name
     except Exception:
@@ -142,25 +154,37 @@ def refresh_stocks() -> dict[str, str]:
         by_code = dict(_SEED)
 
     # ETF 병합 — 코드는 전 종목 유니크라 회사와 충돌 없음. 실패해도 회사 사전 유지.
-    by_code.update(_fetch_etfs())
+    etfs = _fetch_etfs()
+    by_code.update(etfs)
+    etf_codes = set(etfs)
 
-    _save_file(by_code)
-    global _cache
+    _save_file(by_code, etf_codes)
+    global _cache, _etf_cache
     _cache = by_code
+    _etf_cache = etf_codes
     return by_code
 
 
 def load_stocks(refresh: bool = False) -> dict[str, str]:
-    """종목코드→종목명 매핑 반환(메모리 캐시)."""
-    global _cache
+    """종목코드→종목명 매핑 반환(메모리 캐시). ETF 코드셋도 함께 채운다."""
+    global _cache, _etf_cache
     if _cache is not None and not refresh:
         return _cache
     if not refresh:
-        loaded = _load_file()
-        if loaded:
-            _cache = loaded
+        data = _load_file()
+        if data:
+            _cache = {str(k): str(v) for k, v in data["by_code"].items()}
+            _etf_cache = {str(c) for c in data.get("etf_codes", [])}
             return _cache
     return refresh_stocks()
+
+
+def load_etf_codes() -> set[str]:
+    """ETF 단축코드 집합(주식과 구분용). 미로딩 시 사전 로드를 트리거한다."""
+    global _etf_cache
+    if _etf_cache is None:
+        load_stocks()
+    return _etf_cache or set()
 
 
 def _load_json(name: str) -> dict:
