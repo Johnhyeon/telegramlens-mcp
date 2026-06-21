@@ -24,6 +24,11 @@ _DATA_DIR = Path(__file__).parent / "data"
 # https + 리다이렉트 추적 + UA 필요. 실패하면 시드로 폴백한다.
 _KRX_URL = "https://kind.krx.co.kr/corpgeneral/corpList.do"
 
+# KRX 데이터시스템 ETF 전종목 finder(JSON, UTF-8). 상장법인 목록(searchType=13)에는
+# ETF(펀드)가 없어 별도로 받아 병합한다. block1: [{full_code, short_code, codeName}].
+# 실패해도 회사 사전은 유지(ETF만 건너뜀).
+_KRX_ETF_URL = "http://data.krx.co.kr/comm/bldAttendant/getJsonData.cmd"
+
 # 네트워크 불가 시 최소 동작용 시드(대형주 일부).
 _SEED: dict[str, str] = {
     "005930": "삼성전자",
@@ -76,8 +81,33 @@ def _save_file(by_code: dict[str, str]) -> None:
     )
 
 
+def _fetch_etfs() -> dict[str, str]:
+    """KRX 데이터시스템에서 ETF 전종목(코드→약식명)을 받아 반환. 실패 시 {}."""
+    try:
+        resp = httpx.post(
+            _KRX_ETF_URL,
+            data={
+                "bld": "dbms/comm/finder/finder_secuprodisu",
+                "mktsel": "ETF",
+                "typeNo": "0",
+            },
+            timeout=30.0,
+            headers={"User-Agent": "Mozilla/5.0", "Referer": "http://data.krx.co.kr/"},
+        )
+        rows = resp.json().get("block1", [])
+        out: dict[str, str] = {}
+        for r in rows:
+            code = str(r.get("short_code", "")).strip()
+            name = str(r.get("codeName", "")).strip()
+            if code and name:
+                out[code] = name
+        return out
+    except Exception:
+        return {}
+
+
 def refresh_stocks() -> dict[str, str]:
-    """KRX에서 상장종목 전체를 받아 캐시. 실패 시 시드 반환."""
+    """KRX에서 상장종목 전체(회사 + ETF)를 받아 캐시. 실패 시 시드 반환."""
     by_code: dict[str, str] = {}
     try:
         import re
@@ -110,6 +140,9 @@ def refresh_stocks() -> dict[str, str]:
 
     if not by_code:
         by_code = dict(_SEED)
+
+    # ETF 병합 — 코드는 전 종목 유니크라 회사와 충돌 없음. 실패해도 회사 사전 유지.
+    by_code.update(_fetch_etfs())
 
     _save_file(by_code)
     global _cache
