@@ -23,6 +23,8 @@ import sys
 from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 
+from telethon import events
+
 from telegram_lens import commands, db
 from telegram_lens.client import make_client
 from telegram_lens.config import data_dir, secure_data_files
@@ -492,37 +494,72 @@ async def _drain_send_request(client) -> None:
         _LOG.info("나에게 전송 완료 — %d개 메시지", result["sent"])
 
 
-_last_cmd_id = [None]  # 처리한 마지막 '나에게' 메시지 id (None=미초기화)
+_my_id_cache = [None]            # 본인(Saved Messages) user id
+_seen_cmd_ids: set = set()       # 처리(예약)한 '!' 메시지 id — 이벤트·폴링 중복 차단
+_cmd_init_done = [False]         # 기동 직후 기존 메시지 1회 스킵 여부
+
+
+async def _get_my_id(client):
+    if _my_id_cache[0] is None:
+        try:
+            me = await client.get_me()
+            _my_id_cache[0] = me.id if me else None
+        except Exception:  # noqa: BLE001
+            pass
+    return _my_id_cache[0]
+
+
+async def _process_command_msg(client, msg) -> None:
+    """'나에게'의 한 메시지를 '!' 명령이면 처리해 답장. 이벤트·폴링 양쪽에서 호출(중복은 id로 차단).
+
+    '!' 로 시작하는 메시지만 처리 → 브리핑·답장·개인 메모는 무시(루프 방지·프라이버시).
+    """
+    text = (getattr(msg, "raw_text", None) or getattr(msg, "text", None) or "").strip()
+    if not text.startswith("!"):
+        return
+    mid = getattr(msg, "id", None)
+    if mid in _seen_cmd_ids:  # await 전 체크-마킹 → asyncio 단일스레드라 atomic
+        return
+    _seen_cmd_ids.add(mid)
+    if len(_seen_cmd_ids) > 500:  # 메모리 상한
+        for x in sorted(_seen_cmd_ids)[:300]:
+            _seen_cmd_ids.discard(x)
+    try:
+        reply = commands.handle_command(text[1:])
+        if reply:
+            for chunk in _split_message(reply):
+                await client.send_message("me", chunk)
+            _LOG.info("! 명령 처리: %s", text[:24])
+    except Exception as e:  # noqa: BLE001
+        _LOG.error("! 명령 실패: %s: %s", type(e).__name__, e)
+
+
+def _make_command_handler(client):
+    """'나에게'의 새 메시지를 '즉시' 처리하는 이벤트 핸들러(cross-client = 폰에서 보낸 명령)."""
+    async def _handler(event):
+        try:
+            await _process_command_msg(client, event.message)
+        except Exception as e:  # noqa: BLE001
+            _LOG.error("! 명령 핸들러 오류: %s", e)
+
+    return _handler
 
 
 async def _poll_commands(client) -> None:
-    """'나에게(Saved Messages)'의 새 '!' 명령을 폴링해 DB 조회로 즉답한다.
-
-    get_messages 라 폰·데스크탑 등 어느 클라이언트가 보냈든 다 잡힌다(이벤트 핸들러는
-    same-client 미발화 등 불확실해서 검증된 폴링 사용). '!' 로 시작하는 메시지만 처리 →
-    브리핑·답장·개인 메모는 무시(루프 방지·프라이버시). 기동 직후 기존 메시지는 건너뛴다.
-    """
+    """폴백 — 이벤트를 못 받았을 때 '나에게'를 읽어 새 '!' 명령 처리(get_messages 라 어떤
+    클라이언트가 보냈든 잡힘). 기동 직후 기존 메시지는 seen 처리해 과거 명령 replay 방지."""
     try:
         msgs = await client.get_messages("me", limit=15)
     except Exception as e:  # noqa: BLE001
         _LOG.warning("명령 폴링 실패: %s", e)
         return
-    if _last_cmd_id[0] is None:  # 기동 직후 1회: 기존 메시지는 처리하지 않음
-        _last_cmd_id[0] = max((m.id for m in msgs), default=0)
+    if not _cmd_init_done[0]:
+        for m in msgs:
+            _seen_cmd_ids.add(m.id)
+        _cmd_init_done[0] = True
         return
-    for m in sorted((x for x in msgs if x.id > _last_cmd_id[0]), key=lambda x: x.id):
-        _last_cmd_id[0] = m.id
-        text = (m.text or "").strip()
-        if not text.startswith("!"):
-            continue
-        try:
-            reply = commands.handle_command(text[1:])
-            if reply:
-                for chunk in _split_message(reply):
-                    await client.send_message("me", chunk)
-                _LOG.info("! 명령 처리: %s", text[:24])
-        except Exception as e:  # noqa: BLE001
-            _LOG.error("! 명령 실패: %s: %s", type(e).__name__, e)
+    for m in sorted(msgs, key=lambda x: x.id):
+        await _process_command_msg(client, m)
 
 
 async def _loop(
@@ -607,11 +644,17 @@ async def _loop(
         listener = make_client()
         try:
             await listener.connect()
+            my_id = await _get_my_id(listener)
+            if my_id is not None:  # 이벤트 핸들러: '나에게'의 ! 명령을 즉시 처리(instant)
+                listener.add_event_handler(
+                    _make_command_handler(listener),
+                    events.NewMessage(chats=my_id),
+                )
             waited = 0
             total = interval_min * 60
             while waited < total and not _stop.is_set():
                 await _drain_send_request(listener)
-                await _poll_commands(listener)  # '!' 명령 폴링(~15초 주기)
+                await _poll_commands(listener)  # 폴백(이벤트 못 받은 명령 ≤15초)
                 if _read_backfill_request():
                     break
                 try:
