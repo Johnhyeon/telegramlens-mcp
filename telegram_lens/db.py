@@ -202,6 +202,40 @@ def init_db(path: Path | None = None) -> None:
         _migrate(conn)
 
 
+def prune_raw_content(retention_days: int, conn: sqlite3.Connection) -> int:
+    """보존창보다 오래된 '원문'만 정리하고 '시그널'은 영구 보존한다(2층 보존 정책).
+
+    - messages.text 를 ''(빈 문자열)로 비움 → FTS 는 messages_au(UPDATE OF text) 트리거가
+      자동으로 옛 색인 삭제 + 빈 문자열 재색인하므로 검색에서도 사라진다.
+    - message_views_log(조회수 스냅샷)도 보존창 밖이면 삭제.
+    - messages 행·mentions·stock_baseline 은 건드리지 않는다 → momentum 히스토리 보존,
+      ON DELETE CASCADE 미발동(행을 지우지 않으므로 mentions 가 함께 지워지지 않음).
+
+    텔레그램 원본은 이미 삭제됐을 수 있어(우리가 유일 사본) 비가역적이다 → 보존창은 넉넉히.
+    반환: 원문을 비운 메시지 수.
+    """
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=retention_days)).isoformat()
+    cur = conn.execute(
+        "UPDATE messages SET text = '' WHERE date < ? AND text != ''", (cutoff,)
+    )
+    blanked = cur.rowcount
+    conn.execute("DELETE FROM message_views_log WHERE captured_at < ?", (cutoff,))
+    return blanked
+
+
+def vacuum(path: Path | None = None) -> None:
+    """VACUUM 으로 디스크 반환(text 를 비워도 VACUUM 전엔 페이지가 회수되지 않음).
+
+    VACUUM 은 트랜잭션 밖에서만 가능하므로 전용 연결로 autocommit 실행한다.
+    """
+    conn = sqlite3.connect(str(path or db_path()), timeout=30.0)
+    try:
+        conn.isolation_level = None
+        conn.execute("VACUUM")
+    finally:
+        conn.close()
+
+
 def _migrate(conn: sqlite3.Connection) -> None:
     """user_version 게이트 1회성 마이그레이션.
 

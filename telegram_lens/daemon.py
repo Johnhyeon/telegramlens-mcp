@@ -327,6 +327,80 @@ def _clear_file(path) -> None:
         pass
 
 
+def _maintenance_path():
+    return data_dir() / "maintenance.json"
+
+
+def _retention_days() -> int:
+    try:
+        return max(1, int(os.environ.get("TELEGRAMLENS_RAW_RETENTION_DAYS", "90")))
+    except ValueError:
+        return 90
+
+
+def _run_maintenance() -> None:
+    """주기적 정리 — 원문 보존 prune(하루 1회) + VACUUM(월 1회). 시그널(mentions)은 영구 보존.
+
+    매 사이클 호출되지만 타임스탬프 게이트로 실제 작업은 하루/월 1회만 한다(호출 자체는 저렴).
+    """
+    now = datetime.now(timezone.utc)
+    state = {}
+    p = _maintenance_path()
+    if p.exists():
+        try:
+            state = json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, ValueError, json.JSONDecodeError):
+            state = {}
+
+    def _age_h(key):
+        ts = state.get(key)
+        if not ts:
+            return None
+        try:
+            t = datetime.fromisoformat(ts)
+        except (ValueError, TypeError):
+            return None
+        if t.tzinfo is None:
+            t = t.replace(tzinfo=timezone.utc)
+        return (now - t).total_seconds() / 3600
+
+    changed = False
+    # 원문 prune: 하루 1회
+    ah = _age_h("last_prune")
+    if ah is None or ah >= 24:
+        try:
+            days = _retention_days()
+            with db.connect() as conn:
+                blanked = db.prune_raw_content(days, conn)
+            if blanked:
+                _LOG.info("보존 정리 — 원문 %d건 비움(>%d일, 시그널 보존)", blanked, days)
+            state["last_prune"] = now.isoformat()
+            changed = True
+        except Exception as e:  # noqa: BLE001 — 정리 실패가 수집을 막으면 안 됨
+            _LOG.error("보존 정리 실패: %s: %s", type(e).__name__, e)
+    # VACUUM: 월 1회. 첫 실행은 타임스탬프만 찍고 건너뜀(불필요한 초기 VACUUM 방지).
+    vh = _age_h("last_vacuum")
+    if vh is None:
+        state["last_vacuum"] = now.isoformat()
+        changed = True
+    elif vh >= 24 * 30:
+        try:
+            db.vacuum()
+            _LOG.info("VACUUM 완료 — 디스크 반환")
+            state["last_vacuum"] = now.isoformat()
+            changed = True
+        except Exception as e:  # noqa: BLE001
+            _LOG.error("VACUUM 실패: %s: %s", type(e).__name__, e)
+
+    if changed:
+        try:
+            _maintenance_path().write_text(
+                json.dumps(state, ensure_ascii=False), encoding="utf-8"
+            )
+        except OSError:
+            pass
+
+
 async def _loop(
     interval_min: int, min_window: int, max_window: int, per_channel_limit: int
 ) -> None:
@@ -398,6 +472,10 @@ async def _loop(
             _write_heartbeat("error", interval_min, {"error": str(e)})
         else:
             _write_heartbeat("sleeping", interval_min, last_result)
+
+        # 정상 사이클에서만 정리(백필/캐치업 중엔 부하 안 주기 위해 건너뜀).
+        if not catching_up:
+            _run_maintenance()
 
         # interval 만큼 자되, 중간에 백필 요청이 들어오면 ~15초 내 깨어 처리.
         waited = 0
