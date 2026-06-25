@@ -493,6 +493,56 @@ async def telegram_momentum(
     )
 
 
+_BRIEFING_PLAYBOOK = (
+    "이 데이터로 '나에게 보낼' 시장 브리핑을 작성해 telegram_send_me 로 보내세요.\n"
+    "[메시지 2개로 분리]\n"
+    "1) 오늘 시황 — 간밤 미국장·매크로 일정, 코스피/코스닥 방향. 정확한 지수·수치가 필요하면 "
+    "StockLens 시세나 웹으로 '사실'만 보강(텔레그램엔 해석이 많고 확정 수치는 적음).\n"
+    "2) 텔레그램 버즈 — '많이 언급'(trending_많이언급)과 '갑자기 급증'(momentum_급증)을 나눠, "
+    "각 종목이 왜 거론되는지 1차 해석 + 근거 채널을 짧게.\n"
+    "[작성 원칙]\n"
+    "- plain text. 마크다운 기호(**, |, # 등) 쓰지 마세요 — 텔레그램에 그대로 보입니다.\n"
+    "- 수치·사실은 데이터에 있는 것만. 출처에 없는 숫자를 지어내지 말고, 근거가 약하면 '~설/언급'.\n"
+    "- 역할: 텔레그램=해석·테마·센티먼트, 웹/StockLens/DartLens=확정 수치. 섞지 마세요.\n"
+    "- 한국어, 간결한 불릿. 특정 종목 매수/매도 추천이 아니라 '정보 정리'로.\n"
+    "- 보내기 전에 한글 오타·깨진 글자를 검토해 완성하고, telegram_send_me 는 단 한 번만 "
+    "호출하세요(전송 후 재검토·재발송 금지)."
+)
+
+
+@mcp.tool()
+@safe_tool
+@warn_if_collecting
+async def telegram_briefing(hours: float = 12) -> str:
+    """'오늘 브리핑 / 장전 / (텔레그램) 시황 / 시장 브리핑' 등을 요청받으면 호출하세요.
+
+    시장 브리핑용 텔레그램 언급 데이터를 한 번에 모아 반환합니다:
+    - trending_많이언급: 기간 내 '많이 언급된' 종목
+    - momentum_급증: 평소 대비 '갑자기 급증한' 종목(새 내러티브)
+
+    반환값의 _playbook 지침대로 plain-text 메시지를 작성해 telegram_send_me 로 '한 번만' 보내세요.
+    내용 작성·전송 규칙은 _playbook 과 telegram_send_me docstring 을 따르세요.
+
+    Args:
+        hours: 집계 시간 범위(시간). 장전이면 12 권장(간밤~아침). 기본 12.
+    """
+    baseline = max(hours * 6, 72)
+    trending = queries.trending(hours=hours, top=15, kind="all")
+    momentum = queries.momentum(hours=hours, baseline_hours=baseline, top=12, kind="all")
+    etf = load_etf_codes()
+    for s in trending + momentum:
+        s["is_etf"] = s.get("code") in etf
+    return _json(
+        {
+            "_playbook": _BRIEFING_PLAYBOOK,
+            "window_hours": hours,
+            "baseline_hours": baseline,
+            "trending_많이언급": trending,
+            "momentum_급증": momentum,
+        }
+    )
+
+
 def _resolve_code(query: str) -> tuple[str | None, str]:
     """종목명/코드 입력을 (code, name) 으로 해석. 못 찾으면 (None, query). (stocks 공용)"""
     return resolve_code(query)
