@@ -345,6 +345,76 @@ async def telegram_dismiss_backfill() -> str:
 
 @mcp.tool()
 @safe_tool
+async def telegram_send_me(messages: list[str]) -> str:
+    """데일리 브리핑 등을 사용자 본인 텔레그램 'Saved Messages(나에게)'로 전송합니다.
+
+    - messages: plain-text 문자열 리스트. 각 원소 = 텔레그램 메시지 1개.
+      예) telegram_send_me(["오늘 시황 요약 ...", "버즈: 많이 언급 vs 급증 ..."])
+    - 마크다운/HTML 미적용 — 텔레그램에 기호가 그대로 보이므로 plain text 로 작성(별표·표 금지).
+    - 수신자는 항상 본인(Saved Messages)으로 고정 — 남에게는 보낼 수 없습니다(ToS 안전).
+    - 전송은 수집 데몬을 통해 이뤄집니다(수집용 세션과 충돌 방지). 데몬 미가동이면 에러 반환.
+    - 4096자 초과 메시지는 자동 분할. 반환: 성공 여부 + 전송된 메시지 수.
+
+    '아침 주식 비서'처럼 스케줄(매일 07:00) 작업에서 브리핑을 작성해 이 도구로 보냅니다.
+    내용·개수·구성(시황/버즈/시세/공시)은 호출하는 쪽에서 자유롭게 정합니다.
+    """
+    if isinstance(messages, str):
+        msgs = [messages] if messages.strip() else []
+    elif isinstance(messages, list):
+        msgs = [str(m) for m in messages if str(m).strip()]
+    else:
+        return "⚠️ messages 는 문자열 리스트여야 합니다."
+    if not msgs:
+        return "⚠️ 보낼 내용이 없습니다."
+    if len(msgs) > 10:
+        return "⚠️ 한 번에 최대 10개 메시지까지 보낼 수 있습니다."
+
+    from telegram_lens.daemon import is_alive
+
+    if not is_alive():
+        return (
+            "⚠️ 수집 데몬이 가동 중이 아닙니다 — 전송은 데몬을 통해 이뤄집니다. "
+            "Claude 와 PC가 켜져 있는지 확인하세요(잠시 후 watchdog 이 데몬을 다시 띄웁니다)."
+        )
+
+    import uuid
+
+    req_id = uuid.uuid4().hex
+    req_path = data_dir() / "send_request.json"
+    res_path = data_dir() / "send_result.json"
+    try:
+        res_path.unlink()  # 직전 결과 제거(매칭 오인 방지)
+    except OSError:
+        pass
+    req_path.write_text(
+        json.dumps({"req_id": req_id, "messages": msgs}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    # 데몬이 sleep 구간(≈15초 주기)에 처리 → 결과 회수. 대량 수집 중이면 다소 지연 가능.
+    for _ in range(150):  # 150 × 0.5s = 75s
+        await asyncio.sleep(0.5)
+        if not res_path.exists():
+            continue
+        try:
+            res = json.loads(res_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if res.get("req_id") != req_id:
+            continue
+        if res.get("ok"):
+            return _json(
+                {"ok": True, "sent": res.get("sent", 0), "target": "Saved Messages(나에게)"}
+            )
+        return f"⚠️ 전송 실패: {res.get('error', '알 수 없음')}"
+    return (
+        "⚠️ 전송 확인 시간 초과(데몬이 대량 수집 중이면 지연될 수 있습니다). "
+        "중복 전송 방지를 위해 자동 재시도하지 않습니다 — 텔레그램 '나에게'를 확인하세요."
+    )
+
+
+@mcp.tool()
+@safe_tool
 async def telegram_sync(minutes: int = 60, per_channel_limit: int = 500) -> str:
     """최근 N분간의 텔레그램 메시지를 수집·구조화해 로컬 DB에 저장합니다.
 

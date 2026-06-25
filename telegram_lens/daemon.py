@@ -401,6 +401,104 @@ def _run_maintenance() -> None:
             pass
 
 
+def _send_request_path():
+    return data_dir() / "send_request.json"
+
+
+def _send_result_path():
+    return data_dir() / "send_result.json"
+
+
+def _read_send_request():
+    """서버(telegram_send_me 툴)가 남긴 '나에게 전송' 요청. {req_id, messages:[...]} | None.
+
+    전송은 데몬만 한다(세션 소유자 단일화 → 수집용 세션과 충돌 0). 서버는 요청 파일만 남기고,
+    데몬이 sleep 구간(수집 client 비활성)에 처리한 뒤 결과 파일을 남긴다.
+    """
+    p = _send_request_path()
+    if not p.exists():
+        return None
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+    msgs = data.get("messages")
+    if not isinstance(msgs, list) or not msgs:
+        return None
+    return {"req_id": data.get("req_id"), "messages": [str(m) for m in msgs]}
+
+
+def _split_message(text: str, limit: int = 4096) -> list[str]:
+    """텔레그램 길이 제한(4096) 안전망. 줄 경계로 나눠 청크가 한도를 넘지 않게 한다."""
+    text = text.rstrip("\n")
+    if not text.strip():
+        return []
+    if len(text) <= limit:
+        return [text]
+    chunks: list[str] = []
+    cur = ""
+    for line in text.split("\n"):
+        while len(line) > limit:  # 한 줄 자체가 한도 초과(드묾) → 강제 분할
+            if cur:
+                chunks.append(cur)
+                cur = ""
+            chunks.append(line[:limit])
+            line = line[limit:]
+        if not cur:
+            cur = line
+        elif len(cur) + 1 + len(line) <= limit:
+            cur = cur + "\n" + line
+        else:
+            chunks.append(cur)
+            cur = line
+    if cur:
+        chunks.append(cur)
+    return chunks
+
+
+async def _drain_send_request() -> None:
+    """'나에게 전송' 요청이 있으면 데몬이 직접 'me'(Saved Messages)로 보낸다.
+
+    데몬의 sleep 구간(수집 client 비활성)에 호출되므로 수집용 세션과 경합하지 않는다.
+    결과(req_id·성공·건수·오류)를 send_result.json 에 남겨 서버 툴이 회수한다.
+    """
+    req = _read_send_request()
+    if not req:
+        return
+    result = {"req_id": req.get("req_id"), "ok": False, "sent": 0}
+    try:
+        from telegram_lens.client import make_client
+
+        client = make_client()
+        await client.connect()
+        try:
+            if not await client.is_user_authorized():
+                result["error"] = "로그인이 필요합니다 (`telegramlens-login`)."
+            else:
+                sent = 0
+                for msg in req["messages"]:
+                    for chunk in _split_message(msg):
+                        await client.send_message("me", chunk)
+                        sent += 1
+                result["ok"] = True
+                result["sent"] = sent
+        finally:
+            await client.disconnect()
+    except Exception as e:  # noqa: BLE001 — 전송 실패가 데몬을 죽이면 안 됨
+        result["error"] = f"{type(e).__name__}: {e}"
+        _LOG.error("나에게 전송 실패: %s", e)
+
+    try:
+        _send_result_path().write_text(
+            json.dumps(result, ensure_ascii=False), encoding="utf-8"
+        )
+    except OSError:
+        pass
+    _clear_file(_send_request_path())
+    if result["ok"]:
+        _LOG.info("나에게 전송 완료 — %d개 메시지", result["sent"])
+
+
 async def _loop(
     interval_min: int, min_window: int, max_window: int, per_channel_limit: int
 ) -> None:
@@ -477,10 +575,11 @@ async def _loop(
         if not catching_up:
             _run_maintenance()
 
-        # interval 만큼 자되, 중간에 백필 요청이 들어오면 ~15초 내 깨어 처리.
+        # interval 만큼 자되, 중간에 백필/전송 요청이 들어오면 ~15초 내 깨어 처리.
         waited = 0
         total = interval_min * 60
         while waited < total and not _stop.is_set():
+            await _drain_send_request()  # '나에게 전송' 대기 요청 처리(수집 client 없는 구간)
             if _read_backfill_request():
                 break
             try:
