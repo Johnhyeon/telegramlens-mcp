@@ -18,16 +18,31 @@ from pathlib import Path
 from telegram_lens import db
 
 
+# tier(채널 성격) → 구매자용 한국어 라벨.
+_TIER_LABEL = {
+    "analyst": "증권사",
+    "research": "리서치",
+    "info": "정보",
+    "gossip": "찌라시",
+}
+
+
+def _tier_label(t) -> str:
+    return _TIER_LABEL.get(t or "", "-")
+
+
 def _collect(stock_only: bool) -> list[dict]:
     db.init_db()
     with db.connect() as conn:
         rows = conn.execute(
             """
-            SELECT c.id, c.title, c.username, c.subscribers,
+            SELECT c.id, c.title, c.username, c.subscribers, c.about AS about,
                    s.density AS density, s.is_stock AS is_stock, s.mentions AS mentions,
+                   t.tier AS tier,
                    (SELECT COUNT(*) FROM messages m WHERE m.channel_id = c.id) AS msgs
             FROM channels c
             LEFT JOIN channel_scores s ON s.channel_id = c.id
+            LEFT JOIN channel_tier t ON t.channel_id = c.id
             WHERE c.username IS NOT NULL AND c.username != ''
             """
         ).fetchall()
@@ -62,15 +77,16 @@ def _write_markdown(chans: list[dict], out: Path) -> None:
         "> 아래 **공개 채널**에 가입하면 TelegramLens가 해당 채널의 종목 언급·내러티브를",
         "> 수집합니다. 링크를 눌러(또는 텔레그램에서 검색해) 가입하세요.",
         "",
-        "| # | 채널 | 가입 링크 | 구독자 | 종목밀도 |",
-        "|---|---|---|---|---|",
+        "| # | 채널 | 분류 | 소개 | 가입 링크 | 구독자 | 종목밀도 |",
+        "|---|---|---|---|---|---|---|",
     ]
     for i, c in enumerate(chans, 1):
         title = (c.get("title") or "").replace("|", "\\|")
+        about = (c.get("about") or "").replace("|", "\\|") or "-"
         link = f"https://t.me/{c['username']}"
         lines.append(
-            f"| {i} | {title} | {link} | {_subs(c.get('subscribers'))} | "
-            f"{_density(c.get('density'))} |"
+            f"| {i} | {title} | {_tier_label(c.get('tier'))} | {about} | {link} | "
+            f"{_subs(c.get('subscribers'))} | {_density(c.get('density'))} |"
         )
     lines.append("")
     out.write_text("\n".join(lines), encoding="utf-8")
@@ -79,11 +95,16 @@ def _write_markdown(chans: list[dict], out: Path) -> None:
 def _write_csv(chans: list[dict], out: Path) -> None:
     with out.open("w", newline="", encoding="utf-8-sig") as f:
         w = csv.writer(f)
-        w.writerow(["title", "username", "link", "subscribers", "density", "is_stock"])
+        w.writerow(
+            ["title", "tier", "about", "username", "link",
+             "subscribers", "density", "is_stock"]
+        )
         for c in chans:
             w.writerow(
                 [
                     c.get("title"),
+                    _tier_label(c.get("tier")),
+                    c.get("about") or "",
                     c["username"],
                     f"https://t.me/{c['username']}",
                     c.get("subscribers"),
@@ -107,9 +128,18 @@ def main() -> None:
         action="store_true",
         help="classify 로 주식채널 판정된 것만 포함(telegram_classify_channels 선행 필요).",
     )
+    p.add_argument(
+        "--exclude",
+        default="",
+        help="제외할 채널 username(@ 제외) 쉼표 구분. 예: --exclude LeetKey_Labotory,foo. "
+        "본인 채널 등 공유 리스트에서 빼고 싶을 때.",
+    )
     args = p.parse_args()
 
     chans = _collect(args.stock_only)
+    excluded = {u.strip().lstrip("@").lower() for u in args.exclude.split(",") if u.strip()}
+    if excluded:
+        chans = [c for c in chans if (c.get("username") or "").lower() not in excluded]
     if not chans:
         print(
             "공개 채널이 없습니다. 데몬/telegram_sync 로 채널이 수집된 뒤 다시 실행하거나, "
