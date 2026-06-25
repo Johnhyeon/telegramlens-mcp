@@ -23,7 +23,8 @@ import sys
 from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 
-from telegram_lens import db
+from telegram_lens import commands, db
+from telegram_lens.client import make_client
 from telegram_lens.config import data_dir, secure_data_files
 from telegram_lens.sync import run_sync
 
@@ -456,10 +457,9 @@ def _split_message(text: str, limit: int = 4096) -> list[str]:
     return chunks
 
 
-async def _drain_send_request() -> None:
-    """'나에게 전송' 요청이 있으면 데몬이 직접 'me'(Saved Messages)로 보낸다.
+async def _drain_send_request(client) -> None:
+    """'나에게 전송' 요청이 있으면 (sleep 구간 listener client 로) 'me' 에 보낸다.
 
-    데몬의 sleep 구간(수집 client 비활성)에 호출되므로 수집용 세션과 경합하지 않는다.
     결과(req_id·성공·건수·오류)를 send_result.json 에 남겨 서버 툴이 회수한다.
     """
     req = _read_send_request()
@@ -467,23 +467,16 @@ async def _drain_send_request() -> None:
         return
     result = {"req_id": req.get("req_id"), "ok": False, "sent": 0}
     try:
-        from telegram_lens.client import make_client
-
-        client = make_client()
-        await client.connect()
-        try:
-            if not await client.is_user_authorized():
-                result["error"] = "로그인이 필요합니다 (`telegramlens-login`)."
-            else:
-                sent = 0
-                for msg in req["messages"]:
-                    for chunk in _split_message(msg):
-                        await client.send_message("me", chunk)
-                        sent += 1
-                result["ok"] = True
-                result["sent"] = sent
-        finally:
-            await client.disconnect()
+        if not await client.is_user_authorized():
+            result["error"] = "로그인이 필요합니다 (`telegramlens-login`)."
+        else:
+            sent = 0
+            for msg in req["messages"]:
+                for chunk in _split_message(msg):
+                    await client.send_message("me", chunk)
+                    sent += 1
+            result["ok"] = True
+            result["sent"] = sent
     except Exception as e:  # noqa: BLE001 — 전송 실패가 데몬을 죽이면 안 됨
         result["error"] = f"{type(e).__name__}: {e}"
         _LOG.error("나에게 전송 실패: %s", e)
@@ -497,6 +490,39 @@ async def _drain_send_request() -> None:
     _clear_file(_send_request_path())
     if result["ok"]:
         _LOG.info("나에게 전송 완료 — %d개 메시지", result["sent"])
+
+
+_last_cmd_id = [None]  # 처리한 마지막 '나에게' 메시지 id (None=미초기화)
+
+
+async def _poll_commands(client) -> None:
+    """'나에게(Saved Messages)'의 새 '!' 명령을 폴링해 DB 조회로 즉답한다.
+
+    get_messages 라 폰·데스크탑 등 어느 클라이언트가 보냈든 다 잡힌다(이벤트 핸들러는
+    same-client 미발화 등 불확실해서 검증된 폴링 사용). '!' 로 시작하는 메시지만 처리 →
+    브리핑·답장·개인 메모는 무시(루프 방지·프라이버시). 기동 직후 기존 메시지는 건너뛴다.
+    """
+    try:
+        msgs = await client.get_messages("me", limit=15)
+    except Exception as e:  # noqa: BLE001
+        _LOG.warning("명령 폴링 실패: %s", e)
+        return
+    if _last_cmd_id[0] is None:  # 기동 직후 1회: 기존 메시지는 처리하지 않음
+        _last_cmd_id[0] = max((m.id for m in msgs), default=0)
+        return
+    for m in sorted((x for x in msgs if x.id > _last_cmd_id[0]), key=lambda x: x.id):
+        _last_cmd_id[0] = m.id
+        text = (m.text or "").strip()
+        if not text.startswith("!"):
+            continue
+        try:
+            reply = commands.handle_command(text[1:])
+            if reply:
+                for chunk in _split_message(reply):
+                    await client.send_message("me", chunk)
+                _LOG.info("! 명령 처리: %s", text[:24])
+        except Exception as e:  # noqa: BLE001
+            _LOG.error("! 명령 실패: %s: %s", type(e).__name__, e)
 
 
 async def _loop(
@@ -575,18 +601,35 @@ async def _loop(
         if not catching_up:
             _run_maintenance()
 
-        # interval 만큼 자되, 중간에 백필/전송 요청이 들어오면 ~15초 내 깨어 처리.
-        waited = 0
-        total = interval_min * 60
-        while waited < total and not _stop.is_set():
-            await _drain_send_request()  # '나에게 전송' 대기 요청 처리(수집 client 없는 구간)
-            if _read_backfill_request():
-                break
-            try:
-                await asyncio.wait_for(_stop.wait(), timeout=min(15, total - waited))
+        # interval 만큼 자되, 그동안 '나에게'의 '!' 명령을 지속연결 핸들러로 '즉시' 처리하고
+        # 대기 중인 '나에게 전송'도 보낸다. 수집 client 는 이미 끊겼으므로(run_sync finally)
+        # 이 listener 와 세션이 동시에 안 떠 충돌이 없다(순차).
+        listener = make_client()
+        try:
+            await listener.connect()
+            waited = 0
+            total = interval_min * 60
+            while waited < total and not _stop.is_set():
+                await _drain_send_request(listener)
+                await _poll_commands(listener)  # '!' 명령 폴링(~15초 주기)
+                if _read_backfill_request():
+                    break
+                try:
+                    await asyncio.wait_for(_stop.wait(), timeout=min(15, total - waited))
+                except asyncio.TimeoutError:
+                    pass
+                waited += 15
+        except Exception as e:  # noqa: BLE001 — listener 오류가 데몬을 죽이면 안 됨
+            _LOG.warning("명령 listener 오류: %s: %s", type(e).__name__, e)
+            try:  # listener 가 죽어도 수집·하트비트는 계속 — 남은 주기만큼 대기
+                await asyncio.wait_for(_stop.wait(), timeout=interval_min * 60)
             except asyncio.TimeoutError:
                 pass
-            waited += 15
+        finally:
+            try:
+                await listener.disconnect()
+            except Exception:  # noqa: BLE001
+                pass
 
     beat_task.cancel()
     _LOG.info("데몬 종료.")
