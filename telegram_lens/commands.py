@@ -15,23 +15,38 @@ from telegram_lens import queries
 from telegram_lens.stocks import resolve_code
 
 
-def _dedup(samples: list, n: int) -> list:
-    """거의 동일한 원문(같은 뉴스 리포스트)을 접어 상위 n개만."""
-    seen, out = set(), []
-    for s in samples:
+def _diverse_samples(samples: list, n: int) -> list:
+    """채널 다양화 — 채널당 1개, 확산(forwards) 높은 것 우선, 내용 중복 제거.
+
+    뉴스 firehose 채널 하나가 샘플을 도배하거나 같은 뉴스가 반복되는 걸 막는다.
+    distinct 채널이 n 보다 적으면 채널 중복을 허용해 채운다(내용 중복만 계속 제외).
+    """
+    ranked = sorted(samples, key=lambda s: (s.get("forwards") or 0), reverse=True)
+    seen_ch, seen_txt, picked = set(), set(), []
+    for s in ranked:
+        ch = s.get("channel") or ""
         key = " ".join((s.get("text") or "").split())[:30]
-        if not key or key in seen:
+        if not key or key in seen_txt or ch in seen_ch:
             continue
-        seen.add(key)
-        out.append(s)
-        if len(out) >= n:
+        seen_ch.add(ch)
+        seen_txt.add(key)
+        picked.append(s)
+        if len(picked) >= n:
+            return picked
+    for s in ranked:  # 채널 부족 시 내용 중복만 피해 채움
+        key = " ".join((s.get("text") or "").split())[:30]
+        if not key or key in seen_txt:
+            continue
+        seen_txt.add(key)
+        picked.append(s)
+        if len(picked) >= n:
             break
-    return out
+    return picked
 
 
 def _samples_block(samples: list, n: int = 5) -> list:
     lines = []
-    for s in _dedup(samples, n):
+    for s in _diverse_samples(samples, n):
         txt = " ".join((s.get("text") or "").split())[:90]
         lines.append(f"· {txt}")
         link = s.get("telegram_link")
@@ -44,7 +59,7 @@ def _fmt_stock(query: str) -> str:
     code, name = resolve_code(query)
     if not code:
         return f"'{query}' — 종목을 못 찾았어요. !검색 {query} 로 원문을 찾아보세요."
-    r = queries.stock_buzz(code=code, name=name, hours=24, samples=10)
+    r = queries.stock_buzz(code=code, name=name, hours=24, samples=20)
     sm = r.get("summary") or {}
     stat = (
         f"{sm.get('independent', 0)}건 · {sm.get('channels', 0)}개 채널 "
@@ -65,7 +80,7 @@ def _fmt_search(query: str) -> str:
     query = query.strip()
     if not query:
         return "검색어를 주세요. 예: !검색 전력 ETF"
-    r = queries.search_messages(query, hours=48, limit=10)
+    r = queries.search_messages(query, hours=48, limit=15)
     n = r.get("matched", 0)
     if not n:
         return f"'{query}' — 최근 48시간 텔레그램에서 못 찾았어요."
