@@ -12,7 +12,7 @@ import json
 import logging
 import sys
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from mcp.server.fastmcp import FastMCP
 
@@ -504,6 +504,12 @@ _BRIEFING_PLAYBOOK = (
     "2) 텔레그램 버즈(종목): 텔레그램을 1차로 '갑자기 급증'(momentum_급증)·'많이 언급'(trending_많이언급)과 "
     "왜 거론되는지·근거 채널을 잡고, 그 종목들의 정확한 시세·수급·펀더멘털은 StockLens(SL)로, 공시는 "
     "DartLens(DL)로 확인하세요. 텔레그램이 '무엇을 볼지'를 정하고 SL/DL이 숫자를 확정합니다.\n"
+    "   · 급증 노이즈 거르기: momentum_급증 에서 listy_noise=true 인 종목은 '오늘의 리포트·상한가 "
+    "리스트·지분공시 정리' 같은 여러 종목 나열형 메시지에 한 줄 끼인 것(실제 논의 아님)이니 빼세요. "
+    "listy_noise=false 인 종목만, samples 원문을 읽고 왜 거론되는지 근거를 들어 짚으세요"
+    "('노이즈 가능성'으로 얼버무리지 말고 원문으로 판단).\n"
+    "   · 평이한 표현: '베이스라인'·'N배 스파이크'·'평소 대비 N배' 같은 전문용어·배수 수치는 쓰지 "
+    "마세요(사용자가 모름). '평소 거의 안 나오다 오늘 N개 채널에서 거론' 처럼 일반인 말로.\n"
     "[작성 원칙]\n"
     "- plain text. 마크다운 기호(**, |, # 등) 쓰지 마세요 — 텔레그램에 그대로 보입니다.\n"
     "- 수치·사실은 데이터에 있는 것만. 출처에 없는 숫자를 지어내지 말고, 근거가 약하면 '~설/언급'.\n"
@@ -556,6 +562,34 @@ def _macro_buzz(hours: float, limit: int = 12) -> list[dict]:
     return items[:limit]
 
 
+def _list_noise_density(hours: float, codes: list[str]) -> dict:
+    """종목별 '한 메시지당 평균 동시언급 종목수'. 높으면(>=8) 일일 나열형 메시지(오늘의 리포트·
+    상한가 리스트·지분공시 정리)에 한 줄 끼인 것 = 실제 논의가 아닌 저신뢰 노이즈. 낮으면 포커스."""
+    codes = [c for c in codes if c]
+    if not codes:
+        return {}
+    recent_cut = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+    qmarks = ",".join("?" * len(codes))
+    try:
+        with db.connect() as conn:
+            rows = conn.execute(
+                f"""
+                WITH mc AS (
+                    SELECT message_id, COUNT(DISTINCT code) n FROM mentions
+                    WHERE date >= ? GROUP BY message_id
+                )
+                SELECT men.code, AVG(mc.n) avg_codes
+                FROM mentions men JOIN mc ON mc.message_id = men.message_id
+                WHERE men.date >= ? AND men.code IN ({qmarks})
+                GROUP BY men.code
+                """,
+                [recent_cut, recent_cut, *codes],
+            ).fetchall()
+        return {r["code"]: r["avg_codes"] for r in rows}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
 @mcp.tool()
 @safe_tool
 @warn_if_collecting
@@ -576,16 +610,27 @@ async def telegram_briefing(hours: float = 12) -> str:
     trending = queries.trending(hours=hours, top=15, kind="all")
     momentum = queries.momentum(hours=hours, baseline_hours=baseline, top=12, kind="all")
     etf = load_etf_codes()
-    for s in trending + momentum:
+    for s in trending:
         s["is_etf"] = s.get("code") in etf
+    # 급증 종목 정제: '나열형 리스트 끼임' 노이즈를 표시하고, 베이스라인/배수 같은 전문용어
+    # 필드는 빼서(평이한 카운트만 남김) 그대로 echo 되지 않게 한다.
+    dens = _list_noise_density(hours, [s.get("code") for s in momentum])
+    keep = {"code", "name", "recent_mentions", "recent_channels", "is_new", "samples"}
+    slim_momentum = []
+    for s in momentum:
+        avg = dens.get(s.get("code"))
+        d = {k: s[k] for k in keep if k in s}
+        d["is_etf"] = s.get("code") in etf
+        d["stocks_per_msg_avg"] = round(avg, 1) if avg else None
+        d["listy_noise"] = bool(avg and avg >= 8)
+        slim_momentum.append(d)
     return _json(
         {
             "_playbook": _BRIEFING_PLAYBOOK,
             "window_hours": hours,
-            "baseline_hours": baseline,
             "macro_거시버즈": _macro_buzz(hours),
             "trending_많이언급": trending,
-            "momentum_급증": momentum,
+            "momentum_급증": slim_momentum,
         }
     )
 
