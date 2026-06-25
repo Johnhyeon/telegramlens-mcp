@@ -496,9 +496,11 @@ async def telegram_momentum(
 _BRIEFING_PLAYBOOK = (
     "이 데이터로 '나에게 보낼' 시장 브리핑을 작성해 telegram_send_me 로 보내세요.\n"
     "[메시지 2개로 분리 — 섹션마다 1차 소스가 다릅니다]\n"
-    "1) 오늘 시황(거시): 웹/StockLens 를 1차로 '사실'(지수 종가·매크로 일정·공식 수치)을 잡고, "
-    "텔레그램을 2차로 '국내 시장이 그 매크로를 어떻게 받아들이는지' 해석을 얹어 종합하세요. "
-    "여기서 웹은 정확한 숫자·일정 확인 전용 — 범용 뉴스 요약은 하지 마세요.\n"
+    "1) 오늘 시황(거시): macro_거시버즈(텔레그램의 Fed·PCE·금리·환율·지수 언급)와 웹/StockLens 의 "
+    "'사실'(지수 종가·매크로 일정·공식 수치)을 1차로 잡고, 텔레그램으로 '국내가 그 매크로를 어떻게 "
+    "해석·베팅하는지'를 2차로 얹어 종합하세요. 오늘 매크로 이벤트(FOMC·PCE·CPI·GDP·고용·관세 등)가 "
+    "있으면 거시 흐름·해석을 종목 얘기로 건너뛰지 말고 충분히 짚으세요. 웹은 정확한 숫자·일정 확인 "
+    "전용 — 범용 뉴스 요약은 하지 마세요.\n"
     "2) 텔레그램 버즈(종목): 텔레그램을 1차로 '갑자기 급증'(momentum_급증)·'많이 언급'(trending_많이언급)과 "
     "왜 거론되는지·근거 채널을 잡고, 그 종목들의 정확한 수치가 필요할 때만 웹/StockLens 로 2차 확인하세요. "
     "텔레그램이 '무엇을 볼지'를 정하고 웹은 그 숫자만 검증합니다(차별점).\n"
@@ -510,6 +512,47 @@ _BRIEFING_PLAYBOOK = (
     "- 보내기 전에 한글 오타·깨진 글자를 검토해 완성하고, telegram_send_me 는 단 한 번만 "
     "호출하세요(전송 후 재검토·재발송 금지)."
 )
+
+# 거시 키워드 — trending/momentum 은 종목코드 기반이라 거시(Fed·PCE·금리 등)를 못 잡는다.
+# 시황(거시) 섹션에 '데이터 앵커'를 주려고 search 로 끌어온다.
+_MACRO_TERMS = [
+    "FOMC", "연준", "PCE", "CPI", "GDP", "고용",
+    "금리", "환율", "국채", "나스닥", "관세", "유가",
+]
+
+
+def _macro_snippet(text: str, term: str, width: int = 150) -> str:
+    """매칭된 키워드 주변을 보여줘 '왜 거시인지'가 드러나게(앞부분만 자르면 맥락 손실)."""
+    idx = text.find(term)
+    if idx < 0:
+        return text[:width]
+    start = max(0, idx - 40)
+    seg = text[start:start + width]
+    return ("…" + seg if start > 0 else seg) + ("…" if start + width < len(text) else "")
+
+
+def _macro_buzz(hours: float, limit: int = 12) -> list[dict]:
+    """텔레그램에서 거시 키워드 언급을 모아 시황(거시) 섹션 앵커로 반환(최근순 상위 N)."""
+    seen: dict = {}
+    for term in _MACRO_TERMS:
+        try:
+            res = queries.search_messages(term, hours=hours, limit=4)
+        except Exception:  # noqa: BLE001 — 한 키워드 실패가 브리핑을 막으면 안 됨
+            continue
+        for r in res.get("results", []):
+            txt = " ".join((r.get("text") or "").split())
+            key = (r.get("date"), txt[:40])
+            if not txt or key in seen:
+                continue
+            seen[key] = {
+                "term": term,
+                "date": r.get("date"),
+                "channel": r.get("channel"),
+                "text": _macro_snippet(txt, term),
+                "telegram_link": r.get("telegram_link"),
+            }
+    items = sorted(seen.values(), key=lambda x: x.get("date") or "", reverse=True)
+    return items[:limit]
 
 
 @mcp.tool()
@@ -539,6 +582,7 @@ async def telegram_briefing(hours: float = 12) -> str:
             "_playbook": _BRIEFING_PLAYBOOK,
             "window_hours": hours,
             "baseline_hours": baseline,
+            "macro_거시버즈": _macro_buzz(hours),
             "trending_많이언급": trending,
             "momentum_급증": momentum,
         }
