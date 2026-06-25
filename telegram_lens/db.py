@@ -76,6 +76,7 @@ CREATE TABLE IF NOT EXISTS channels (
     title       TEXT,
     username    TEXT,
     subscribers INTEGER,
+    about       TEXT,                         -- 채널 소개글(GetFullChannel, 별도 수집)
     last_synced TEXT
 );
 
@@ -134,6 +135,8 @@ CREATE TABLE IF NOT EXISTS mentions (
 );
 CREATE INDEX IF NOT EXISTS idx_mentions_code_date ON mentions(code, date);
 CREATE INDEX IF NOT EXISTS idx_mentions_date ON mentions(date);
+-- message_id 인덱스: messages↔mentions 조인 및 ON DELETE CASCADE 시 풀스캔 방지(DB 성장 대비).
+CREATE INDEX IF NOT EXISTS idx_mentions_message_id ON mentions(message_id);
 
 CREATE TABLE IF NOT EXISTS channel_scores (
     channel_id    INTEGER PRIMARY KEY,
@@ -181,6 +184,11 @@ def connect(path: Path | None = None) -> Iterator[sqlite3.Connection]:
     try:
         yield conn
         conn.commit()
+    except Exception:
+        # 배치 도중 실패하면 부분 기록을 명시적으로 롤백하고 예외를 올린다(데몬이 '사이클
+        # 실패'로 로깅). close() 의 암묵 롤백에 기대지 않고 commit 단계 실패까지 포괄.
+        conn.rollback()
+        raise
     finally:
         conn.close()
 
@@ -215,6 +223,12 @@ def _migrate(conn: sqlite3.Connection) -> None:
     for name, decl in _MESSAGES_ADDED_COLUMNS.items():
         if name not in existing:
             conn.execute(f"ALTER TABLE messages ADD COLUMN {name} {decl}")
+
+    # channels.about: 채널 소개글(Telethon GetFullChannel 로 별도 수집). 신규 DB 는
+    # _SCHEMA 에 이미 있고, 기존 DB 만 여기서 채워진다(idempotent).
+    chan_cols = {r["name"] for r in conn.execute("PRAGMA table_info(channels)")}
+    if "about" not in chan_cols:
+        conn.execute("ALTER TABLE channels ADD COLUMN about TEXT")
 
     # v3: cluster_id/text_sig 컬럼이 확보됐으니 인덱스 생성(idempotent). _SCHEMA 가 아니라
     # 여기 두는 이유는 v2 DB executescript 시점엔 컬럼이 아직 없어 인덱스가 깨지기 때문.

@@ -21,9 +21,10 @@ import os
 import signal
 import sys
 from datetime import datetime, timezone
+from logging.handlers import RotatingFileHandler
 
 from telegram_lens import db
-from telegram_lens.config import data_dir
+from telegram_lens.config import data_dir, secure_data_files
 from telegram_lens.sync import run_sync
 
 _LOG = logging.getLogger("telegramlens.daemon")
@@ -73,7 +74,16 @@ def _collector_fresh(max_age_sec: float = 180) -> bool:
 
 def _setup_logging() -> None:
     log_path = data_dir() / "daemon.log"
-    handler = logging.FileHandler(log_path, encoding="utf-8")
+    # 로테이션: 10분마다 INFO 한 줄을 무기한 append 하면 무한 증식 → 5MB×3 으로 상한.
+    handler = RotatingFileHandler(
+        log_path, maxBytes=5_000_000, backupCount=3, encoding="utf-8"
+    )
+    # 포그라운드 디버그 실행 시 한국어 로그를 콘솔 코드페이지(예: cp949)로 찍다 나는
+    # UnicodeEncodeError 잡음을 막는다(운영에선 stdout 이 DEVNULL 이라 무관).
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="backslashreplace")
+    except (AttributeError, ValueError, OSError):
+        pass
     stream = logging.StreamHandler(sys.stdout)
     fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
     handler.setFormatter(fmt)
@@ -448,6 +458,7 @@ def main() -> None:
     args = _build_parser().parse_args()
 
     _setup_logging()
+    secure_data_files()
     min_window = (
         args.min_window if args.min_window is not None else args.interval * 2 + 10
     )

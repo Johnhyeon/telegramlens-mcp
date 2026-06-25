@@ -76,3 +76,22 @@ def save_credentials(api_id: int, api_hash: str) -> None:
 def is_logged_in() -> bool:
     """세션 파일이 존재하는지(로그인 완료 여부의 약한 신호)."""
     return session_path().with_suffix(".session").exists()
+
+
+def secure_data_files() -> None:
+    """민감 로컬 파일 권한을 0o600 으로 최소화(best-effort). 프로세스 기동 시 1회 호출.
+
+    특히 ``session.session`` 은 텔레그램 계정 전체 읽기 권한을 가진 가장 민감한 파일인데
+    Telethon 이 생성할 때 권한을 제한하지 않는다. 데이터 주권이 핵심 가치이므로 보호한다.
+    Windows 에선 chmod 가 대체로 무시되나(무해), POSIX(Mac/Linux)에선 world-readable 을 막는다.
+    """
+    for p in (
+        _credentials_file(),
+        session_path().with_suffix(".session"),
+        data_dir() / "license.key",
+    ):
+        try:
+            if p.exists():
+                p.chmod(0o600)
+        except OSError:
+            pass

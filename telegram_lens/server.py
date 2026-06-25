@@ -18,7 +18,7 @@ from mcp.server.fastmcp import FastMCP
 
 from telegram_lens import db, discover, queries
 from telegram_lens.classify import run_classification
-from telegram_lens.config import data_dir, is_logged_in
+from telegram_lens.config import data_dir, is_logged_in, secure_data_files
 from telegram_lens.client import NoCredentialsError, NotLoggedInError
 from telegram_lens.licensing import is_licensed, LOCKED_MESSAGE
 from telegram_lens.extract import reset_index
@@ -51,6 +51,7 @@ logging.getLogger("telethon").setLevel(logging.CRITICAL)
 @asynccontextmanager
 async def _lifespan(_server):
     db.init_db()
+    secure_data_files()
     # 수집 데몬을 '한 번만' 스폰하면, 데몬이 절전/재개·일시정지 등으로 죽었을 때 서버가
     # 살아있어도 영영 안 되살아난다(2026-06 장애: 3일간 수집 정지). 60초 감시 루프로
     # '실제 가동(is_alive: PID + 가동 신호 신선도)'을 확인해 죽었으면 재스폰한다 — Claude 가
