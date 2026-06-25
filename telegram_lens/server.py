@@ -510,6 +510,10 @@ _BRIEFING_PLAYBOOK = (
     "('노이즈 가능성'으로 얼버무리지 말고 원문으로 판단).\n"
     "   · 평이한 표현: '베이스라인'·'N배 스파이크'·'평소 대비 N배' 같은 전문용어·배수 수치는 쓰지 "
     "마세요(사용자가 모름). '평소 거의 안 나오다 오늘 N개 채널에서 거론' 처럼 일반인 말로.\n"
+    "3) 보면 좋은 글·자료(읽을거리_links): 확산 높은 심층글·첨부 리포트 '후보'입니다. 전부 나열하지 "
+    "말고, 오늘 시황·버즈와 관련 있고 읽을 가치 높은 것만 3~5개로 추려 '한 줄 내용 → URL' 형식으로 "
+    "주세요(plain text라 URL 그대로 — 텔레그램이 자동 링크, 마크다운 [이동] 금지). has_file 이면 "
+    "파일명도 적고. 모바일에서 원문으로 바로 점프하는 용도.\n"
     "[작성 원칙]\n"
     "- plain text. 마크다운 기호(**, |, # 등) 쓰지 마세요 — 텔레그램에 그대로 보입니다.\n"
     "- 수치·사실은 데이터에 있는 것만. 출처에 없는 숫자를 지어내지 말고, 근거가 약하면 '~설/언급'.\n"
@@ -590,6 +594,51 @@ def _list_noise_density(hours: float, codes: list[str]) -> dict:
         return {}
 
 
+def _reading_list(hours: float, limit: int = 8) -> list[dict]:
+    """그 시간대 '보면 좋은 글'(확산 높은 심층글)·첨부 리포트(document)를 링크와 함께 모은다.
+
+    모바일에서 원문으로 바로 점프하라고 브리핑에 붙인다. forwards(확산)가 핵심 신호.
+    잡담(gossip) 티어·짧은 글·인라인 사진(photo)은 제외.
+    """
+    cut = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+    try:
+        with db.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT m.text, m.msg_id, m.channel_id, m.media_type, m.file_name,
+                       m.forwards, c.title channel, c.username, t.tier
+                FROM messages m
+                LEFT JOIN channels c ON c.id = m.channel_id
+                LEFT JOIN channel_tier t ON t.channel_id = m.channel_id
+                WHERE m.date >= ? AND m.text != ''
+                  AND (LENGTH(m.text) > 120 OR m.media_type = 'document')
+                  AND (t.tier IS NULL OR t.tier != 'gossip')
+                ORDER BY m.forwards DESC
+                LIMIT ?
+                """,
+                (cut, limit),
+            ).fetchall()
+    except Exception:  # noqa: BLE001
+        return []
+    out = []
+    for r in rows:
+        link = queries._tg_link(r["username"], r["channel_id"], r["msg_id"])
+        if not link:
+            continue
+        is_doc = r["media_type"] == "document"
+        out.append(
+            {
+                "snippet": " ".join((r["text"] or "").split())[:60],
+                "channel": r["channel"],
+                "forwards": r["forwards"],
+                "has_file": bool(r["file_name"]) and is_doc,
+                "file_name": r["file_name"] if is_doc else None,
+                "link": link,
+            }
+        )
+    return out
+
+
 @mcp.tool()
 @safe_tool
 @warn_if_collecting
@@ -631,6 +680,7 @@ async def telegram_briefing(hours: float = 12) -> str:
             "macro_거시버즈": _macro_buzz(hours),
             "trending_많이언급": trending,
             "momentum_급증": slim_momentum,
+            "읽을거리_links": _reading_list(hours),
         }
     )
 
