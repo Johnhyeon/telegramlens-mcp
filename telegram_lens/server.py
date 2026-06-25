@@ -510,7 +510,10 @@ _BRIEFING_PLAYBOOK = (
     "('노이즈 가능성'으로 얼버무리지 말고 원문으로 판단).\n"
     "   · 평이한 표현: '베이스라인'·'N배 스파이크'·'평소 대비 N배' 같은 전문용어·배수 수치는 쓰지 "
     "마세요(사용자가 모름). '평소 거의 안 나오다 오늘 N개 채널에서 거론' 처럼 일반인 말로.\n"
-    "3) 보면 좋은 글·자료(읽을거리_links): 확산 높은 심층글·첨부 리포트 '후보'입니다. 전부 나열하지 "
+    "3) 내 종목(watchlist_내종목): 비어있지 않으면 보유 종목별로 오늘 텔레그램 거론 핵심을 한두 줄로 "
+    "정리하고(samples 근거 + 출처 채널), 정확한 종가는 StockLens 로 붙이세요. 조용한 종목은 '특이 "
+    "언급 없음'으로. 비어있으면 이 섹션 생략. '발견(시장 버즈)'과 별개인 '내가 가진 것 챙기기'입니다.\n"
+    "4) 보면 좋은 글·자료(읽을거리_links): 확산 높은 심층글·첨부 리포트 '후보'입니다. 전부 나열하지 "
     "말고, 오늘 시황·버즈와 관련 있고 읽을 가치 높은 것만 3~5개로 추려 '한 줄 내용 → URL' 형식으로 "
     "주세요(plain text라 URL 그대로 — 텔레그램이 자동 링크, 마크다운 [이동] 금지). has_file 이면 "
     "파일명도 적고. 모바일에서 원문으로 바로 점프하는 용도.\n"
@@ -639,6 +642,40 @@ def _reading_list(hours: float, limit: int = 8) -> list[dict]:
     return out
 
 
+def _watchlist_buzz(hours: float) -> list[dict]:
+    """보유/관심 종목(watchlist)별 텔레그램 언급 요약 — 브리핑 '내 종목(관리)' 섹션용.
+
+    텔레그램 언급·해석만 모은다. 정확한 종가는 Claude 가 StockLens 로 붙인다(역할 분리).
+    watchlist 비어있으면 빈 리스트 → 섹션 생략.
+    """
+    from telegram_lens import watchlist as _wl
+
+    out = []
+    for s in _wl.load():
+        try:
+            r = queries.stock_buzz(code=s["code"], name=s["name"], hours=hours, samples=2)
+        except Exception:  # noqa: BLE001
+            continue
+        sm = r.get("summary") or {}
+        out.append(
+            {
+                "name": s.get("name"),
+                "code": s.get("code"),
+                "independent": sm.get("independent", 0),
+                "channels": sm.get("channels", 0),
+                "samples": [
+                    {
+                        "text": x.get("text"),
+                        "channel": x.get("channel"),
+                        "telegram_link": x.get("telegram_link"),
+                    }
+                    for x in (r.get("samples") or [])[:2]
+                ],
+            }
+        )
+    return out
+
+
 @mcp.tool()
 @safe_tool
 @warn_if_collecting
@@ -681,6 +718,7 @@ async def telegram_briefing(hours: float = 12) -> str:
             "trending_많이언급": trending,
             "momentum_급증": slim_momentum,
             "읽을거리_links": _reading_list(hours),
+            "watchlist_내종목": _watchlist_buzz(hours),
         }
     )
 

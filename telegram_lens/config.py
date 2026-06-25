@@ -39,6 +39,11 @@ def tracked_path() -> Path:
     return data_dir() / "tracked.json"
 
 
+def watchlist_path() -> Path:
+    """보유/관심 종목 목록('내 종목 관리'). 명령(!보유)·브리핑 내종목 섹션이 사용."""
+    return data_dir() / "watchlist.json"
+
+
 def _credentials_file() -> Path:
     return data_dir() / "credentials.json"
 
