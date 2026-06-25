@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import functools
 import json
 import logging
@@ -50,23 +51,38 @@ logging.getLogger("telethon").setLevel(logging.CRITICAL)
 @asynccontextmanager
 async def _lifespan(_server):
     db.init_db()
-    child = None
-    try:
+    # 수집 데몬을 '한 번만' 스폰하면, 데몬이 절전/재개·일시정지 등으로 죽었을 때 서버가
+    # 살아있어도 영영 안 되살아난다(2026-06 장애: 3일간 수집 정지). 60초 감시 루프로
+    # '실제 가동(is_alive: PID + 가동 신호 신선도)'을 확인해 죽었으면 재스폰한다 — Claude 가
+    # 켜진 동안 수집 신선도를 자가치유로 보장. 새 persistence 없이 부모-자식 관계 유지.
+    state: dict = {"child": None}
+
+    async def _supervise() -> None:
         from telegram_lens.daemon import is_alive, spawn_child
 
-        if is_logged_in() and not is_alive():
-            child = spawn_child()
-            if child is not None:
-                _LOG.info("수집 데몬 자식 프로세스 기동 (pid=%s)", child.pid)
-    except Exception as e:  # noqa: BLE001 — 수집 기동 실패가 서버를 막으면 안 됨
-        _LOG.warning("수집 데몬 기동 실패: %s", e)
-        child = None
+        while True:
+            try:
+                if is_logged_in() and not is_alive():
+                    child = spawn_child()
+                    if child is not None:
+                        state["child"] = child
+                        _LOG.info("수집 데몬 자식 프로세스 (재)기동 (pid=%s)", child.pid)
+            except Exception as e:  # noqa: BLE001 — 감시 실패가 서버를 막으면 안 됨
+                _LOG.warning("수집 데몬 감시 실패: %s", e)
+            try:
+                await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                break
+
+    watchdog = asyncio.create_task(_supervise())
     try:
         yield
     finally:
+        watchdog.cancel()
+        child = state.get("child")
         if child is not None:
             try:
-                child.terminate()
+                child.terminate()  # Claude 종료 시 우리가 띄운 데몬도 정리(persistence 방지)
             except Exception:  # noqa: BLE001
                 pass
 
@@ -124,17 +140,6 @@ _WHY_GUIDANCE = (
     "추측하지 말고, telegram_stock_buzz 로 해당 종목을 더 확인하거나 '원문상 이유 불명'"
     "이라고 답하세요."
 )
-
-
-def _daemon_pid_alive(pid) -> bool:
-    if not pid:
-        return False
-    try:
-        from telegram_lens.daemon import _pid_alive
-
-        return _pid_alive(int(pid))
-    except Exception:
-        return False
 
 
 def _collecting_notice() -> str | None:
@@ -252,7 +257,8 @@ async def telegram_status() -> str:
             beat = json.loads(hb.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
             beat = None
-    if beat and _daemon_pid_alive(beat.get("pid")):
+    from telegram_lens.daemon import is_alive as _collector_alive
+    if beat and _collector_alive():
         last_result = beat.get("last_result")
         if isinstance(last_result, dict) and last_result.get("since"):
             last_result = {**last_result, "since": queries._to_kst(last_result["since"])}

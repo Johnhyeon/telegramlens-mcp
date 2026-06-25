@@ -11,6 +11,7 @@ import logging
 from datetime import datetime, timezone
 
 from telethon import TelegramClient
+from telethon.errors import FloodWaitError
 from telethon.tl.types import (
     Channel,
     Chat,
@@ -41,7 +42,12 @@ def make_client() -> TelegramClient:
             "Telegram API 자격증명이 없습니다. https://my.telegram.org 에서 "
             "API_ID / API_HASH 발급 후 `telegramlens-login` 으로 등록하세요."
         )
-    return TelegramClient(str(session_path()), api_id, api_hash)
+    client = TelegramClient(str(session_path()), api_id, api_hash)
+    # 짧은 FloodWait(60초 이하)는 Telethon 이 알아서 잠깐 자고 재시도한다. 그보다 긴
+    # 대기는 예외로 올라오고, fetch_recent 가 채널별로 잡아 '이 사이클만 스킵'한다
+    # (다음 사이클 재시도) — 긴 대기로 데몬 전체를 막지 않기 위함.
+    client.flood_sleep_threshold = 60
+    return client
 
 
 async def list_dialogs(client: TelegramClient) -> list[dict]:
@@ -120,33 +126,48 @@ async def fetch_recent(
         )
         eff_since = new_since if is_new else since
         eff_limit = (new_limit or per_channel_limit) if is_new else per_channel_limit
-        async for msg in client.iter_messages(ent, limit=eff_limit):
-            if msg.date and msg.date < eff_since:
-                break
-            text = msg.message or ""
-            if not text.strip():
-                continue
-            fwd = getattr(msg, "fwd_from", None)
-            media_type, file_name = _media_meta(msg)
-            results.append(
-                {
-                    "channel_id": ent.id,
-                    "title": title,
-                    "username": username,
-                    "subscribers": subs,
-                    "msg_id": msg.id,
-                    "date": msg.date.astimezone(timezone.utc).isoformat(),
-                    "text": text,
-                    "views": getattr(msg, "views", None),
-                    "forwards": getattr(msg, "forwards", None),
-                    "fwd_from_chat_id": _peer_id(getattr(fwd, "from_id", None)),
-                    "fwd_from_chat_title": _fwd_title(msg, fwd),
-                    "fwd_from_message_id": getattr(fwd, "channel_post", None),
-                    "fwd_from_date": _iso(getattr(fwd, "date", None)),
-                    "media_type": media_type,
-                    "file_name": file_name,
-                }
+        # 채널별 격리: 한 채널이 실패(권한 상실·FloodWait·구조 변경)해도 그 채널만 건너뛰고,
+        # 이미 수집한 정상 채널 결과는 보존한 채 다음 채널로 계속한다(P0: 내결함성).
+        try:
+            async for msg in client.iter_messages(ent, limit=eff_limit):
+                if msg.date and msg.date < eff_since:
+                    break
+                text = msg.message or ""
+                if not text.strip():
+                    continue
+                fwd = getattr(msg, "fwd_from", None)
+                media_type, file_name = _media_meta(msg)
+                results.append(
+                    {
+                        "channel_id": ent.id,
+                        "title": title,
+                        "username": username,
+                        "subscribers": subs,
+                        "msg_id": msg.id,
+                        "date": msg.date.astimezone(timezone.utc).isoformat(),
+                        "text": text,
+                        "views": getattr(msg, "views", None),
+                        "forwards": getattr(msg, "forwards", None),
+                        "fwd_from_chat_id": _peer_id(getattr(fwd, "from_id", None)),
+                        "fwd_from_chat_title": _fwd_title(msg, fwd),
+                        "fwd_from_message_id": getattr(fwd, "channel_post", None),
+                        "fwd_from_date": _iso(getattr(fwd, "date", None)),
+                        "media_type": media_type,
+                        "file_name": file_name,
+                    }
+                )
+        except FloodWaitError as e:
+            _LOG.warning(
+                "채널 %s FloodWait %s초 — 이 사이클 스킵(다음 사이클 재시도)",
+                getattr(ent, "id", "?"), getattr(e, "seconds", "?"),
             )
+            continue
+        except Exception as e:  # noqa: BLE001 — 한 채널 실패가 전체 사이클을 막으면 안 됨
+            _LOG.warning(
+                "채널 %s 수집 실패 — 스킵: %s: %s",
+                getattr(ent, "id", "?"), type(e).__name__, e,
+            )
+            continue
     return results, channels
 
 

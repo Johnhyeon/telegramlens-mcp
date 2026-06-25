@@ -38,6 +38,39 @@ def _pid_path():
     return data_dir() / "daemon.pid"
 
 
+def _alive_path():
+    return data_dir() / "daemon_alive"
+
+
+def _touch_alive() -> None:
+    """가동 신호(타임스탬프) 갱신 — 데몬이 30초마다 호출.
+
+    PID 존재가 아니라 이 타임스탬프의 신선도로 '진짜 가동 중'을 판정한다. Windows 의
+    OpenProcess 는 종료됐거나 재사용된 PID 도 열어버려(_pid_alive 거짓양성) 죽은 데몬을
+    살아있다고 오판하지만, 좀비/재사용 PID 는 이 파일을 갱신하지 못한다.
+    """
+    try:
+        _alive_path().write_text(
+            datetime.now(timezone.utc).isoformat(), encoding="utf-8"
+        )
+    except OSError:
+        pass
+
+
+def _collector_fresh(max_age_sec: float = 180) -> bool:
+    """daemon_alive 타임스탬프가 max_age_sec 이내면 True(= 실제 가동 중)."""
+    p = _alive_path()
+    if not p.exists():
+        return False
+    try:
+        ts = datetime.fromisoformat(p.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return False
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - ts).total_seconds() <= max_age_sec
+
+
 def _setup_logging() -> None:
     log_path = data_dir() / "daemon.log"
     handler = logging.FileHandler(log_path, encoding="utf-8")
@@ -78,16 +111,23 @@ def _write_heartbeat(
 
 
 def _acquire_lock() -> bool:
-    """이미 데몬이 돌고 있으면 False. 단순 PID 파일 락."""
+    """이미 '실제로' 데몬이 돌고 있으면 False. PID 파일 + 가동 신선도 락.
+
+    PID 존재만 보면 Windows 좀비/재사용 PID 에 속아 '이미 실행 중'으로 오판하고 데몬이
+    영영 못 뜬다(2026-06 장애 원인). 가동 신호(_collector_fresh)가 멎었으면 그 PID 는
+    우리 데몬이 아니거나 멎은 것이므로 락을 회수해 새로 띄운다.
+    """
     p = _pid_path()
     if p.exists():
         try:
             old_pid = int(p.read_text().strip())
         except (ValueError, OSError):
             old_pid = None
-        if old_pid and _pid_alive(old_pid):
+        if old_pid and _pid_alive(old_pid) and _collector_fresh():
             _LOG.error("이미 데몬이 실행 중입니다 (pid=%s). 종료합니다.", old_pid)
             return False
+        if old_pid:
+            _LOG.warning("낡은 PID 락 회수 (pid=%s, 가동 신호 멎음) — 새로 기동.", old_pid)
     p.write_text(str(os.getpid()), encoding="utf-8")
     return True
 
@@ -117,7 +157,12 @@ def _release_lock() -> None:
 
 
 def is_alive() -> bool:
-    """데몬이 현재 실행 중인지 — PID 락 파일 기준. 외부(서버)에서 호출."""
+    """데몬이 '실제로' 가동 중인지 — PID 존재 AND 가동 신호 신선도. 외부(서버)에서 호출.
+
+    PID 만으로는 Windows 좀비/재사용 PID 에 속는다(_pid_alive 거짓양성). 가동 신호가
+    멈췄으면 그 PID 가 우리 데몬이 아니거나 멎은 것이므로 죽은 것으로 본다 → 서버 감시
+    루프가 재스폰한다.
+    """
     p = _pid_path()
     if not p.exists():
         return False
@@ -125,7 +170,7 @@ def is_alive() -> bool:
         pid = int(p.read_text().strip())
     except (ValueError, OSError):
         return False
-    return _pid_alive(pid)
+    return _pid_alive(pid) and _collector_fresh()
 
 
 def spawn_child(interval: int = 10):
@@ -285,15 +330,35 @@ async def _loop(
     # 기동 시 1회: 갭이 자동 백필 상한(기본 7일)을 넘으면 사용자에게 제안 플래그를 남긴다.
     _maybe_offer_backfill(max_window)
 
+    # 가동 신호: 30초마다 타임스탬프를 갱신해 서버 감시 루프/락이 '실제 가동 중'을
+    # 신뢰성 있게 판정하게 한다(PID 거짓양성 회피). 즉시 1회 찍어 빠르게 인식되게.
+    _touch_alive()
+
+    async def _beat() -> None:
+        while not _stop.is_set():
+            _touch_alive()
+            try:
+                await asyncio.wait_for(_stop.wait(), timeout=30)
+            except asyncio.TimeoutError:
+                pass
+
+    beat_task = asyncio.create_task(_beat())
+
     while not _stop.is_set():
         last_result = None
-        # 사용자가 명시적으로 요청한 깊은 백필이 있으면 그 일수를 우선.
+        # 사용자 요청 백필이 있으면 '요청 일수'와 '자동 캐치업 창'(연속 수집 갭) 중 큰 쪽.
         req_days = _read_backfill_request()
+        auto_window = _catchup_window(min_window, max_window)
         if req_days:
-            window_min = req_days * 1440
-            _LOG.info("사용자 요청 백필 — 최근 %d일 소급 수집", req_days)
+            # 작은 요청(예: 1일)이 큰 다운타임 갭(예: 3일)을 덮어써, 중간 구간을 영영
+            # 수집하지 않고 영구·무성 구멍을 남기던 버그를 막는다(P0: 히스토리 무결성).
+            window_min = max(req_days * 1440, auto_window)
+            _LOG.info(
+                "사용자 요청 백필 — 요청 %d일, 실효 창 %d분 소급 수집",
+                req_days, window_min,
+            )
         else:
-            window_min = _catchup_window(min_window, max_window)
+            window_min = auto_window
         eff_limit = _catchup_limit(window_min, per_channel_limit)
         # 큰 창(평소보다 깊은 소급) = 다운타임 캐치업. 사용자 요청 백필도 캐치업으로 본다.
         catching_up = bool(req_days) or window_min > min_window
@@ -336,6 +401,7 @@ async def _loop(
                 pass
             waited += 15
 
+    beat_task.cancel()
     _LOG.info("데몬 종료.")
 
 
