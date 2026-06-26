@@ -10,6 +10,7 @@ import asyncio
 import functools
 import json
 import logging
+import re
 import sys
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
@@ -634,21 +635,49 @@ def _reading_list(hours: float, limit: int = 8) -> list[dict]:
     return out
 
 
-def _watchlist_buzz(hours: float) -> list[dict]:
-    """보유/관심 종목(watchlist)별 텔레그램 언급 요약 — 브리핑 '내 종목(관리)' 섹션용.
+# 저신뢰 샘플 — 봇이 자동 포스팅하는 기술지표(이격도·MA·종가)나 나열형 리스트(오늘의 리포트·
+# 공시 정리·상한가 리스트)는 '내러티브'가 아니라 샘플로 부적합. 후순위로 민다(없으면 그냥 씀).
+_LOW_NARRATIVE_RE = re.compile(
+    r"이격도|\(\d{6}\.K[SQ]\)|MA\s?\d+\s*[:：]|일목균형|볼린저|"
+    r"오늘의 ?리포트|주요 ?공시 ?정리|상한가 ?(리스트|정리|종목)|지분 ?공시 ?정리"
+)
+
+
+def _is_low_narrative(text: str | None) -> bool:
+    return bool(_LOW_NARRATIVE_RE.search(text or ""))
+
+
+def _pick_sample(samples: list[dict]) -> dict | None:
+    """샘플 중 '내러티브 있는' 첫 글. 전부 저신뢰면 그냥 첫 글."""
+    if not samples:
+        return None
+    for s in samples:
+        if not _is_low_narrative(s.get("text")):
+            return s
+    return samples[0]
+
+
+def _watchlist_buzz(hours: float, samples: int = 2) -> list[dict]:
+    """보유/관심 종목(watchlist)별 텔레그램 언급 요약 — 브리핑·내 종목 도구용.
 
     텔레그램 언급·해석만 모은다. 정확한 종가는 Claude 가 StockLens 로 붙인다(역할 분리).
-    watchlist 비어있으면 빈 리스트 → 섹션 생략.
+    watchlist 비어있으면 빈 리스트 → 섹션 생략. samples: 종목당 원문 샘플 수(요약 근거).
     """
     from telegram_lens import watchlist as _wl
 
     out = []
     for s in _wl.load():
         try:
-            r = queries.stock_buzz(code=s["code"], name=s["name"], hours=hours, samples=2)
+            r = queries.stock_buzz(
+                code=s["code"], name=s["name"], hours=hours, samples=max(samples * 2, 12)
+            )
         except Exception:  # noqa: BLE001
             continue
         sm = r.get("summary") or {}
+        # 내러티브 우선 — 저신뢰(이격도·MA·나열형 리포트)는 뒤로, 동률은 원래 순서(stable).
+        cand = sorted(
+            r.get("samples") or [], key=lambda x: _is_low_narrative(x.get("text"))
+        )[:samples]
         out.append(
             {
                 "name": s.get("name"),
@@ -661,7 +690,7 @@ def _watchlist_buzz(hours: float) -> list[dict]:
                         "channel": x.get("channel"),
                         "telegram_link": x.get("telegram_link"),
                     }
-                    for x in (r.get("samples") or [])[:2]
+                    for x in cand
                 ],
             }
         )
@@ -714,8 +743,8 @@ def _format_briefing_ready(
                 f" · {_chg(s.get('code'))}{s.get('name', '?')}{tag}"
                 f" — {how} 오늘 {ch}개 채널에서 거론"
             )
-            samp = s.get("samples") or []
-            txt = " ".join((samp[0].get("text") or "").split())[:70] if samp else ""
+            pick = _pick_sample(s.get("samples") or [])
+            txt = " ".join((pick.get("text") or "").split())[:70] if pick else ""
             if txt:
                 lines.append(f'   "{txt}"')
         lines.append("")
@@ -726,8 +755,8 @@ def _format_briefing_ready(
             n, ch = s.get("independent", 0), s.get("channels", 0)
             quiet = " (특이 언급 없음)" if not n else ""
             lines.append(f" · {_chg(s.get('code'))}{s.get('name', '?')} — {n}건 {ch}채널{quiet}")
-            samp = s.get("samples") or []
-            txt = " ".join((samp[0].get("text") or "").split())[:70] if (n and samp) else ""
+            pick = _pick_sample(s.get("samples") or []) if n else None
+            txt = " ".join((pick.get("text") or "").split())[:70] if pick else ""
             if txt:
                 lines.append(f'   "{txt}"')
         lines.append("")
@@ -806,6 +835,37 @@ async def telegram_briefing(hours: float = 12) -> str:
 def _resolve_code(query: str) -> tuple[str | None, str]:
     """종목명/코드 입력을 (code, name) 으로 해석. 못 찾으면 (None, query). (stocks 공용)"""
     return resolve_code(query)
+
+
+@mcp.tool()
+@safe_tool
+@warn_if_collecting
+async def telegram_watchlist(hours: float = 24) -> str:
+    """'내 종목/보유 종목'이 텔레그램에서 어떻게 거론되는지 — 언급 원문·요약 근거를 반환합니다.
+
+    '내 종목 분석/소식/여론/뭐래/텔레그램에서 어때' 류 요청에 호출하세요. 종가·차트·이동평균·
+    기술지표가 아니라 *텔레그램에서 그 종목을 두고 무슨 말이 도는지*(원문·채널·링크)를 줍니다.
+    이 데이터로 종목별 '여론·이슈'를 요약하세요(기술지표는 사용자가 원할 때만 StockLens 로).
+    종목 등록/삭제는 텔레그램 '!보유 설정 …' 명령으로.
+
+    Args:
+        hours: 집계 시간 범위(시간). 기본 24.
+    """
+    items = _watchlist_buzz(hours, samples=6)
+    if not items:
+        return (
+            "등록된 내 종목이 없어요. 텔레그램에서 '!보유 설정 삼성전자 SK하이닉스' 처럼 "
+            "등록하면 그 종목들의 텔레그램 언급을 모아 줍니다."
+        )
+    return _json(
+        {
+            "window_hours": hours,
+            "watchlist_내종목": items,
+            "_지침": "종목별 samples 원문을 근거로 '텔레그램에서 무슨 말이 도는지(여론·이슈·근거 "
+            "채널)'를 요약하세요. 이동평균·이격도 같은 기술지표 말고 텔레그램 내러티브 중심. "
+            "언급 없는 종목은 '특이 언급 없음'으로.",
+        }
+    )
 
 
 @mcp.tool()
