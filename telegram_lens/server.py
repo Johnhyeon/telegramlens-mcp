@@ -789,6 +789,8 @@ async def telegram_briefing(hours: float = 12) -> str:
             for s in grp
         ]
         change = prices.daily_change(codes)
+    # 버즈/내종목/읽을거리는 _ready 텍스트가 이미 '완성'이라 raw 를 안 보냄(토큰 75% 절감).
+    # Claude 가 작문하는 건 시황뿐 — 거기 필요한 macro 만 남긴다. 깊은 분석은 !종목·velocity 로.
     return _json(
         {
             "_playbook": _BRIEFING_PLAYBOOK,
@@ -797,10 +799,6 @@ async def telegram_briefing(hours: float = 12) -> str:
                 trending, slim_momentum, watchlist, reading, change
             ),
             "macro_거시버즈": _macro_buzz(hours),
-            "trending_많이언급": trending,
-            "momentum_급증": slim_momentum,
-            "읽을거리_links": reading,
-            "watchlist_내종목": watchlist,
         }
     )
 
