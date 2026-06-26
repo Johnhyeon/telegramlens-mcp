@@ -494,37 +494,25 @@ async def telegram_momentum(
 
 
 _BRIEFING_PLAYBOOK = (
-    "이 데이터로 '나에게 보낼' 시장 브리핑을 작성해 telegram_send_me 로 보내세요.\n"
-    "[메시지 2개로 분리 — 섹션마다 1차 소스가 다릅니다]\n"
-    "1) 오늘 시황(거시): '사실'(코스피/코스닥·미국 지수 종가, 공식 수치)은 StockLens(SL) 우선으로 "
-    "잡으세요 — SL 수치는 정확하니 웹으로 다시 확인하지 마세요(환각·구버전 방지). SL이 못 주는 것"
-    "(매크로 일정·이벤트, 글로벌/지정학)만 웹으로 보강. 거기에 macro_거시버즈로 '국내가 그 매크로를 "
-    "어떻게 해석·베팅하는지'를 2차로 얹어 종합하세요. 오늘 매크로 이벤트(FOMC·PCE·CPI·GDP·고용·관세 "
-    "등)가 있으면 거시 흐름·해석을 종목 얘기로 건너뛰지 말고 충분히 짚으세요.\n"
-    "2) 텔레그램 버즈(종목): 텔레그램을 1차로 '갑자기 급증'(momentum_급증)·'많이 언급'(trending_많이언급)과 "
-    "왜 거론되는지·근거 채널을 잡고, 그 종목들의 정확한 시세·수급·펀더멘털은 StockLens(SL)로, 공시는 "
-    "DartLens(DL)로 확인하세요. 텔레그램이 '무엇을 볼지'를 정하고 SL/DL이 숫자를 확정합니다.\n"
-    "   · 급증 노이즈 거르기: momentum_급증 에서 listy_noise=true 인 종목은 '오늘의 리포트·상한가 "
-    "리스트·지분공시 정리' 같은 여러 종목 나열형 메시지에 한 줄 끼인 것(실제 논의 아님)이니 빼세요. "
-    "listy_noise=false 인 종목만, samples 원문을 읽고 왜 거론되는지 근거를 들어 짚으세요"
-    "('노이즈 가능성'으로 얼버무리지 말고 원문으로 판단).\n"
-    "   · 평이한 표현: '베이스라인'·'N배 스파이크'·'평소 대비 N배' 같은 전문용어·배수 수치는 쓰지 "
-    "마세요(사용자가 모름). '평소 거의 안 나오다 오늘 N개 채널에서 거론' 처럼 일반인 말로.\n"
-    "3) 내 종목(watchlist_내종목): 비어있지 않으면 보유 종목별로 오늘 텔레그램 거론 핵심을 한두 줄로 "
-    "정리하고(samples 근거 + 출처 채널), 정확한 종가는 StockLens 로 붙이세요. 조용한 종목은 '특이 "
-    "언급 없음'으로. 비어있으면 이 섹션 생략. '발견(시장 버즈)'과 별개인 '내가 가진 것 챙기기'입니다.\n"
-    "4) 보면 좋은 글·자료(읽을거리_links): 확산 높은 심층글·첨부 리포트 '후보'입니다. 전부 나열하지 "
-    "말고, 오늘 시황·버즈와 관련 있고 읽을 가치 높은 것만 3~5개로 추려 '한 줄 내용 → URL' 형식으로 "
-    "주세요(plain text라 URL 그대로 — 텔레그램이 자동 링크, 마크다운 [이동] 금지). has_file 이면 "
-    "파일명도 적고. 모바일에서 원문으로 바로 점프하는 용도.\n"
+    "이 데이터로 '나에게 보낼' 시장 브리핑을 telegram_send_me 로 '한 번만' 보내세요.\n"
+    "★ 한글 깨짐 방지(중요): 종목명·언급수·원문 같은 데이터는 '_ready_버즈_그대로전송' 에 이미 "
+    "plain text 로 '완성'돼 있습니다. 그 텍스트를 '한 글자도 고치지 말고 그대로 복사'해서 두 번째 "
+    "메시지로 보내세요. 종목명·수치·원문을 직접 다시 타이핑하면 한글이 깨집니다 — 절대 재작성 금지.\n"
+    "당신이 직접 작문하는 건 아래 1)시황 한 덩어리뿐입니다.\n"
+    "전송: telegram_send_me([ <1)시황 — 당신 작문>, <_ready_버즈_그대로전송 을 그대로> ]).\n"
+    "1) 오늘 시황(거시) — 짧게 3~5줄, 당신이 작문:\n"
+    "   · 지수 종가·공식 수치는 StockLens(SL)로 잡으세요(SL 수치는 정확하니 웹 재확인 금지). "
+    "코스피·코스닥·주요 미국 지수까지만. 종목별 개별 종가는 넣지 마세요(궁금하면 사용자가 !종목).\n"
+    "   · 오늘 매크로 이벤트(FOMC·PCE·CPI·GDP·고용·관세 등)·글로벌·지정학은 웹으로 보강하고, "
+    "macro_거시버즈로 '국내가 그 매크로를 어떻게 해석·베팅하는지'를 2차로 얹어 종합하세요. "
+    "매크로 이벤트가 있으면 거시 흐름을 충분히 짚으세요.\n"
+    "2)·3)·4) 버즈·내 종목·읽을거리: '_ready_버즈_그대로전송' 이 이미 다 담고 있으니, 손대지 말고 "
+    "그대로 두 번째 메시지로 전송. (노이즈 거름·평이한 표현·링크는 서버에서 이미 처리됨.)\n"
     "[작성 원칙]\n"
     "- plain text. 마크다운 기호(**, |, # 등) 쓰지 마세요 — 텔레그램에 그대로 보입니다.\n"
-    "- 수치·사실은 데이터에 있는 것만. 출처에 없는 숫자를 지어내지 말고, 근거가 약하면 '~설/언급'.\n"
-    "- 소스 우선순위(사실/수치): 지수·시세·수급·펀더멘털=StockLens, 공시=DartLens, 이 둘이 못 주는 "
-    "것(매크로 일정·글로벌·지정학)만 웹. SL/DL 이 준 수치는 정확하니 웹 재확인 금지. 해석·테마=텔레그램.\n"
-    "- 한국어, 간결한 불릿. 특정 종목 매수/매도 추천이 아니라 '정보 정리'로.\n"
-    "- 보내기 전에 한글 오타·깨진 글자를 검토해 완성하고, telegram_send_me 는 단 한 번만 "
-    "호출하세요(전송 후 재검토·재발송 금지)."
+    "- 1)시황의 수치·사실은 데이터/SL 에 있는 것만. 출처 없는 숫자를 지어내지 마세요.\n"
+    "- 특정 종목 매수/매도 추천이 아니라 '정보 정리'로. 한국어, 간결.\n"
+    "- telegram_send_me 는 단 한 번만 호출(전송 후 재검토·재발송 금지)."
 )
 
 # 거시 키워드 — trending/momentum 은 종목코드 기반이라 거시(Fed·PCE·금리 등)를 못 잡는다.
@@ -676,6 +664,66 @@ def _watchlist_buzz(hours: float) -> list[dict]:
     return out
 
 
+def _format_briefing_ready(
+    trending: list[dict],
+    momentum: list[dict],
+    watchlist: list[dict],
+    reading: list[dict],
+) -> str:
+    """버즈·내 종목·읽을거리를 '바로 보낼 수 있는 plain text'로 서버에서 완성한다.
+
+    Claude 가 종목명·수치·원문을 다시 타이핑하다 한글이 깨지는 걸 막으려고, 깨지면 안 되는
+    데이터는 여기서 DB 텍스트 그대로 포맷한다(commands.py 의 '!명령'이 안 깨지는 이유와 같다).
+    급증 노이즈(listy_noise)·전문용어는 여기서 이미 거른다.
+    """
+    now = datetime.now()
+    lines = [f"📊 텔레그램 버즈 · {now.month}월 {now.day}일", ""]
+
+    top = trending[:8]
+    if top:
+        lines.append("🔥 많이 언급된 종목")
+        for i, s in enumerate(top, 1):
+            tag = " (ETF)" if s.get("is_etf") else ""
+            cnt = s.get("independent") or s.get("raw_messages") or 0
+            lines.append(f" {i}. {s.get('name', '?')}{tag} — {cnt}건 {s.get('channels', 0)}채널")
+        lines.append("")
+
+    surge = [s for s in momentum if not s.get("listy_noise")][:6]
+    if surge:
+        lines.append("🚀 갑자기 늘어난 종목")
+        for s in surge:
+            tag = " (ETF)" if s.get("is_etf") else ""
+            how = "평소 거의 없다가" if s.get("is_new") else "최근 부쩍 늘어"
+            ch = s.get("recent_channels", 0)
+            lines.append(f" · {s.get('name', '?')}{tag} — {how} 오늘 {ch}개 채널에서 거론")
+            samp = s.get("samples") or []
+            txt = " ".join((samp[0].get("text") or "").split())[:70] if samp else ""
+            if txt:
+                lines.append(f'   "{txt}"')
+        lines.append("")
+
+    if watchlist:
+        lines.append("📌 내 종목")
+        for s in watchlist:
+            n, ch = s.get("independent", 0), s.get("channels", 0)
+            quiet = " (특이 언급 없음)" if not n else ""
+            lines.append(f" · {s.get('name', '?')} — {n}건 {ch}채널{quiet}")
+            samp = s.get("samples") or []
+            txt = " ".join((samp[0].get("text") or "").split())[:70] if (n and samp) else ""
+            if txt:
+                lines.append(f'   "{txt}"')
+        lines.append("")
+
+    if reading:
+        lines.append("📎 읽을거리")
+        for r in reading[:5]:
+            lines.append(f" · {r.get('snippet', '')}")
+            fn = f" [{r.get('file_name')}]" if r.get("has_file") else ""
+            lines.append(f"   {r.get('channel', '')}{fn} {r.get('link', '')}")
+
+    return "\n".join(lines).rstrip()
+
+
 @mcp.tool()
 @safe_tool
 @warn_if_collecting
@@ -710,15 +758,20 @@ async def telegram_briefing(hours: float = 12) -> str:
         d["stocks_per_msg_avg"] = round(avg, 1) if avg else None
         d["listy_noise"] = bool(avg and avg >= 8)
         slim_momentum.append(d)
+    watchlist = _watchlist_buzz(hours)
+    reading = _reading_list(hours)
     return _json(
         {
             "_playbook": _BRIEFING_PLAYBOOK,
             "window_hours": hours,
+            "_ready_버즈_그대로전송": _format_briefing_ready(
+                trending, slim_momentum, watchlist, reading
+            ),
             "macro_거시버즈": _macro_buzz(hours),
             "trending_많이언급": trending,
             "momentum_급증": slim_momentum,
-            "읽을거리_links": _reading_list(hours),
-            "watchlist_내종목": _watchlist_buzz(hours),
+            "읽을거리_links": reading,
+            "watchlist_내종목": watchlist,
         }
     )
 
