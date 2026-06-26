@@ -686,7 +686,7 @@ def _format_briefing_ready(
 
     def _chg(code: str | None) -> str:
         v = change.get(code or "")
-        return f" {v:+.1f}%" if v is not None else ""
+        return f"[{v:+.1f}%]" if v is not None else ""
 
     now = datetime.now()
     lines = [f"📊 텔레그램 버즈 · {now.month}월 {now.day}일", ""]
@@ -698,7 +698,7 @@ def _format_briefing_ready(
             tag = " (ETF)" if s.get("is_etf") else ""
             cnt = s.get("independent") or s.get("raw_messages") or 0
             lines.append(
-                f" {i}. {s.get('name', '?')}{tag}{_chg(s.get('code'))}"
+                f" {i}. {_chg(s.get('code'))}{s.get('name', '?')}{tag}"
                 f" — {cnt}건 {s.get('channels', 0)}채널"
             )
         lines.append("")
@@ -711,7 +711,7 @@ def _format_briefing_ready(
             how = "평소 거의 없다가" if s.get("is_new") else "최근 부쩍 늘어"
             ch = s.get("recent_channels", 0)
             lines.append(
-                f" · {s.get('name', '?')}{tag}{_chg(s.get('code'))}"
+                f" · {_chg(s.get('code'))}{s.get('name', '?')}{tag}"
                 f" — {how} 오늘 {ch}개 채널에서 거론"
             )
             samp = s.get("samples") or []
@@ -725,7 +725,7 @@ def _format_briefing_ready(
         for s in watchlist:
             n, ch = s.get("independent", 0), s.get("channels", 0)
             quiet = " (특이 언급 없음)" if not n else ""
-            lines.append(f" · {s.get('name', '?')}{_chg(s.get('code'))} — {n}건 {ch}채널{quiet}")
+            lines.append(f" · {_chg(s.get('code'))}{s.get('name', '?')} — {n}건 {ch}채널{quiet}")
             samp = s.get("samples") or []
             txt = " ".join((samp[0].get("text") or "").split())[:70] if (n and samp) else ""
             if txt:
