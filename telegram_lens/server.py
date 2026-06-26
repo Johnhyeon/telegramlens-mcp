@@ -673,13 +673,21 @@ def _format_briefing_ready(
     momentum: list[dict],
     watchlist: list[dict],
     reading: list[dict],
+    change: dict[str, float] | None = None,
 ) -> str:
     """버즈·내 종목·읽을거리를 '바로 보낼 수 있는 plain text'로 서버에서 완성한다.
 
     Claude 가 종목명·수치·원문을 다시 타이핑하다 한글이 깨지는 걸 막으려고, 깨지면 안 되는
     데이터는 여기서 DB 텍스트 그대로 포맷한다(commands.py 의 '!명령'이 안 깨지는 이유와 같다).
     급증 노이즈(listy_noise)·전문용어는 여기서 이미 거른다.
+    change: {code: 등락률%} — 장 종료 후에만 채워져 종목 옆에 붙는다(없으면 생략).
     """
+    change = change or {}
+
+    def _chg(code: str | None) -> str:
+        v = change.get(code or "")
+        return f" {v:+.1f}%" if v is not None else ""
+
     now = datetime.now()
     lines = [f"📊 텔레그램 버즈 · {now.month}월 {now.day}일", ""]
 
@@ -689,7 +697,10 @@ def _format_briefing_ready(
         for i, s in enumerate(top, 1):
             tag = " (ETF)" if s.get("is_etf") else ""
             cnt = s.get("independent") or s.get("raw_messages") or 0
-            lines.append(f" {i}. {s.get('name', '?')}{tag} — {cnt}건 {s.get('channels', 0)}채널")
+            lines.append(
+                f" {i}. {s.get('name', '?')}{tag}{_chg(s.get('code'))}"
+                f" — {cnt}건 {s.get('channels', 0)}채널"
+            )
         lines.append("")
 
     surge = [s for s in momentum if not s.get("listy_noise")][:6]
@@ -699,7 +710,10 @@ def _format_briefing_ready(
             tag = " (ETF)" if s.get("is_etf") else ""
             how = "평소 거의 없다가" if s.get("is_new") else "최근 부쩍 늘어"
             ch = s.get("recent_channels", 0)
-            lines.append(f" · {s.get('name', '?')}{tag} — {how} 오늘 {ch}개 채널에서 거론")
+            lines.append(
+                f" · {s.get('name', '?')}{tag}{_chg(s.get('code'))}"
+                f" — {how} 오늘 {ch}개 채널에서 거론"
+            )
             samp = s.get("samples") or []
             txt = " ".join((samp[0].get("text") or "").split())[:70] if samp else ""
             if txt:
@@ -711,7 +725,7 @@ def _format_briefing_ready(
         for s in watchlist:
             n, ch = s.get("independent", 0), s.get("channels", 0)
             quiet = " (특이 언급 없음)" if not n else ""
-            lines.append(f" · {s.get('name', '?')} — {n}건 {ch}채널{quiet}")
+            lines.append(f" · {s.get('name', '?')}{_chg(s.get('code'))} — {n}건 {ch}채널{quiet}")
             samp = s.get("samples") or []
             txt = " ".join((samp[0].get("text") or "").split())[:70] if (n and samp) else ""
             if txt:
@@ -764,12 +778,23 @@ async def telegram_briefing(hours: float = 12) -> str:
         slim_momentum.append(d)
     watchlist = _watchlist_buzz(hours)
     reading = _reading_list(hours)
+    # 등락률은 장 종료 후(16시 이후)에만 — 장중/장전(7시 브리핑)엔 의미가 약하고 전일치 혼동.
+    change: dict[str, float] = {}
+    if datetime.now().hour >= 16:
+        from telegram_lens import prices
+
+        codes = [
+            s.get("code")
+            for grp in (trending, slim_momentum, watchlist)
+            for s in grp
+        ]
+        change = prices.daily_change(codes)
     return _json(
         {
             "_playbook": _BRIEFING_PLAYBOOK,
             "window_hours": hours,
             "_ready_버즈_그대로전송": _format_briefing_ready(
-                trending, slim_momentum, watchlist, reading
+                trending, slim_momentum, watchlist, reading, change
             ),
             "macro_거시버즈": _macro_buzz(hours),
             "trending_많이언급": trending,
