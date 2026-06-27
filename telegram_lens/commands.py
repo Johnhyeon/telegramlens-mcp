@@ -101,12 +101,16 @@ def _fmt_trending() -> str:
 
 def _help() -> str:
     return (
-        "명령:\n"
-        "· !<종목명> 또는 !종목 <종목명> — 그 종목 텔레그램 언급·원문\n"
-        "· !검색 <키워드> — 키워드 원문 검색\n"
-        "· !트렌딩 (또는 !버즈) — 많이 언급된 종목\n"
-        "· !보유 — 내 종목들 텔레그램 언급 (설정: !보유 설정 삼성전자 SK하이닉스)\n"
-        "분석·판단은 데스크탑 Claude 에서 물어보세요."
+        "📋 명령어 목록\n"
+        "· !삼성전자 — 그 종목 텔레그램 언급·원문 (!<종목명>)\n"
+        "· !검색 전력 — 키워드로 원문 검색\n"
+        "· !트렌딩 — 많이 언급된 종목 (= !버즈)\n"
+        "· !보유 (= !관심) — 내 종목 텔레그램 언급\n"
+        "    등록: !관심 삼성전자 SK하이닉스 한미반도체\n"
+        "    추가/삭제: !보유 추가 엔비디아 · !보유 삭제 엔비디아\n"
+        "    전체 비우기: !보유 비우기\n"
+        "· !명령어 — 이 목록 다시 보기\n"
+        "더 깊은 분석·판단은 데스크탑 Claude 에서."
     )
 
 
@@ -127,17 +131,21 @@ def _fmt_watchlist_buzz() -> str:
     return "\n".join(lines)
 
 
+def _set_watchlist(names: list[str]) -> str:
+    added, failed = watchlist.set_stocks(names)
+    msg = "내 종목 설정: " + (", ".join(s["name"] for s in added) if added else "(없음)")
+    return msg + (f"\n못 찾음: {', '.join(failed)}" if failed else "")
+
+
 def _handle_watchlist(arg: str) -> str:
-    parts = (arg or "").strip().split(maxsplit=1)
-    sub = parts[0].lower() if parts else ""
-    rest = parts[1].strip() if len(parts) > 1 else ""
+    toks = (arg or "").strip().split()
+    if not toks:
+        return _fmt_watchlist_buzz()  # !보유 / !관심 — 내 종목 버즈
+    sub = toks[0].lower()
+    rest_toks = toks[1:]
+    rest = " ".join(rest_toks)
     if sub in ("설정", "set"):
-        names = rest.split()
-        if not names:
-            return "예: !보유 설정 삼성전자 SK하이닉스 엔비디아"
-        added, failed = watchlist.set_stocks(names)
-        msg = "내 종목 설정: " + (", ".join(s["name"] for s in added) if added else "(없음)")
-        return msg + (f"\n못 찾음: {', '.join(failed)}" if failed else "")
+        return _set_watchlist(rest_toks) if rest_toks else "예: !보유 설정 삼성전자 SK하이닉스 엔비디아"
     if sub in ("추가", "add"):
         if not rest:
             return "예: !보유 추가 엔비디아"
@@ -147,24 +155,31 @@ def _handle_watchlist(arg: str) -> str:
         return ("이미 있음: " if existed else "추가: ") + s["name"]
     if sub in ("빼기", "삭제", "제거", "remove", "del"):
         if not rest:
-            return "예: !보유 빼기 엔비디아"
+            return "예: !보유 삭제 엔비디아  (전체 비우기: !보유 비우기)"
         removed = watchlist.remove(rest)
-        return ("제거: " + removed["name"]) if removed else f"'{rest}' — 목록에 없어요."
+        return ("삭제: " + removed["name"]) if removed else f"'{rest}' — 목록에 없어요."
+    if sub in ("비우기", "전체삭제", "초기화", "clear", "reset"):
+        watchlist.set_stocks([])
+        return "내 종목을 모두 비웠어요."
     if sub in ("목록", "list", "리스트"):
         wl = watchlist.load()
         return "내 종목: " + (", ".join(s["name"] for s in wl) if wl else "(없음)")
-    return _fmt_watchlist_buzz()  # 서브명령 없으면 내 종목 버즈
+    # 서브명령이 아니면 종목명들로 보고 바로 등록 (예: !관심 SK하이닉스 삼성전자 한미반도체)
+    return _set_watchlist(toks)
 
 
 def handle_command(cmd: str) -> str:
     """'!' 를 뗀 명령 문자열을 받아 답장 텍스트(plain text)를 반환한다."""
     cmd = (cmd or "").strip()
-    if not cmd or cmd in ("?", "help", "도움", "도움말"):
+    if not cmd or cmd in (
+        "?", "help", "h", "도움", "도움말",
+        "명령", "명령어", "명령목록", "메뉴", "commands", "cmd", "menu",
+    ):
         return _help()
     parts = cmd.split(maxsplit=1)
     head, arg = parts[0], (parts[1] if len(parts) > 1 else "")
     low = head.lower()
-    if low in ("보유", "내종목", "watchlist", "portfolio"):
+    if low in ("보유", "내종목", "관심", "관심종목", "watchlist", "portfolio"):
         return _handle_watchlist(arg)
     if low in ("트렌딩", "버즈", "trending", "buzz"):
         return _fmt_trending()
