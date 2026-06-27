@@ -1,6 +1,6 @@
 [project]
 name = "telegramlens-mcp"
-version = "0.4.1"
+version = "0.4.2"
 description = "TelegramLens — 텔레그램 채널의 종목 내러티브·언급 흐름을 구조화해 AI에게 전달하는 로컬 MCP 서버"
 readme = "README.md"
 license = { text = "Proprietary" }
