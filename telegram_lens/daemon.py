@@ -545,6 +545,21 @@ def _make_command_handler(client):
     return _handler
 
 
+async def _attach_command_listener(client) -> None:
+    """수집 client 에 '!' 명령 이벤트 핸들러를 단다(run_sync 의 on_client_ready 콜백).
+
+    수집(run_sync) 단계에도 같은 client 로 명령을 즉답해 '수집 중 무응답' 데드존을 없앤다.
+    수집 client 는 fetch 내내 연결돼 있어 Telethon 이 그동안 새 메시지(업데이트)를 받는다.
+    같은 client 하나라 대기 단계 listener 와 동시에 뜨지 않아 세션 충돌이 없다.
+    """
+    my_id = await _get_my_id(client)
+    if my_id is not None:
+        client.add_event_handler(
+            _make_command_handler(client),
+            events.NewMessage(chats=my_id),
+        )
+
+
 async def _poll_commands(client) -> None:
     """폴백 — 이벤트를 못 받았을 때 '나에게'를 읽어 새 '!' 명령 처리(get_messages 라 어떤
     클라이언트가 보냈든 잡힘). 기동 직후 기존 메시지는 seen 처리해 과거 명령 replay 방지."""
@@ -617,7 +632,9 @@ async def _loop(
                     "캐치업 — %d분 소급 수집(채널당 최대 %d개)", window_min, eff_limit
                 )
             last_result = await run_sync(
-                minutes=window_min, per_channel_limit=eff_limit
+                minutes=window_min,
+                per_channel_limit=eff_limit,
+                on_client_ready=_attach_command_listener,
             )
             _LOG.info(
                 "sync 완료 — 신규 메시지 %d, 신규 언급 %d, 채널 %d",

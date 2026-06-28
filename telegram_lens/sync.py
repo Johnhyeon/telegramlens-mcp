@@ -48,6 +48,7 @@ async def run_sync(
     minutes: int = 60,
     per_channel_limit: int = 500,
     new_channel_minutes: int = _NEW_CHANNEL_BACKFILL_MIN,
+    on_client_ready=None,
 ) -> dict:
     """최근 N분 메시지를 수집·저장. 요약 통계 반환.
 
@@ -58,6 +59,11 @@ async def run_sync(
     수집 시점에 포워드 메타·조회수·룰베이스 태그(sentiment/msg_type)를 함께 저장하고,
     정상 사이클에선 게시 후 1h/6h/24h 조회수 snapshot 갱신과 종목 베이스라인 재계산도
     수행한다.
+
+    on_client_ready: 선택. 연결·인증된 client 를 받는 async 콜백. 수집 client 가 fetch 내내
+    연결돼 있으므로(Telethon 은 그동안 백그라운드로 업데이트 수신) 여기에 '!' 명령 이벤트
+    핸들러를 달면 수집 도중에도 같은 client 로 즉답할 수 있다(데몬이 명령 데드존 제거에 사용).
+    같은 client 하나라 별도 세션 충돌이 없다. 콜백 실패는 수집을 막지 않는다(흡수).
     """
     db.init_db()
     now = datetime.now(timezone.utc)
@@ -80,6 +86,12 @@ async def run_sync(
             raise NotLoggedInError(
                 "로그인되어 있지 않습니다. `telegramlens-login` 을 먼저 실행하세요."
             )
+        # 수집 client 에 '!' 명령 핸들러 등록(fetch 도중에도 즉답 — 명령 데드존 제거).
+        if on_client_ready is not None:
+            try:
+                await on_client_ready(client)
+            except Exception:  # noqa: BLE001 — 명령 핸들러 등록 실패가 수집을 막으면 안 됨
+                pass
         # channel_ids=None → 가입된 모든 브로드캐스트 채널(새 채널 자동 포함).
         rows, channels_meta = await fetch_recent(
             client,
