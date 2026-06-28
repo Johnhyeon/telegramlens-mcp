@@ -17,7 +17,7 @@ from datetime import datetime, timedelta, timezone
 
 from mcp.server.fastmcp import FastMCP
 
-from telegram_lens import db, discover, queries
+from telegram_lens import db, discover, market_clock, queries
 from telegram_lens.classify import run_classification
 from telegram_lens.config import data_dir, is_logged_in, secure_data_files
 from telegram_lens.client import NoCredentialsError, NotLoggedInError
@@ -502,6 +502,8 @@ _BRIEFING_PLAYBOOK = (
     "당신이 직접 작문하는 건 아래 1)시황 한 덩어리뿐입니다.\n"
     "전송: telegram_send_me([ <1)시황 — 당신 작문>, <_ready_버즈_그대로전송 을 그대로> ]).\n"
     "1) 오늘 시황(거시) — 당신이 작문, '풍부하고 구조 있게' 아래 형식으로:\n"
+    "   ★ 관점: 먼저 '_시황_관점' 을 읽고 그 관점으로 쓰세요 — 읽는 시각에 따라 시황의 무게가 "
+    "다릅니다(장전=오늘 전망, 장중=실시간, 장마감 후=복기). 관점이 형식보다 우선.\n"
     "   머리 2줄: '[오늘 시황] M월 D일(요일)' / 그 아래 지수 한 줄 — '코스피 N,NNN.NN (±N.NN%) · "
     "코스닥 N,NNN.NN (±N.NN%)'. 지수 종가·등락률은 StockLens(SL)로(정확하니 웹 재확인 금지). "
     "종목별 개별 종가는 넣지 마세요(궁금하면 사용자가 !종목).\n"
@@ -771,6 +773,32 @@ def _format_briefing_ready(
     return "\n".join(lines).rstrip()
 
 
+def _briefing_session(krx: dict) -> str:
+    """KRX 세션 상태(market_clock) → 시황 작성 '관점'. 같은 데이터라도 읽는 시각에 따라
+    의미 있는 시황이 다르다(장전=오늘 전망 / 장중=실시간 / 장마감 후=복기)."""
+    status = krx.get("status", "")
+    last_d, next_d = krx.get("last_trading_day", ""), krx.get("next_trading_day", "")
+    if status in ("closed_weekend", "closed_holiday"):
+        return (
+            f"휴장. 직전 거래일({last_d}) 복기와 다음 거래일({next_d}) 전망을 함께. "
+            "휴장 동안의 미국장·환율·뉴스 흐름 중심으로."
+        )
+    if status in ("pre_market", "closed_before_open"):
+        return (
+            "장전(개장 전). 간밤 미국장 마감·환율·선물·밤사이 뉴스로 '오늘 한국장 전망'을 "
+            "중심에 두세요. 어제 복기는 짧게 — 무게는 '오늘 어떻게 열릴까'에."
+        )
+    if status == "regular":
+        return (
+            "장중(정규장 진행). 지금 한국장 흐름 — 지수·외국인/기관 수급·실시간 버즈 중심. "
+            "마감 단정 대신 '현재 흐름·관전포인트'로."
+        )
+    return (  # closed_after_hours / after_hours
+        "장마감 후. 오늘 한국장을 '왜 이렇게 됐나' 복기하고, 이어질 미국장 관전포인트와 "
+        "내일 전망을 덧붙이세요."
+    )
+
+
 @mcp.tool()
 @safe_tool
 @warn_if_collecting
@@ -820,10 +848,13 @@ async def telegram_briefing(hours: float = 12) -> str:
         change = prices.daily_change(codes)
     # 버즈/내종목/읽을거리는 _ready 텍스트가 이미 '완성'이라 raw 를 안 보냄(토큰 75% 절감).
     # Claude 가 작문하는 건 시황뿐 — 거기 필요한 macro 만 남긴다. 깊은 분석은 !종목·velocity 로.
+    clock = market_clock.get_market_clock()  # SL 과 동일한 시각/세션 로직(KST·KRX 휴일)
     return _json(
         {
             "_playbook": _BRIEFING_PLAYBOOK,
             "window_hours": hours,
+            "기준시각_kst": clock["now_kst"],
+            "_시황_관점": _briefing_session(clock["krx"]),
             "_ready_버즈_그대로전송": _format_briefing_ready(
                 trending, slim_momentum, watchlist, reading, change
             ),
