@@ -641,8 +641,13 @@ def _reading_list(hours: float, limit: int = 8) -> list[dict]:
 # 공시 정리·상한가 리스트)는 '내러티브'가 아니라 샘플로 부적합. 후순위로 민다(없으면 그냥 씀).
 _LOW_NARRATIVE_RE = re.compile(
     r"이격도|\(\d{6}\.K[SQ]\)|MA\s?\d+\s*[:：]|일목균형|볼린저|"
-    r"오늘의 ?리포트|주요 ?공시 ?정리|상한가 ?(리스트|정리|종목)|지분 ?공시 ?정리"
+    r"오늘의 ?리포트|주요 ?공시 ?정리|상한가 ?(리스트|정리|종목)|지분 ?공시 ?정리|"
+    r"경제 ?방송 ?종목|방송 ?종목|오늘의 ?종목|관심 ?종목 ?정리"
 )
+
+# '갑자기 늘어난' 으로 인정할 최소 채널 수 — 1~2채널 급증은 한 채널의 잡담·나열·오매칭이라
+# 신호가 아니다. 여러 채널이 '동시에' 거론해야 새 내러티브로 본다(briefing 한정 기준).
+_SURGE_MIN_CHANNELS = 3
 
 
 def _is_low_narrative(text: str | None) -> bool:
@@ -734,7 +739,17 @@ def _format_briefing_ready(
             )
         lines.append("")
 
-    surge = [s for s in momentum if not s.get("listy_noise")][:6]
+    surge = [
+        s
+        for s in momentum
+        if not s.get("listy_noise")
+        and (s.get("recent_channels") or 0) >= _SURGE_MIN_CHANNELS
+    ]
+    surge.sort(  # 가장 많은 채널이 동시에 본 것 우선(=신호 강함)
+        key=lambda s: (s.get("recent_channels") or 0, s.get("recent_mentions") or 0),
+        reverse=True,
+    )
+    surge = surge[:6]
     if surge:
         lines.append("🚀 갑자기 늘어난 종목")
         for s in surge:
@@ -817,7 +832,7 @@ async def telegram_briefing(hours: float = 12) -> str:
     """
     baseline = max(hours * 6, 72)
     trending = queries.trending(hours=hours, top=15, kind="all")
-    momentum = queries.momentum(hours=hours, baseline_hours=baseline, top=12, kind="all")
+    momentum = queries.momentum(hours=hours, baseline_hours=baseline, top=20, kind="all")
     etf = load_etf_codes()
     for s in trending:
         s["is_etf"] = s.get("code") in etf
