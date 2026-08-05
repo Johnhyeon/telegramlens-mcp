@@ -11,7 +11,13 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-from telegram_lens.client import fetch_recent, make_client, refresh_views
+from telegram_lens.client import (
+    connect_with_timeout,
+    disconnect_safely,
+    fetch_recent,
+    make_client,
+    refresh_views,
+)
 from telegram_lens import cluster, db
 from telegram_lens.config import data_dir
 from telegram_lens.extract import extract_mentions
@@ -78,8 +84,10 @@ async def run_sync(
         known_ids = {r["id"] for r in conn.execute("SELECT id FROM channels")}
 
     client = make_client()
-    await client.connect()
     try:
+        # connect()도 try 안에서 — 연결 도중 실패해도 disconnect_safely 로 반드시 뒷정리한다
+        # (이전엔 connect()가 try 밖이라 연결 실패 시 정리 경로를 못 타는 문제가 있었음).
+        await connect_with_timeout(client)
         if not await client.is_user_authorized():
             from telegram_lens.client import NotLoggedInError
 
@@ -93,7 +101,7 @@ async def run_sync(
             except Exception:  # noqa: BLE001 — 명령 핸들러 등록 실패가 수집을 막으면 안 됨
                 pass
         # channel_ids=None → 가입된 모든 브로드캐스트 채널(새 채널 자동 포함).
-        rows, channels_meta = await fetch_recent(
+        rows, channels_meta, channel_stats = await fetch_recent(
             client,
             None,
             since,
@@ -114,7 +122,7 @@ async def run_sync(
             except Exception:  # noqa: BLE001 — 조회수 갱신 실패가 수집을 막으면 안 됨
                 views_refreshed = 0
     finally:
-        await client.disconnect()
+        await disconnect_safely(client)
 
     new_messages = 0
     new_mentions = 0
@@ -212,6 +220,7 @@ async def run_sync(
         "new_messages": new_messages,
         "new_mentions": new_mentions,
         "channels": len(channels_meta),
+        "channel_stats": channel_stats,
         "new_channels": len(new_channels),
         "new_channels_backfilled_days": round(new_channel_minutes / 1440, 1)
         if new_channels

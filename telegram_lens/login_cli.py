@@ -106,6 +106,8 @@ async def _sign_in_with_code(client, phone: str) -> None:
 async def _login() -> None:
     from telethon import TelegramClient
 
+    from telegram_lens.client import connect_with_timeout, disconnect_safely
+
     api_id, api_hash = get_credentials()
     if not api_id or not api_hash:
         api_id, api_hash = _prompt_api_credentials()
@@ -113,9 +115,9 @@ async def _login() -> None:
     _print_safety_note()
 
     client = TelegramClient(str(session_path()), api_id, api_hash)
-    await client.connect()
 
     try:
+        await connect_with_timeout(client)
         if await client.is_user_authorized():
             me = await client.get_me()
             print(f"이미 로그인됨: {me.first_name} (@{me.username})")
@@ -131,7 +133,7 @@ async def _login() -> None:
         me = await client.get_me()
         print(f"\n로그인 성공: {me.first_name} (@{me.username})")
     finally:
-        await client.disconnect()
+        await disconnect_safely(client)
 
 
 def main() -> None:

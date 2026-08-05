@@ -47,6 +47,12 @@ telegramlens-setup           # Claude Desktop/Code 자동 등록
 { "mcpServers": { "telegramlens": { "command": "telegramlens" } } }
 ```
 
+MCP가 Claude에 안 뜨거나 뭔가 막히면:
+
+```powershell
+telegramlens-doctor           # 설치·설정 진단 (uv/패키지/명령/config/라이선스/로그인)
+```
+
 ## 백그라운드 자동 수집 (별도 자식 데몬)
 
 수동 `telegram_sync` 를 매번 부르지 않아도, **Claude 가 이 MCP 서버를 켜둔 동안**

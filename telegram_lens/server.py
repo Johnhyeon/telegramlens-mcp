@@ -11,6 +11,7 @@ import functools
 import json
 import logging
 import re
+import subprocess
 import sys
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
@@ -81,12 +82,66 @@ async def _lifespan(_server):
         yield
     finally:
         watchdog.cancel()
+        await asyncio.gather(watchdog, return_exceptions=True)
         child = state.get("child")
         if child is not None:
-            try:
-                child.terminate()  # Claude 종료 시 우리가 띄운 데몬도 정리(persistence 방지)
-            except Exception:  # noqa: BLE001
-                pass
+            await _terminate_child(child)  # Claude 종료 시 우리가 띄운 데몬도 정리(persistence 방지)
+
+
+async def _terminate_child(child) -> None:
+    """자식 수집 데몬 정리: terminate → 최대 5초 대기 → 안 죽으면 kill → 재대기.
+
+    이전엔 terminate() 만 보내고 실제 종료를 기다리지 않아, 자식의 Telethon 연결 정리
+    (send/recv 루프 task)가 끝나기 전에 부모(MCP 서버) 프로세스가 먼저 죽어버릴 수 있었다
+    (고객 로그의 'Task was destroyed but it is pending' 시그니처와 같은 계열).
+    child.wait() 는 블로킹 호출이라 to_thread 로 돌려 서버 이벤트 루프를 막지 않는다.
+    """
+    try:
+        child.terminate()
+    except Exception as e:  # noqa: BLE001 — 이미 죽었거나 권한 문제는 무시
+        _LOG.warning("수집 데몬 종료 신호 실패: %s: %s", type(e).__name__, e)
+        return
+    try:
+        await asyncio.to_thread(child.wait, 5)
+        _LOG.info("수집 데몬 자식 프로세스 정상 종료 (pid=%s, code=%s)", child.pid, child.returncode)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    except Exception as e:  # noqa: BLE001
+        _LOG.warning("수집 데몬 종료 대기 실패: %s: %s", type(e).__name__, e)
+        return
+    _LOG.warning("수집 데몬 5초 내 미종료 — 강제 kill (pid=%s)", child.pid)
+    try:
+        child.kill()
+        await asyncio.to_thread(child.wait, 5)
+        _LOG.info("수집 데몬 강제 종료 완료 (pid=%s, code=%s)", child.pid, child.returncode)
+    except Exception as e:  # noqa: BLE001
+        _LOG.warning("수집 데몬 강제 종료 실패: %s: %s", type(e).__name__, e)
+
+
+def _support_hint() -> str:
+    """safe_tool 의 '예상 못한 오류' 버킷에서만 붙이는 자가진단 안내.
+
+    이미 원인이 명확한 예외(라이선스/로그인/자격증명 등)엔 안 붙인다 — 사소한 것까지
+    문의로 유도하면 노이즈만 늘어난다. sys.platform 은 이 프로세스가 실제 도는 OS라
+    Mac/Win 명령을 헷갈릴 일 없이 바로 골라 보여줄 수 있다.
+    """
+    if sys.platform == "darwin":
+        log_cmd = "cd ~/Library/Logs/Claude && zip -r ~/Desktop/claude_logs.zip . && open ~/Desktop"
+    elif sys.platform == "win32":
+        log_cmd = (
+            'powershell -c "Compress-Archive $env:APPDATA\\Claude\\logs\\* '
+            '$env:USERPROFILE\\Desktop\\claude_logs.zip -Force; explorer $env:USERPROFILE\\Desktop"'
+        )
+    else:
+        log_cmd = None
+    hint = "\n\n계속되면:\n1) Claude 완전 종료 후 재시작 → 다시 시도"
+    if log_cmd:
+        hint += (
+            "\n2) 그래도 안 되면 아래 명령으로 로그를 모아서 osy980315@gmail.com 으로 "
+            f"보내주세요\n   {log_cmd}"
+        )
+    return hint
 
 
 def safe_tool(func):
@@ -104,7 +159,7 @@ def safe_tool(func):
         except NotLoggedInError as e:
             return f"⚠️ {e}"
         except Exception as e:  # noqa: BLE001
-            return f"⚠️ 처리 중 오류: {type(e).__name__}: {e}"
+            return f"⚠️ 처리 중 오류: {type(e).__name__}: {e}" + _support_hint()
 
     return wrapper
 
@@ -240,62 +295,115 @@ trending·momentum 결과의 수치는 '무엇이 얼마나 언급됐나'(빈도
 @mcp.tool()
 @safe_tool
 async def telegram_status() -> str:
-    """로그인·수집 상태와 백그라운드 수집 데몬 상태를 반환합니다."""
+    """로그인·수집 상태와 백그라운드 수집 데몬 상태를 반환합니다.
+
+    status(healthy/degraded/failed)와 last_error.code 를 보고 문제가 있으면
+    recovery.instruction/command 를 사용자에게 안내하세요(예: telegramlens-doctor).
+    """
+    from telegram_lens import procstate
+    from telegram_lens.daemon import lock_path, status_path
+
     db.init_db()
     with db.connect() as conn:
         s = db.stats(conn)
-    s["logged_in"] = is_logged_in()
+    logged_in = is_logged_in()
+    s["logged_in"] = logged_in
     s["stocks_loaded"] = len(load_stocks())
     # 사용자에게 보이는 시각은 KST 로(저장은 UTC). 한국 사용자가 status 의 UTC 보고
     # 헷갈리던 부분 — 다른 조회 도구는 이미 _to_kst 로 변환해 노출한다.
     s["last_synced"] = queries._to_kst(s.get("last_synced"))
     s["baselines_computed"] = queries._to_kst(s.get("baselines_computed"))
 
-    # 백그라운드 수집 데몬(별도 자식 프로세스)의 하트비트.
-    hb = data_dir() / "daemon_status.json"
-    beat = None
-    if hb.exists():
-        try:
-            beat = json.loads(hb.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
-            beat = None
-    from telegram_lens.daemon import is_alive as _collector_alive
-    if beat and _collector_alive():
-        last_result = beat.get("last_result")
-        if isinstance(last_result, dict) and last_result.get("since"):
-            last_result = {**last_result, "since": queries._to_kst(last_result["since"])}
-        s["collector"] = {
-            "running": True,
-            "mode": "별도 자식 프로세스 (Claude 켜진 동안 백그라운드 수집)",
-            "state": beat.get("state"),
-            "interval_minutes": beat.get("interval_minutes"),
-            "last_run": queries._to_kst(beat.get("last_run")),
-            "last_result": last_result,
+    if not logged_in:
+        s["status"] = "failed"
+        s["summary"] = "텔레그램 로그인이 되어 있지 않습니다."
+        s["last_error"] = {"code": "NOT_LOGGED_IN", "message": "세션 파일이 없습니다."}
+        s["recovery"] = {
+            "automatic": False,
+            "command": "telegramlens-login",
+            "instruction": "터미널에서 telegramlens-login 을 실행해 로그인하세요.",
         }
-    else:
-        s["collector"] = {
-            "running": False,
-            "note": "수집 데몬 미가동 — Claude 재시작 시 자동 기동(로그인 상태일 때).",
+        return _json(s)
+
+    # 백그라운드 수집 데몬(별도 자식 프로세스) 상태 — 락 보유 여부(procstate.DaemonLock)가
+    # '실제로 살아있는가'의 유일한 근거고, daemon_status.json 은 사실(fact) 노출용이다.
+    lock_held = procstate.DaemonLock(lock_path()).is_held()
+    daemon_status = procstate.read_json(status_path())
+    health = procstate.compute_health(daemon_status, lock_held)
+    s["status"] = health["health"]
+    s["summary"] = health["message"]
+
+    collector: dict = {"running": lock_held}
+    if daemon_status:
+        collector.update(
+            {
+                "daemon_state": daemon_status.get("state"),
+                "heartbeat_at": queries._to_kst(daemon_status.get("heartbeat_at")),
+                "last_success_at": queries._to_kst(daemon_status.get("last_success_at")),
+                "newest_message_at": queries._to_kst(daemon_status.get("newest_message_at")),
+                "interval_minutes": daemon_status.get("interval_minutes"),
+                "channel_count": (daemon_status.get("channels") or {}).get("total"),
+                "channels": daemon_status.get("channels"),
+                "consecutive_failures": daemon_status.get("consecutive_failures"),
+            }
+        )
+        last_success_at = daemon_status.get("last_success_at")
+        if last_success_at:
+            try:
+                dt = datetime.fromisoformat(last_success_at)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                collector["current_lag_minutes"] = round(
+                    (datetime.now(timezone.utc) - dt).total_seconds() / 60, 1
+                )
+            except ValueError:
+                pass
+        last_result = daemon_status.get("last_result")
+        if isinstance(last_result, dict) and last_result.get("since"):
+            collector["last_result"] = {
+                **last_result, "since": queries._to_kst(last_result["since"])
+            }
+        elif last_result:
+            collector["last_result"] = last_result
+    if not lock_held:
+        collector["note"] = "수집 데몬 미가동 — Claude 재시작 시 자동 기동(로그인 상태일 때)."
+    elif daemon_status is None:
+        collector["note"] = "데몬은 가동 중이나 상태 파일을 아직 못 읽었습니다(막 기동됨)."
+    s["collector"] = collector
+    s["backfill"] = (daemon_status or {}).get("backfill") or {"state": "idle"}
+
+    if health["problem_code"]:
+        last_error = {"code": health["problem_code"], "message": health["message"]}
+        de = (daemon_status or {}).get("last_error")
+        if de:
+            last_error.update(
+                {
+                    "stage": de.get("stage"),
+                    "type": de.get("type"),
+                    "occurred_at": queries._to_kst(de.get("occurred_at")),
+                }
+            )
+        s["last_error"] = last_error
+        s["recovery"] = {
+            "automatic": False,
+            "command": "telegramlens-doctor --repair daemon",
+            "instruction": "명령을 실행한 뒤 Claude 를 완전히 종료하고 다시 실행하세요.",
         }
 
     # 7일(자동 백필 상한)을 넘는 공백이 감지되면, 더 수집할지 사용자에게 제안.
-    offer = data_dir() / "pending_offer.json"
-    if offer.exists():
-        try:
-            o = json.loads(offer.read_text(encoding="utf-8"))
-            s["backfill_offer"] = {
-                "gap_days": o.get("gap_days"),
-                "auto_collected_days": o.get("auto_collected_days"),
-                "action": (
-                    f"최근 약 {o.get('gap_days')}일치 데이터가 있는데 자동으로는 "
-                    f"{o.get('auto_collected_days')}일까지만 수집했습니다. 사용자에게 "
-                    "'그 이전 데이터까지 더 수집할까요?'라고 물어보고, 원하면 "
-                    "telegram_collect_history(days=원하는_일수)를 호출하세요. "
-                    "거절하면 telegram_dismiss_backfill()."
-                ),
-            }
-        except (json.JSONDecodeError, OSError):
-            pass
+    offer = procstate.read_json(data_dir() / "pending_offer.json")
+    if offer:
+        s["backfill_offer"] = {
+            "gap_days": offer.get("gap_days"),
+            "auto_collected_days": offer.get("auto_collected_days"),
+            "action": (
+                f"최근 약 {offer.get('gap_days')}일치 데이터가 있는데 자동으로는 "
+                f"{offer.get('auto_collected_days')}일까지만 수집했습니다. 사용자에게 "
+                "'그 이전 데이터까지 더 수집할까요?'라고 물어보고, 원하면 "
+                "telegram_collect_history(days=원하는_일수)를 호출하세요. "
+                "거절하면 telegram_dismiss_backfill()."
+            ),
+        }
     return _json(s)
 
 
@@ -310,13 +418,12 @@ async def telegram_collect_history(days: int = 7) -> str:
     Args:
         days: 소급 수집할 일수(1~90). 예: 14면 최근 14일치.
     """
+    from telegram_lens import procstate
+
     days = max(1, min(int(days), 90))
-    (data_dir() / "backfill_request.json").write_text(
-        json.dumps(
-            {"days": days, "requested_at": datetime.now(timezone.utc).isoformat()},
-            ensure_ascii=False,
-        ),
-        encoding="utf-8",
+    procstate.atomic_write_json(
+        data_dir() / "backfill_request.json",
+        {"days": days, "requested_at": datetime.now(timezone.utc).isoformat()},
     )
     # 제안은 처리됐으니 정리.
     try:

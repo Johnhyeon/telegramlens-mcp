@@ -120,12 +120,19 @@ def _resolve_targets(arg: str) -> list[str]:
     raise ValueError(f"Invalid target: {arg}")
 
 
-def _configure_one_target(config_path: Path, label: str, *, command: str) -> None:
-    print()
-    print(f"  -> {label}")
+def _configure_one_target(config_path: Path, label: str, *, command: str, quiet: bool = False) -> dict:
+    """단일 config 파일에 mcpServers.telegramlens 등록. 변경 결과를 dict로 반환한다.
+
+    quiet=True 면 사람용 진행 로그를 찍지 않는다(Manager의 --json/--non-interactive
+    호출에서 stdout을 구조화 결과 하나로만 유지하기 위함).
+    """
+    if not quiet:
+        print()
+        print(f"  -> {label}")
 
     config_path.parent.mkdir(parents=True, exist_ok=True)
 
+    backup_path: Path | None = None
     if config_path.exists():
         try:
             with open(config_path, "r", encoding="utf-8") as f:
@@ -133,9 +140,11 @@ def _configure_one_target(config_path: Path, label: str, *, command: str) -> Non
             backup_path = config_path.with_suffix(".json.backup")
             with open(backup_path, "w", encoding="utf-8") as f:
                 json.dump(config, f, indent=2, ensure_ascii=False)
-            print(f"  [OK] Backup saved: {backup_path}")
+            if not quiet:
+                print(f"  [OK] Backup saved: {backup_path}")
         except json.JSONDecodeError:
-            print("  [WARN] Existing config is corrupted. Creating new one.")
+            if not quiet:
+                print("  [WARN] Existing config is corrupted. Creating new one.")
             config = {}
     else:
         config = {}
@@ -149,21 +158,35 @@ def _configure_one_target(config_path: Path, label: str, *, command: str) -> Non
     with open(config_path, "w", encoding="utf-8") as f:
         json.dump(config, f, indent=2, ensure_ascii=False)
 
-    print(f"  [OK] Config updated (key: {SERVER_KEY})")
-    print(f"  Path:    {config_path}")
-    print(f"  Command: {entry['command']}")
-    if "args" in entry:
-        print(f"  Args:    {' '.join(entry['args'])}")
+    if not quiet:
+        print(f"  [OK] Config updated (key: {SERVER_KEY})")
+        print(f"  Path:    {config_path}")
+        print(f"  Command: {entry['command']}")
+        if "args" in entry:
+            print(f"  Args:    {' '.join(entry['args'])}")
+
+    return {
+        "target_label": label,
+        "config_path": str(config_path),
+        "backup_path": str(backup_path) if backup_path else None,
+        "command": entry["command"],
+        "args": entry.get("args"),
+    }
 
 
-def configure(command: str = "telegramlens", *, targets: list[str] | None = None) -> None:
+def configure(
+    command: str = "telegramlens", *, targets: list[str] | None = None, quiet: bool = False
+) -> list[dict]:
+    """선택된 모든 타겟에 telegramlens MCP 등록. 타겟별 변경 결과 리스트를 반환한다."""
     targets = targets or ["claude-desktop"]
     unknown = [t for t in targets if t not in TARGETS]
     if unknown:
         raise ValueError(f"Unknown target(s): {unknown}. Valid: {list(TARGETS.keys())}")
+    results = []
     for target in targets:
         path_func, label = TARGETS[target]
-        _configure_one_target(path_func(), label, command=command)
+        results.append(_configure_one_target(path_func(), label, command=command, quiet=quiet))
+    return results
 
 
 def _build_parser():
@@ -179,29 +202,50 @@ def _build_parser():
         choices=["claude-desktop", "claude-code", "both", "auto"],
         default="auto",
     )
+    p.add_argument(
+        "--json",
+        action="store_true",
+        help="결과를 JSON으로 stdout에 출력 (Manager 연동용). 자동으로 --non-interactive를 겸한다.",
+    )
+    p.add_argument(
+        "--non-interactive",
+        action="store_true",
+        help="배너/진행 로그를 찍지 않는다 (원래 프롬프트가 없으므로 동작 자체는 동일).",
+    )
     return p
 
 
 def main():
     args = _build_parser().parse_args()
     targets = _resolve_targets(args.target)
-    target_labels = ", ".join(TARGETS[t][1] for t in targets)
+    quiet = args.json or args.non_interactive
 
-    print("==============================================")
-    print("  TelegramLens - MCP Setup")
-    print("==============================================")
-    print(f"  Targets: {target_labels}")
+    if not quiet:
+        target_labels = ", ".join(TARGETS[t][1] for t in targets)
+        print("==============================================")
+        print("  TelegramLens - MCP Setup")
+        print("==============================================")
+        print(f"  Targets: {target_labels}")
 
     try:
-        configure(args.command, targets=targets)
+        results = configure(args.command, targets=targets, quiet=quiet)
+    except Exception as e:
+        if args.json:
+            print(json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False))
+        else:
+            print(f"  [ERROR] {e}", file=sys.stderr)
+        sys.exit(1)
+
+    if args.json:
+        print(json.dumps({"ok": True, "targets": results}, ensure_ascii=False))
+        sys.exit(0)
+
+    if not quiet:
         print()
         if "claude-desktop" in targets:
             print("Done! Claude Desktop 을 완전히 종료 후 다시 실행하세요.")
         if "claude-code" in targets:
             print("Done! Claude Code 새 세션부터 telegramlens 도구 사용 가능.")
-    except Exception as e:
-        print(f"  [ERROR] {e}", file=sys.stderr)
-        sys.exit(1)
 
 
 if __name__ == "__main__":

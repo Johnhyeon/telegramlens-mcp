@@ -15,6 +15,7 @@ StockLens/DartLens 와 같은 판매자 키쌍을 쓰되, PRODUCT 태그(TGLN)�
 from __future__ import annotations
 
 import base64
+import json
 import os
 import sys
 
@@ -62,6 +63,14 @@ def _decode(key_str: str) -> bytes:
     s = key_str.strip().upper().replace("-", "").replace(" ", "")
     s += "=" * ((8 - len(s) % 8) % 8)
     return base64.b32decode(s)
+
+
+def mask_tail(value: str, keep: int = 4) -> str:
+    """마지막 keep자만 남기고 나머지는 '*'로 가림. 로그·JSON에 원문 노출 방지용."""
+    v = (value or "").strip()
+    if len(v) <= keep:
+        return "*" * len(v)
+    return "*" * 4 + v[-keep:]
 
 
 def verify_key(key_str: str) -> dict:
@@ -151,13 +160,74 @@ def _prompt_key() -> str | None:
         return None
 
 
+def _read_key_from_stdin() -> str | None:
+    """표준입력 한 줄을 키로 읽는다. argv에 담지 않으므로 프로세스 목록(ps/작업관리자)에
+    키가 노출되지 않는다 — Manager 등 자동화가 activation을 호출할 때 쓰는 경로."""
+    try:
+        line = sys.stdin.readline()
+    except Exception:
+        return None
+    return line.strip() or None
+
+
+def _build_activate_parser():
+    import argparse
+
+    p = argparse.ArgumentParser(
+        prog="telegramlens-activate",
+        description="TelegramLens 라이선스 키 활성화",
+    )
+    p.add_argument(
+        "key",
+        nargs="*",
+        help=(
+            "라이선스 키 (기존 방식 — 공백으로 잘려도 합쳐서 인식). "
+            "프로세스 목록에 노출될 수 있어 자동화에는 --stdin 권장."
+        ),
+    )
+    p.add_argument(
+        "--stdin",
+        action="store_true",
+        help="표준입력에서 키를 한 줄 읽는다 (프로세스 목록에 노출 안 됨).",
+    )
+    p.add_argument(
+        "--json",
+        action="store_true",
+        help="결과를 JSON으로 stdout에 출력 (Manager 연동용).",
+    )
+    return p
+
+
 def activate_cli() -> None:
-    """`telegramlens-activate <KEY>` 진입점. 인자가 없으면 키 입력을 안내한다."""
-    args = sys.argv[1:]
-    key = " ".join(args).strip() if args else _prompt_key()
+    """`telegramlens-activate` 진입점.
+
+    사용법:
+        telegramlens-activate <KEY>           기존 방식 (인자 없으면 대화형 입력)
+        telegramlens-activate --stdin         표준입력에서 키 읽기 (프로세스 목록 비노출)
+        telegramlens-activate --stdin --json  Manager 연동용 구조화 출력
+    """
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
+    args = _build_activate_parser().parse_args(sys.argv[1:])
+
+    if args.stdin:
+        key = _read_key_from_stdin()
+    elif args.key:
+        key = " ".join(args.key).strip()
+    elif not args.json:
+        key = _prompt_key()
+    else:
+        key = None
 
     if not key:
-        if is_licensed():
+        active = is_licensed()
+        if args.json:
+            print(json.dumps({"ok": active, "status": "active" if active else "not_active"}, ensure_ascii=False))
+            sys.exit(0 if active else 1)
+        if active:
             print("현재 상태: 활성화됨 ✅")
             sys.exit(0)
         print("현재 상태: 미활성화 ❌\n")
@@ -165,10 +235,22 @@ def activate_cli() -> None:
         sys.exit(1)
 
     res = save_key(key)
+    key = None  # 저장 직후 로컬 참조 제거 — 이후 경로에서 키 원문을 다시 쓰지 않는다.
+
     if res["valid"]:
+        if args.json:
+            print(json.dumps(
+                {"ok": True, "status": "active", "license_id_masked": mask_tail(res["license_id"].upper())},
+                ensure_ascii=False,
+            ))
+            sys.exit(0)
         print(f"활성화 완료 ✅  (license_id: {res['license_id']})")
         print("Claude Desktop을 완전히 종료했다가 다시 켜면 TelegramLens 도구를 쓸 수 있습니다.")
         sys.exit(0)
+
+    if args.json:
+        print(json.dumps({"ok": False, "status": "invalid", "reason": res["reason"]}, ensure_ascii=False))
+        sys.exit(1)
     print(f"활성화 실패 ❌  — {res['reason']}\n")
     print("· 결제 후 발송된 키를 공백 없이 정확히 붙여넣었는지 확인하세요.")
     if PURCHASE_URL:

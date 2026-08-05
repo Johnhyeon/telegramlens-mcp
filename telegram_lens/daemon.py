@@ -7,14 +7,15 @@ PC가 켜져 있는 동안 주기적으로 sync 를 돌려 DB를 촘촘히 채�
   - 수집 창(window) > 주기(interval): 한 사이클이 늦어도 공백 없이 겹쳐 수집.
     중복은 DB의 UNIQUE 제약으로 자동 스킵.
   - 사이클 실패(네트워크/FloodWait)는 로그만 남기고 다음 사이클로 계속.
-  - 하트비트(daemon_status.json)를 매 사이클 기록 → telegram_status 가 표시.
-  - 락 파일(daemon.pid)로 중복 실행 방지.
+  - 상태 파일(daemon_status.json, schema v2)을 매 사이클·매 하트비트 기록 →
+    telegram_status/doctor 가 health 를 판정하는 원재료(raw facts)로만 쓴다.
+  - daemon.pid 에 건 OS advisory lock(procstate.DaemonLock)으로 중복 실행 방지 —
+    PID 재사용 오탐 없이 프로세스 생애주기와 락이 정확히 일치한다.
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import math
 import os
@@ -25,54 +26,60 @@ from logging.handlers import RotatingFileHandler
 
 from telethon import events
 
-from telegram_lens import commands, db
-from telegram_lens.client import make_client
+from telegram_lens import commands, db, procstate
+from telegram_lens.client import connect_with_timeout, disconnect_safely, make_client
 from telegram_lens.config import data_dir, secure_data_files
 from telegram_lens.sync import run_sync
 
 _LOG = logging.getLogger("telegramlens.daemon")
 _stop = asyncio.Event()
 
+_STATUS_SCHEMA_VERSION = 2
 
-def _status_path():
+# 사이클 종류별 타임아웃(초). 일반 사이클(정상 창)은 짧게, 다운타임 자동 캐치업은 넉넉히,
+# 사용자가 명시적으로 요청한 대규모 백필(최대 90일)은 가장 넉넉히 — 단일 상수를 모든
+# 사이클에 똑같이 적용하면 큰 백필이 도중에 잘리는 문제(P0)가 있었다.
+_CYCLE_TIMEOUT_NORMAL_SEC = 600
+_CYCLE_TIMEOUT_AUTO_CATCHUP_SEC = 1800
+_CYCLE_TIMEOUT_USER_BACKFILL_SEC = 3600
+
+# 락 보유자의 하트비트가 이 나이(초)를 넘으면 좀비로 간주해 정리 후 락을 회수한다.
+_STALE_AFTER_SEC = 180
+
+
+def status_path():
     return data_dir() / "daemon_status.json"
 
 
-def _pid_path():
+def lock_path():
     return data_dir() / "daemon.pid"
 
 
-def _alive_path():
-    return data_dir() / "daemon_alive"
+def _offer_path():
+    return data_dir() / "pending_offer.json"
 
 
-def _touch_alive() -> None:
-    """가동 신호(타임스탬프) 갱신 — 데몬이 30초마다 호출.
-
-    PID 존재가 아니라 이 타임스탬프의 신선도로 '진짜 가동 중'을 판정한다. Windows 의
-    OpenProcess 는 종료됐거나 재사용된 PID 도 열어버려(_pid_alive 거짓양성) 죽은 데몬을
-    살아있다고 오판하지만, 좀비/재사용 PID 는 이 파일을 갱신하지 못한다.
-    """
-    try:
-        _alive_path().write_text(
-            datetime.now(timezone.utc).isoformat(), encoding="utf-8"
-        )
-    except OSError:
-        pass
+def _request_path():
+    return data_dir() / "backfill_request.json"
 
 
-def _collector_fresh(max_age_sec: float = 180) -> bool:
-    """daemon_alive 타임스탬프가 max_age_sec 이내면 True(= 실제 가동 중)."""
-    p = _alive_path()
-    if not p.exists():
-        return False
-    try:
-        ts = datetime.fromisoformat(p.read_text(encoding="utf-8").strip())
-    except (OSError, ValueError):
-        return False
-    if ts.tzinfo is None:
-        ts = ts.replace(tzinfo=timezone.utc)
-    return (datetime.now(timezone.utc) - ts).total_seconds() <= max_age_sec
+def _maintenance_path():
+    return data_dir() / "maintenance.json"
+
+
+def _send_request_path():
+    return data_dir() / "send_request.json"
+
+
+def _send_result_path():
+    return data_dir() / "send_result.json"
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+_daemon_lock = procstate.DaemonLock(lock_path())
 
 
 def _setup_logging() -> None:
@@ -96,94 +103,52 @@ def _setup_logging() -> None:
     _LOG.addHandler(stream)
 
 
-def _write_heartbeat(
-    state: str,
-    interval_min: int,
-    last_result: dict | None,
-    catching_up: bool = False,
-    window_minutes: int | None = None,
-) -> None:
-    now = datetime.now(timezone.utc)
-    data = {
+def _new_status(interval_min: int) -> dict:
+    """상태 파일의 초기값. 여기엔 '사실'만 담는다(healthy/degraded 같은 판정은 담지 않음) —
+    판정은 telegram_status/doctor 가 procstate.compute_health 로 한 곳에서만 계산한다."""
+    now = _now_iso()
+    return {
+        "schema_version": _STATUS_SCHEMA_VERSION,
         "pid": os.getpid(),
-        "state": state,  # running | sleeping | error
+        "state": "starting",  # starting | running | sleeping | error | stopped
         "interval_minutes": interval_min,
-        # catching_up: 이번 'running' 사이클이 다운타임 후 큰 창을 소급 수집 중인지.
-        # 정상 사이클(작은 창)은 False — 조회 도구가 정상 사이클엔 '수집 중' 차단을 안 한다.
-        "catching_up": catching_up,
-        "window_minutes": window_minutes,
-        "last_run": now.isoformat(),
-        "last_result": last_result,
+        "process_started_at": now,
+        "heartbeat_at": now,
+        "cycle_started_at": None,
+        "last_success_at": None,
+        "last_error_at": None,
+        "newest_message_at": None,
+        "catching_up": False,
+        "window_minutes": None,
+        "channels": {"total": 0, "processed": 0, "succeeded": 0, "failed": 0},
+        "last_result": None,
+        "backfill": {
+            "state": "idle",  # idle | running | interrupted
+            "requested_days": None,
+            "window_minutes": None,
+            "processed_channels": 0,
+            "total_channels": 0,
+            "fetched_messages": 0,
+            "started_at": None,
+            "last_progress_at": None,
+        },
+        "consecutive_failures": 0,
+        "last_error": None,
     }
-    try:
-        _status_path().write_text(
-            json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
-    except OSError:
-        pass
 
 
-def _acquire_lock() -> bool:
-    """이미 '실제로' 데몬이 돌고 있으면 False. PID 파일 + 가동 신선도 락.
-
-    PID 존재만 보면 Windows 좀비/재사용 PID 에 속아 '이미 실행 중'으로 오판하고 데몬이
-    영영 못 뜬다(2026-06 장애 원인). 가동 신호(_collector_fresh)가 멎었으면 그 PID 는
-    우리 데몬이 아니거나 멎은 것이므로 락을 회수해 새로 띄운다.
-    """
-    p = _pid_path()
-    if p.exists():
-        try:
-            old_pid = int(p.read_text().strip())
-        except (ValueError, OSError):
-            old_pid = None
-        if old_pid and _pid_alive(old_pid) and _collector_fresh():
-            _LOG.error("이미 데몬이 실행 중입니다 (pid=%s). 종료합니다.", old_pid)
-            return False
-        if old_pid:
-            _LOG.warning("낡은 PID 락 회수 (pid=%s, 가동 신호 멎음) — 새로 기동.", old_pid)
-    p.write_text(str(os.getpid()), encoding="utf-8")
-    return True
-
-
-def _pid_alive(pid: int) -> bool:
-    if sys.platform == "win32":
-        import ctypes
-
-        PROCESS_QUERY = 0x1000
-        h = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY, False, pid)
-        if h:
-            ctypes.windll.kernel32.CloseHandle(h)
-            return True
-        return False
-    try:
-        os.kill(pid, 0)
-        return True
-    except (OSError, ProcessLookupError):
-        return False
-
-
-def _release_lock() -> None:
-    try:
-        _pid_path().unlink()
-    except OSError:
-        pass
+def _persist_status(status: dict) -> None:
+    procstate.atomic_write_json(status_path(), status)
 
 
 def is_alive() -> bool:
-    """데몬이 '실제로' 가동 중인지 — PID 존재 AND 가동 신호 신선도. 외부(서버)에서 호출.
+    """데몬이 실제로 가동 중인지 — 외부(server.py 등)에서 호출.
 
-    PID 만으로는 Windows 좀비/재사용 PID 에 속는다(_pid_alive 거짓양성). 가동 신호가
-    멈췄으면 그 PID 가 우리 데몬이 아니거나 멎은 것이므로 죽은 것으로 본다 → 서버 감시
-    루프가 재스폰한다.
+    락 보유 여부만 확인하면 충분하다. OS 가 프로세스 종료(SIGKILL 포함)와 동시에 advisory
+    lock 을 자동 해제하므로, '락이 잡혀있다'는 사실 자체가 '살아있는 프로세스가 쥐고
+    있다'는 것과 항상 정확히 일치한다 — PID 재사용으로 오판할 여지가 구조적으로 없다.
     """
-    p = _pid_path()
-    if not p.exists():
-        return False
-    try:
-        pid = int(p.read_text().strip())
-    except (ValueError, OSError):
-        return False
-    return _pid_alive(pid) and _collector_fresh()
+    return procstate.DaemonLock(lock_path()).is_held()
 
 
 def spawn_child(interval: int = 10):
@@ -193,7 +158,7 @@ def spawn_child(interval: int = 10):
     아님 → 백신 행위탐지 회피). stdout/stderr 를 DEVNULL 로 막아 부모(MCP 서버)의
     stdio(JSON-RPC) 채널을 오염시키지 않는다. 데몬 자신의 로그는 daemon.log 로 남는다.
 
-    이미 살아있으면 None(데몬의 PID 락도 이중 안전망). 반환: subprocess.Popen | None.
+    이미 살아있으면 None(데몬의 락도 이중 안전망). 반환: subprocess.Popen | None.
     """
     if is_alive():
         return None
@@ -258,12 +223,14 @@ def _catchup_limit(window_min: int, base_limit: int, per_hour: int = 80,
     return max(base_limit, min(scaled, hard_cap))
 
 
-def _offer_path():
-    return data_dir() / "pending_offer.json"
-
-
-def _request_path():
-    return data_dir() / "backfill_request.json"
+def _cycle_timeout_sec(req_days: int | None, catching_up: bool) -> int:
+    """사이클 종류에 따른 타임아웃(초). 채널 하나가 멎어도 client.py 의 채널별 타임아웃이
+    먼저 잡아내므로, 여기 상한은 '전체 사이클'이 통째로 안 끝나는 극단적 경우의 최후 방어선."""
+    if req_days:
+        return _CYCLE_TIMEOUT_USER_BACKFILL_SEC
+    if catching_up:
+        return _CYCLE_TIMEOUT_AUTO_CATCHUP_SEC
+    return _CYCLE_TIMEOUT_NORMAL_SEC
 
 
 def _gap_minutes():
@@ -295,32 +262,26 @@ def _maybe_offer_backfill(max_window: int) -> None:
     gap = _gap_minutes()
     if not gap or gap <= max_window:
         return
-    try:
-        _offer_path().write_text(
-            json.dumps(
-                {
-                    "gap_days": int(math.ceil(gap / 1440)),
-                    "auto_collected_days": round(max_window / 1440, 1),
-                    "detected_at": datetime.now(timezone.utc).isoformat(),
-                },
-                ensure_ascii=False,
-            ),
-            encoding="utf-8",
-        )
-    except OSError:
-        pass
+    procstate.atomic_write_json(
+        _offer_path(),
+        {
+            "gap_days": int(math.ceil(gap / 1440)),
+            "auto_collected_days": round(max_window / 1440, 1),
+            "detected_at": _now_iso(),
+        },
+    )
 
 
 def _read_backfill_request():
     """사용자가 요청한 깊은 백필 일수. 없으면 None."""
-    p = _request_path()
-    if not p.exists():
+    data = procstate.read_json(_request_path())
+    if not data:
         return None
     try:
-        days = int(json.loads(p.read_text(encoding="utf-8")).get("days", 0))
-        return days if days > 0 else None
-    except (OSError, ValueError, json.JSONDecodeError):
+        days = int(data.get("days", 0))
+    except (TypeError, ValueError):
         return None
+    return days if days > 0 else None
 
 
 def _clear_file(path) -> None:
@@ -328,10 +289,6 @@ def _clear_file(path) -> None:
         path.unlink()
     except OSError:
         pass
-
-
-def _maintenance_path():
-    return data_dir() / "maintenance.json"
 
 
 def _retention_days() -> int:
@@ -347,13 +304,7 @@ def _run_maintenance() -> None:
     매 사이클 호출되지만 타임스탬프 게이트로 실제 작업은 하루/월 1회만 한다(호출 자체는 저렴).
     """
     now = datetime.now(timezone.utc)
-    state = {}
-    p = _maintenance_path()
-    if p.exists():
-        try:
-            state = json.loads(p.read_text(encoding="utf-8"))
-        except (OSError, ValueError, json.JSONDecodeError):
-            state = {}
+    state = procstate.read_json(_maintenance_path()) or {}
 
     def _age_h(key):
         ts = state.get(key)
@@ -396,20 +347,7 @@ def _run_maintenance() -> None:
             _LOG.error("VACUUM 실패: %s: %s", type(e).__name__, e)
 
     if changed:
-        try:
-            _maintenance_path().write_text(
-                json.dumps(state, ensure_ascii=False), encoding="utf-8"
-            )
-        except OSError:
-            pass
-
-
-def _send_request_path():
-    return data_dir() / "send_request.json"
-
-
-def _send_result_path():
-    return data_dir() / "send_result.json"
+        procstate.atomic_write_json(_maintenance_path(), state)
 
 
 def _read_send_request():
@@ -418,12 +356,8 @@ def _read_send_request():
     전송은 데몬만 한다(세션 소유자 단일화 → 수집용 세션과 충돌 0). 서버는 요청 파일만 남기고,
     데몬이 sleep 구간(수집 client 비활성)에 처리한 뒤 결과 파일을 남긴다.
     """
-    p = _send_request_path()
-    if not p.exists():
-        return None
-    try:
-        data = json.loads(p.read_text(encoding="utf-8"))
-    except (OSError, ValueError, json.JSONDecodeError):
+    data = procstate.read_json(_send_request_path())
+    if not data:
         return None
     msgs = data.get("messages")
     if not isinstance(msgs, list) or not msgs:
@@ -483,12 +417,7 @@ async def _drain_send_request(client) -> None:
         result["error"] = f"{type(e).__name__}: {e}"
         _LOG.error("나에게 전송 실패: %s", e)
 
-    try:
-        _send_result_path().write_text(
-            json.dumps(result, ensure_ascii=False), encoding="utf-8"
-        )
-    except OSError:
-        pass
+    procstate.atomic_write_json(_send_result_path(), result)
     _clear_file(_send_request_path())
     if result["ok"]:
         _LOG.info("나에게 전송 완료 — %d개 메시지", result["sent"])
@@ -577,122 +506,210 @@ async def _poll_commands(client) -> None:
         await _process_command_msg(client, m)
 
 
+async def _run_cycle(status: dict, interval_min: int, min_window: int, max_window: int,
+                      per_channel_limit: int) -> bool:
+    """사이클 1회 실행. status 딕셔너리를 제자리에서 갱신하고 매 단계 영속화한다.
+
+    반환: 이번 사이클이 (사용자 요청이든 자동이든) 캐치업이었는지 — 호출자가 유지보수 실행
+    여부를 판단하는 데 쓴다.
+    """
+    req_days = _read_backfill_request()
+    auto_window = _catchup_window(min_window, max_window)
+    if req_days:
+        # 작은 요청(예: 1일)이 큰 다운타임 갭(예: 3일)을 덮어써, 중간 구간을 영영
+        # 수집하지 않고 영구·무성 구멍을 남기던 버그를 막는다(P0: 히스토리 무결성).
+        window_min = max(req_days * 1440, auto_window)
+        _LOG.info(
+            "사용자 요청 백필 — 요청 %d일, 실효 창 %d분 소급 수집", req_days, window_min,
+        )
+    else:
+        window_min = auto_window
+    eff_limit = _catchup_limit(window_min, per_channel_limit)
+    # 큰 창(평소보다 깊은 소급) = 다운타임 캐치업. 사용자 요청 백필도 캐치업으로 본다.
+    catching_up = bool(req_days) or window_min > min_window
+    cycle_timeout = _cycle_timeout_sec(req_days, catching_up)
+
+    status["state"] = "running"
+    status["catching_up"] = catching_up
+    status["window_minutes"] = window_min
+    status["cycle_started_at"] = _now_iso()
+    status["heartbeat_at"] = _now_iso()
+    if req_days:
+        prev_bf = status.get("backfill") or {}
+        status["backfill"] = {
+            "state": "running",
+            "requested_days": req_days,
+            "window_minutes": window_min,
+            "processed_channels": 0,
+            "total_channels": 0,
+            "fetched_messages": 0,
+            "started_at": prev_bf.get("started_at") or _now_iso(),
+            "last_progress_at": _now_iso(),
+        }
+    _persist_status(status)
+
+    if window_min > min_window:
+        _LOG.info("캐치업 — %d분 소급 수집(채널당 최대 %d개, 타임아웃 %d초)",
+                   window_min, eff_limit, cycle_timeout)
+
+    try:
+        last_result = await asyncio.wait_for(
+            run_sync(
+                minutes=window_min,
+                per_channel_limit=eff_limit,
+                on_client_ready=_attach_command_listener,
+            ),
+            timeout=cycle_timeout,
+        )
+        _LOG.info(
+            "sync 완료 — 신규 메시지 %d, 신규 언급 %d, 채널 %d",
+            last_result.get("new_messages", 0),
+            last_result.get("new_mentions", 0),
+            last_result.get("channels", 0),
+        )
+        stats = last_result.get("channel_stats") or {}
+        status["channels"] = {
+            "total": stats.get("total", 0),
+            "processed": stats.get("processed", 0),
+            "succeeded": stats.get("succeeded", 0),
+            "failed": stats.get("failed", 0),
+        }
+        status["last_result"] = last_result
+        status["last_success_at"] = _now_iso()
+        status["consecutive_failures"] = 0
+        status["last_error"] = None
+        status["state"] = "sleeping"
+        try:
+            with db.connect() as conn:
+                status["newest_message_at"] = db.newest_message_date(conn)
+        except Exception:  # noqa: BLE001 — 신선도 표시 실패가 사이클 결과를 덮으면 안 됨
+            pass
+        if req_days:
+            status["backfill"]["processed_channels"] = stats.get("processed", 0)
+            status["backfill"]["total_channels"] = stats.get("total", 0)
+            status["backfill"]["fetched_messages"] = last_result.get("fetched", 0)
+            status["backfill"]["last_progress_at"] = _now_iso()
+            status["backfill"]["state"] = "idle"  # 완료
+            _clear_file(_request_path())
+            _clear_file(_offer_path())
+    except asyncio.TimeoutError:
+        _LOG.error(
+            "sync 강제 취소 — %d초 내 완료 못함(네트워크 행 의심). 다음 사이클로 계속.",
+            cycle_timeout,
+        )
+        status["consecutive_failures"] = status.get("consecutive_failures", 0) + 1
+        status["last_error_at"] = _now_iso()
+        status["last_error"] = {
+            "code": "SYNC_TIMEOUT",
+            "stage": "run_sync",
+            "type": "TimeoutError",
+            "message": f"{cycle_timeout}초 내 사이클이 끝나지 않았습니다.",
+            "occurred_at": _now_iso(),
+        }
+        status["state"] = "error"
+        if req_days:
+            status["backfill"]["state"] = "interrupted"
+    except Exception as e:  # noqa: BLE001 — 사이클 실패는 치명적이지 않게(다음 사이클로 계속)
+        _LOG.error("sync 실패: %s: %s", type(e).__name__, e)
+        status["consecutive_failures"] = status.get("consecutive_failures", 0) + 1
+        status["last_error_at"] = _now_iso()
+        status["last_error"] = {
+            "code": "UNKNOWN_ERROR",
+            "stage": "run_sync",
+            "type": type(e).__name__,
+            "message": str(e),
+            "occurred_at": _now_iso(),
+        }
+        status["state"] = "error"
+        if req_days:
+            status["backfill"]["state"] = "interrupted"
+
+    status["heartbeat_at"] = _now_iso()
+    _persist_status(status)
+    return catching_up
+
+
+async def _idle_listen(interval_min: int) -> None:
+    """interval 만큼 자되, 그동안 '나에게'의 '!' 명령을 지속연결 핸들러로 '즉시' 처리하고
+    대기 중인 '나에게 전송'도 보낸다. 수집 client 는 이미 끊겼으므로(run_sync finally)
+    이 listener 와 세션이 동시에 안 떠 충돌이 없다(순차)."""
+    listener = make_client()
+    try:
+        await connect_with_timeout(listener)
+        my_id = await _get_my_id(listener)
+        if my_id is not None:  # 이벤트 핸들러: '나에게'의 ! 명령을 즉시 처리(instant)
+            listener.add_event_handler(
+                _make_command_handler(listener),
+                events.NewMessage(chats=my_id),
+            )
+        waited = 0
+        total = interval_min * 60
+        while waited < total and not _stop.is_set():
+            await _drain_send_request(listener)
+            await _poll_commands(listener)  # 폴백(이벤트 못 받은 명령 ≤15초)
+            if _read_backfill_request():
+                break
+            try:
+                await asyncio.wait_for(_stop.wait(), timeout=min(15, total - waited))
+            except asyncio.TimeoutError:
+                pass
+            waited += 15
+    except Exception as e:  # noqa: BLE001 — listener 오류가 데몬을 죽이면 안 됨
+        _LOG.warning("명령 listener 오류: %s: %s", type(e).__name__, e)
+        try:  # listener 가 죽어도 수집·하트비트는 계속 — 남은 주기만큼 대기
+            await asyncio.wait_for(_stop.wait(), timeout=interval_min * 60)
+        except asyncio.TimeoutError:
+            pass
+    finally:
+        await disconnect_safely(listener)
+
+
 async def _loop(
     interval_min: int, min_window: int, max_window: int, per_channel_limit: int
 ) -> None:
     _LOG.info(
         "데몬 시작 — 주기 %d분, 창 %d~%d분(캐치업), 채널당 %d개",
-        interval_min,
-        min_window,
-        max_window,
-        per_channel_limit,
+        interval_min, min_window, max_window, per_channel_limit,
     )
     # 기동 시 1회: 갭이 자동 백필 상한(기본 7일)을 넘으면 사용자에게 제안 플래그를 남긴다.
     _maybe_offer_backfill(max_window)
 
-    # 가동 신호: 30초마다 타임스탬프를 갱신해 서버 감시 루프/락이 '실제 가동 중'을
-    # 신뢰성 있게 판정하게 한다(PID 거짓양성 회피). 즉시 1회 찍어 빠르게 인식되게.
-    _touch_alive()
+    status = _new_status(interval_min)
+    _persist_status(status)
 
     async def _beat() -> None:
+        # 하트비트: 30초마다 heartbeat_at 을 갱신·영속화 — telegram_status/doctor 가 이
+        # 나이로 '프로세스가 완전히 멎었는지'를 판정한다(사이클 자체가 멎어도 여기서 계속
+        # 갱신되면 오판인데, connect/disconnect/사이클을 전부 타임아웃으로 감쌌으므로 메인
+        # 코루틴이 무기한 멎을 일이 이제 없다 — beat 의 틱이 다시 유효한 생존 신호가 된다).
         while not _stop.is_set():
-            _touch_alive()
+            status["heartbeat_at"] = _now_iso()
+            _persist_status(status)
             try:
                 await asyncio.wait_for(_stop.wait(), timeout=30)
             except asyncio.TimeoutError:
                 pass
 
     beat_task = asyncio.create_task(_beat())
-
-    while not _stop.is_set():
-        last_result = None
-        # 사용자 요청 백필이 있으면 '요청 일수'와 '자동 캐치업 창'(연속 수집 갭) 중 큰 쪽.
-        req_days = _read_backfill_request()
-        auto_window = _catchup_window(min_window, max_window)
-        if req_days:
-            # 작은 요청(예: 1일)이 큰 다운타임 갭(예: 3일)을 덮어써, 중간 구간을 영영
-            # 수집하지 않고 영구·무성 구멍을 남기던 버그를 막는다(P0: 히스토리 무결성).
-            window_min = max(req_days * 1440, auto_window)
-            _LOG.info(
-                "사용자 요청 백필 — 요청 %d일, 실효 창 %d분 소급 수집",
-                req_days, window_min,
+    try:
+        while not _stop.is_set():
+            catching_up = await _run_cycle(
+                status, interval_min, min_window, max_window, per_channel_limit
             )
-        else:
-            window_min = auto_window
-        eff_limit = _catchup_limit(window_min, per_channel_limit)
-        # 큰 창(평소보다 깊은 소급) = 다운타임 캐치업. 사용자 요청 백필도 캐치업으로 본다.
-        catching_up = bool(req_days) or window_min > min_window
-        try:
-            _write_heartbeat(
-                "running", interval_min, None,
-                catching_up=catching_up, window_minutes=window_min,
-            )
-            if window_min > min_window:
-                _LOG.info(
-                    "캐치업 — %d분 소급 수집(채널당 최대 %d개)", window_min, eff_limit
-                )
-            last_result = await run_sync(
-                minutes=window_min,
-                per_channel_limit=eff_limit,
-                on_client_ready=_attach_command_listener,
-            )
-            _LOG.info(
-                "sync 완료 — 신규 메시지 %d, 신규 언급 %d, 채널 %d",
-                last_result.get("new_messages", 0),
-                last_result.get("new_mentions", 0),
-                last_result.get("channels", 0),
-            )
-            if req_days:  # 요청 처리 완료 → 요청·제안 정리
-                _clear_file(_request_path())
-                _clear_file(_offer_path())
-        except Exception as e:  # noqa: BLE001 — 사이클 실패는 치명적이지 않게
-            _LOG.error("sync 실패: %s: %s", type(e).__name__, e)
-            _write_heartbeat("error", interval_min, {"error": str(e)})
-        else:
-            _write_heartbeat("sleeping", interval_min, last_result)
-
-        # 정상 사이클에서만 정리(백필/캐치업 중엔 부하 안 주기 위해 건너뜀).
-        if not catching_up:
-            _run_maintenance()
-
-        # interval 만큼 자되, 그동안 '나에게'의 '!' 명령을 지속연결 핸들러로 '즉시' 처리하고
-        # 대기 중인 '나에게 전송'도 보낸다. 수집 client 는 이미 끊겼으므로(run_sync finally)
-        # 이 listener 와 세션이 동시에 안 떠 충돌이 없다(순차).
-        listener = make_client()
-        try:
-            await listener.connect()
-            my_id = await _get_my_id(listener)
-            if my_id is not None:  # 이벤트 핸들러: '나에게'의 ! 명령을 즉시 처리(instant)
-                listener.add_event_handler(
-                    _make_command_handler(listener),
-                    events.NewMessage(chats=my_id),
-                )
-            waited = 0
-            total = interval_min * 60
-            while waited < total and not _stop.is_set():
-                await _drain_send_request(listener)
-                await _poll_commands(listener)  # 폴백(이벤트 못 받은 명령 ≤15초)
-                if _read_backfill_request():
-                    break
-                try:
-                    await asyncio.wait_for(_stop.wait(), timeout=min(15, total - waited))
-                except asyncio.TimeoutError:
-                    pass
-                waited += 15
-        except Exception as e:  # noqa: BLE001 — listener 오류가 데몬을 죽이면 안 됨
-            _LOG.warning("명령 listener 오류: %s: %s", type(e).__name__, e)
-            try:  # listener 가 죽어도 수집·하트비트는 계속 — 남은 주기만큼 대기
-                await asyncio.wait_for(_stop.wait(), timeout=interval_min * 60)
-            except asyncio.TimeoutError:
-                pass
-        finally:
-            try:
-                await listener.disconnect()
-            except Exception:  # noqa: BLE001
-                pass
-
-    beat_task.cancel()
-    _LOG.info("데몬 종료.")
+            # 정상 사이클에서만 정리(백필/캐치업 중엔 부하 안 주기 위해 건너뜀).
+            if not catching_up:
+                _run_maintenance()
+            await _idle_listen(interval_min)
+    finally:
+        # 종료 경로(정상완료/예외/SIGTERM) 어디서든 반드시: beat_task 정리 → 최종 상태 기록.
+        # daemon.pid 락 자체는 main() 이 release() 한다(락 해제는 프로세스 종료를 뜻하므로
+        # 상태 기록보다 나중이어야 telegram_status 가 마지막 순간까지 파일을 읽을 수 있다).
+        beat_task.cancel()
+        await asyncio.gather(beat_task, return_exceptions=True)
+        status["state"] = "stopped"
+        status["heartbeat_at"] = _now_iso()
+        _persist_status(status)
+        _LOG.info("데몬 종료.")
 
 
 def _install_signal_handlers() -> None:
@@ -744,7 +761,8 @@ def main() -> None:
     )
     max_window = max(args.max_window, min_window)
 
-    if not _acquire_lock():
+    if not _daemon_lock.acquire(stale_after_sec=_STALE_AFTER_SEC, status_path=status_path()):
+        _LOG.error("이미 데몬이 실행 중이거나 락을 얻을 수 없습니다. 종료합니다.")
         sys.exit(1)
 
     _install_signal_handlers()
@@ -752,9 +770,16 @@ def main() -> None:
         if args.once:
             window = _catchup_window(min_window, max_window)
             eff_limit = _catchup_limit(window, args.per_channel_limit)
-            _LOG.info("--once 캐치업 창 %d분(채널당 최대 %d개)", window, eff_limit)
+            timeout = _cycle_timeout_sec(None, window > min_window)
+            _LOG.info(
+                "--once 캐치업 창 %d분(채널당 최대 %d개, 타임아웃 %d초)",
+                window, eff_limit, timeout,
+            )
             result = asyncio.run(
-                run_sync(minutes=window, per_channel_limit=eff_limit)
+                asyncio.wait_for(
+                    run_sync(minutes=window, per_channel_limit=eff_limit),
+                    timeout=timeout,
+                )
             )
             _LOG.info("--once 완료 — %s", result)
         else:
@@ -762,7 +787,7 @@ def main() -> None:
                 _loop(args.interval, min_window, max_window, args.per_channel_limit)
             )
     finally:
-        _release_lock()
+        _daemon_lock.release()
 
 
 if __name__ == "__main__":
