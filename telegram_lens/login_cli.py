@@ -13,8 +13,11 @@
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import getpass
+import json
+import sys
 import webbrowser
 
 from telegram_lens.config import (
@@ -136,7 +139,169 @@ async def _login() -> None:
         await disconnect_safely(client)
 
 
+def _emit(payload: dict) -> None:
+    """JSON-Lines 프로토콜의 한 줄 — LeetKit Manager가 stdout에서 한 줄씩 읽는다."""
+    print(json.dumps(payload, ensure_ascii=False), flush=True)
+
+
+async def _read_stdin_json() -> dict | None:
+    """LeetKit Manager가 stdin에 써주는 한 줄(JSON)을 기다린다. EOF(상대가 프로세스를
+    끝냈거나 파이프가 닫힘)면 None — 호출자는 즉시 정리하고 반환해야 한다."""
+    loop = asyncio.get_event_loop()
+    line = await loop.run_in_executor(None, sys.stdin.readline)
+    if not line:
+        return None
+    line = line.strip()
+    if not line:
+        return None
+    try:
+        return json.loads(line)
+    except json.JSONDecodeError:
+        return None
+
+
+def _me_dict(me) -> dict:
+    return {"first_name": me.first_name, "username": me.username}
+
+
+async def _run_stepper() -> None:
+    """`--stepper` 모드 — GUI(LeetKit Manager)가 단계별로 대화하며 로그인을 대신 진행할
+    수 있게 stdin/stdout으로 JSON 한 줄씩 주고받는다. 기본(대화형) 흐름과 실제 Telethon
+    호출은 동일하다 — input()/getpass() 네 곳만 stdin 읽기로 바뀐 것.
+
+    한 줄 = 상태 하나: need_credentials/need_phone/code_sent/need_2fa(요청) →
+    already_logged_in/ok(완료) 또는 error(같은 단계 재시도 — 프로세스는 안 죽는다).
+    """
+    from telethon import TelegramClient
+    from telethon.errors import (
+        PasswordHashInvalidError,
+        PhoneCodeInvalidError,
+        PhoneNumberInvalidError,
+        SessionPasswordNeededError,
+    )
+
+    from telegram_lens.client import connect_with_timeout, disconnect_safely
+    from telegram_lens.daemon import lock_path
+    from telegram_lens.procstate import DaemonLock
+
+    if DaemonLock(lock_path()).is_held():
+        # 데몬(Claude Desktop이 열려 있을 때 같이 뜨는 프로세스)이 이미 session.session
+        # 파일을 쥐고 있으면, 여기서 또 열려는 순간 SQLite가 "database is locked"로
+        # 죽는다(실제로 재현해서 확인함) — 그 cryptic한 에러 대신 바로 원인을 알려준다.
+        _emit({
+            "status": "error", "code": "DAEMON_ACTIVE",
+            "message": "Claude Desktop이 열려 있어 세션 파일을 사용 중입니다. Claude Desktop을 완전히 종료한 뒤 다시 시도하세요.",
+        })
+        return
+
+    api_id, api_hash = get_credentials()
+    if not api_id or not api_hash:
+        _emit({"status": "need_credentials"})
+        msg = await _read_stdin_json()
+        if msg is None:
+            return
+        try:
+            api_id = int(msg.get("api_id"))
+        except (TypeError, ValueError):
+            _emit({"status": "error", "code": "CREDENTIALS_INVALID", "message": "API_ID는 숫자여야 합니다."})
+            return
+        api_hash = str(msg.get("api_hash") or "").strip()
+        if not api_hash:
+            _emit({"status": "error", "code": "CREDENTIALS_INVALID", "message": "API_HASH가 비어 있습니다."})
+            return
+        save_credentials(api_id, api_hash)
+
+    client = TelegramClient(str(session_path()), api_id, api_hash)
+    logged_in = False
+    try:
+        await connect_with_timeout(client)
+
+        if await client.is_user_authorized():
+            me = await client.get_me()
+            _emit({"status": "already_logged_in", "me": _me_dict(me)})
+            logged_in = True
+        else:
+            phone: str | None = None
+            while phone is None:
+                _emit({"status": "need_phone"})
+                msg = await _read_stdin_json()
+                if msg is None:
+                    return
+                candidate = str(msg.get("phone") or "").strip()
+                try:
+                    await client.send_code_request(candidate)
+                except PhoneNumberInvalidError:
+                    _emit({"status": "error", "code": "PHONE_INVALID", "message": "전화번호 형식이 올바르지 않습니다."})
+                    continue
+                phone = candidate
+                _emit({"status": "code_sent"})
+
+            signed_in = False
+            while not signed_in:
+                msg = await _read_stdin_json()
+                if msg is None:
+                    return
+                code = str(msg.get("code") or "").strip()
+                try:
+                    await client.sign_in(phone, code)
+                    signed_in = True
+                except PhoneCodeInvalidError:
+                    _emit({"status": "error", "code": "CODE_INVALID", "message": "인증 코드가 올바르지 않습니다."})
+                    continue
+                except SessionPasswordNeededError:
+                    while True:
+                        _emit({"status": "need_2fa"})
+                        msg = await _read_stdin_json()
+                        if msg is None:
+                            return
+                        password = str(msg.get("password") or "")
+                        try:
+                            await client.sign_in(password=password)
+                            signed_in = True
+                            break
+                        except PasswordHashInvalidError:
+                            _emit({"status": "error", "code": "2FA_INVALID", "message": "2단계 인증 비밀번호가 올바르지 않습니다."})
+                            continue
+
+            me = await client.get_me()
+            _emit({"status": "ok", "me": _me_dict(me)})
+            logged_in = True
+    except Exception as e:  # noqa: BLE001 — 예상 못 한 오류도 트레이스백 대신 상태 한 줄로
+        _emit({"status": "error", "code": "UNEXPECTED", "message": str(e)})
+        return
+    finally:
+        await disconnect_safely(client)
+
+    if logged_in:
+        init_db()
+        refresh_stocks()
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="telegramlens-login", description="TelegramLens 로그인.")
+    p.add_argument(
+        "--stepper", action="store_true",
+        help="JSON-Lines 단계별 프로토콜로 동작(LeetKit Manager 등 GUI가 대신 진행할 때 사용).",
+    )
+    return p
+
+
 def main() -> None:
+    if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
+        # Windows 콘솔은 기본이 cp949라, --stepper의 stdout이 utf-8이라고 믿고 읽는
+        # LeetKit Manager(InteractiveProcess)가 디코딩 에러를 EOF로 오인해 조용히
+        # 죽는다(실제로 재현해서 확인함) — doctor.py --json과 동일하게 여기서도 맞춘다.
+        try:
+            sys.stdout.reconfigure(encoding="utf-8")
+        except Exception:
+            pass
+
+    args = _build_parser().parse_args()
+
+    if args.stepper:
+        asyncio.run(_run_stepper())
+        return
+
     print("TelegramLens 로그인\n")
     asyncio.run(_login())
 

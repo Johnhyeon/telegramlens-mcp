@@ -95,9 +95,19 @@ def get_claude_code_config_path() -> Path:
     return Path.home() / ".claude.json"
 
 
+def get_codex_config_path() -> Path:
+    """Codex CLI의 MCP 서버 설정 — `~/.codex/config.toml`, `[mcp_servers.<name>]` 섹션.
+
+    Windows에서 실제 설치본으로 이 경로를 확인했다. macOS/Linux도 관례상 같은 경로일
+    가능성이 높으나 이 환경에서 직접 검증하지는 못했다.
+    """
+    return Path.home() / ".codex" / "config.toml"
+
+
 TARGETS: dict[str, tuple] = {
     "claude-desktop": (get_claude_desktop_config_path, "Claude Desktop"),
     "claude-code": (get_claude_code_config_path, "Claude Code CLI"),
+    "codex": (get_codex_config_path, "Codex CLI"),
 }
 
 
@@ -120,12 +130,71 @@ def _resolve_targets(arg: str) -> list[str]:
     raise ValueError(f"Invalid target: {arg}")
 
 
+def _configure_toml_target(config_path: Path, label: str, *, command: str, quiet: bool = False) -> dict:
+    """Codex처럼 TOML(`[mcp_servers.<name>]`)로 MCP 서버를 등록하는 클라이언트용.
+
+    tomlkit으로 파싱·재작성해서 다른 mcp_servers.* 항목·주석은 그대로 두고 우리
+    섹션만 추가/갱신한다.
+    """
+    import tomlkit
+
+    if not quiet:
+        print()
+        print(f"  -> {label}")
+
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+
+    backup_path: Path | None = None
+    doc = tomlkit.document()
+    if config_path.exists():
+        backup_path = config_path.with_suffix(".toml.backup")
+        backup_path.write_bytes(config_path.read_bytes())
+        if not quiet:
+            print(f"  [OK] Backup saved: {backup_path}")
+        try:
+            doc = tomlkit.parse(config_path.read_text(encoding="utf-8"))
+        except Exception:
+            if not quiet:
+                print("  [WARN] Existing config is corrupted. Creating new one.")
+            doc = tomlkit.document()
+
+    if "mcp_servers" not in doc:
+        doc["mcp_servers"] = tomlkit.table()
+
+    entry = resolve_server_entry(command)
+    server_table = tomlkit.table()
+    server_table["command"] = entry["command"]
+    if "args" in entry:
+        server_table["args"] = entry["args"]
+    doc["mcp_servers"][SERVER_KEY] = server_table
+
+    config_path.write_text(tomlkit.dumps(doc), encoding="utf-8")
+
+    if not quiet:
+        print(f"  [OK] Config updated (key: {SERVER_KEY})")
+        print(f"  Path:    {config_path}")
+        print(f"  Command: {entry['command']}")
+        if "args" in entry:
+            print(f"  Args:    {' '.join(entry['args'])}")
+
+    return {
+        "target_label": label,
+        "config_path": str(config_path),
+        "backup_path": str(backup_path) if backup_path else None,
+        "command": entry["command"],
+        "args": entry.get("args"),
+    }
+
+
 def _configure_one_target(config_path: Path, label: str, *, command: str, quiet: bool = False) -> dict:
     """단일 config 파일에 mcpServers.telegramlens 등록. 변경 결과를 dict로 반환한다.
 
     quiet=True 면 사람용 진행 로그를 찍지 않는다(Manager의 --json/--non-interactive
     호출에서 stdout을 구조화 결과 하나로만 유지하기 위함).
     """
+    if config_path.suffix == ".toml":
+        return _configure_toml_target(config_path, label, command=command, quiet=quiet)
+
     if not quiet:
         print()
         print(f"  -> {label}")
@@ -199,7 +268,7 @@ def _build_parser():
     p.add_argument("command", nargs="?", default="telegramlens")
     p.add_argument(
         "--target",
-        choices=["claude-desktop", "claude-code", "both", "auto"],
+        choices=["claude-desktop", "claude-code", "both", "auto", "codex"],
         default="auto",
     )
     p.add_argument(
