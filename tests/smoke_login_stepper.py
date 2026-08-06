@@ -172,9 +172,9 @@ def check_flood_wait_shows_clear_message_and_retries_same_step() -> None:
     client = _FakeClient(flood_wait_seconds=120)
     emitted = _run_stepper_with(client, [{"phone": "+821012345678"}])
     statuses = [e["status"] for e in emitted]
-    # 에러 후 같은 need_phone 단계를 재시도(다른 에러들과 동일 패턴) — stdin이 더 없으면
-    # 거기서 조용히 종료된다.
-    _assert(statuses == ["need_phone", "error", "need_phone"], f"got {statuses}")
+    # 입력 1개 → 상태 1줄. 에러 후 프롬프트를 재emit하지 않는다(UI가 같은 단계를
+    # 유지하므로 불필요하고, 재emit하면 호출자의 한 줄 소비와 어긋나 desync가 난다).
+    _assert(statuses == ["need_phone", "error"], f"got {statuses}")
     _assert(emitted[1]["code"] == "FLOOD_WAIT", f"에러 코드 FLOOD_WAIT, got {emitted[1]}")
     _assert("120" in emitted[1]["message"], f"대기 시간이 메시지에 포함, got {emitted[1]}")
 
@@ -198,7 +198,7 @@ def check_invalid_phone_retries_same_step() -> None:
         [{"phone": "invalid"}, {"phone": "+821012345678"}, {"code": "999999"}],
     )
     statuses = [e["status"] for e in emitted]
-    _assert(statuses == ["need_phone", "error", "need_phone", "code_sent", "ok"], f"got {statuses}")
+    _assert(statuses == ["need_phone", "error", "code_sent", "ok"], f"got {statuses}")
     _assert(emitted[1]["code"] == "PHONE_INVALID", "에러 코드 PHONE_INVALID")
 
 
@@ -215,7 +215,7 @@ def check_2fa_flow_with_wrong_then_right_password() -> None:
         ],
     )
     statuses = [e["status"] for e in emitted]
-    _assert(statuses == ["need_phone", "code_sent", "need_2fa", "error", "need_2fa", "ok"], f"got {statuses}")
+    _assert(statuses == ["need_phone", "code_sent", "need_2fa", "error", "ok"], f"got {statuses}")
     _assert(emitted[3]["code"] == "2FA_INVALID", "에러 코드 2FA_INVALID")
 
 
@@ -249,8 +249,34 @@ def check_daemon_active_blocks_before_connecting() -> None:
     _assert(emitted[0]["code"] == "DAEMON_ACTIVE", f"에러 코드 DAEMON_ACTIVE, got {emitted[0]}")
 
 
+def check_one_status_line_per_input() -> None:
+    """이 프로토콜의 핵심 불변식 — 호출자(Manager)는 stdin 한 줄을 보내고 stdout 한 줄을
+    소비한다. 어느 경로든 입력 하나에 두 줄 이상 나가면 그 여분이 호출자 큐에 남아
+    이후 모든 왕복이 한 칸씩 밀린다(실제 subprocess로 재현해 확인한 버그). 기존
+    테스트들은 자식이 뱉는 순서만 봤을 뿐 "입력 개수 = 응답 줄 개수"를 못 박지 않아
+    이 버그를 그대로 통과시켰다."""
+    print("\n=== 불변식: 입력 1개당 상태 1줄(에러 경로 포함) ===")
+    scenarios = [
+        ("잘못된 번호 후 재시도", _FakeClient(code_attempts=["999999"]),
+         [{"phone": "invalid"}, {"phone": "+821012345678"}, {"code": "999999"}]),
+        ("잘못된 코드 후 재시도", _FakeClient(code_attempts=["111111", "999999"]),
+         [{"phone": "+821012345678"}, {"code": "wrong"}, {"code": "999999"}]),
+        ("2FA 오입력 후 성공", _FakeClient(needs_2fa=True, code_attempts=["999999"], correct_password="right"),
+         [{"phone": "+821012345678"}, {"code": "999999"}, {"password": "wrong"}, {"password": "right"}]),
+    ]
+    for label, client, inputs in scenarios:
+        emitted = _run_stepper_with(client, inputs)
+        # 첫 줄(need_phone)은 입력 전에 나가는 프롬프트이므로 제외하고 센다.
+        responses = len(emitted) - 1
+        _assert(
+            responses == len(inputs),
+            f"{label}: 입력 {len(inputs)}개 → 응답 {responses}줄, got {[e['status'] for e in emitted]}",
+        )
+
+
 def main() -> None:
     check_already_logged_in_short_circuits()
+    check_one_status_line_per_input()
     check_happy_path_phone_then_code()
     check_code_sent_reports_actual_delivery_channel()
     check_flood_wait_shows_clear_message_and_retries_same_step()

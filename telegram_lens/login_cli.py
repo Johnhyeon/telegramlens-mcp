@@ -241,9 +241,14 @@ async def _run_stepper() -> None:
             _emit({"status": "already_logged_in", "me": _me_dict(me)})
             logged_in = True
         else:
+            # 프롬프트는 단계에 "처음 들어올 때" 한 번만 emit한다 — 예전엔 루프 상단에
+            # 있어서, 잘못된 입력 하나에 `error`와 `need_phone` 두 줄이 나갔다. 호출자
+            # (Manager)는 입력 하나당 한 줄만 소비하므로 여분이 큐에 남아 이후 모든
+            # 왕복이 한 칸씩 밀렸다(실제 subprocess로 재현 확인). error 상태만 받아도
+            # UI는 같은 단계를 그대로 유지하므로 재emit은 애초에 불필요하다.
             phone: str | None = None
+            _emit({"status": "need_phone"})
             while phone is None:
-                _emit({"status": "need_phone"})
                 msg = await _read_stdin_json()
                 if msg is None:
                     return
@@ -278,8 +283,8 @@ async def _run_stepper() -> None:
                     _emit({"status": "error", "code": "CODE_INVALID", "message": "인증 코드가 올바르지 않습니다."})
                     continue
                 except SessionPasswordNeededError:
+                    _emit({"status": "need_2fa"})  # 위와 같은 이유로 진입 시 1회만
                     while True:
-                        _emit({"status": "need_2fa"})
                         msg = await _read_stdin_json()
                         if msg is None:
                             return
