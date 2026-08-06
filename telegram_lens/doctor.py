@@ -28,6 +28,7 @@ try:
     from telegram_lens.setup_claude import (
         get_claude_desktop_config_path,
         get_claude_code_config_path,
+        get_codex_config_path,
         SERVER_KEY,
         _uv_tool_bin_dirs,
         _find_store_config_path,
@@ -37,6 +38,7 @@ except ImportError:
     from telegram_lens.setup_claude import (
         get_claude_desktop_config_path,
         get_claude_code_config_path,
+        get_codex_config_path,
         SERVER_KEY,
         _uv_tool_bin_dirs,
         _find_store_config_path,
@@ -61,6 +63,7 @@ _CHECK_IDS = {
     "command": "COMMAND_AVAILABLE",
     "config_desktop": "MCP_CONFIG_DESKTOP",
     "config_code": "MCP_CONFIG_CODE",
+    "config_codex": "MCP_CONFIG_CODEX",
     "registered_targets": "MCP_CONFIG_VALID",
     "license": "LICENSE_ACTIVE",
     "telegram_login": "TELEGRAM_LOGIN",
@@ -70,13 +73,15 @@ _CHECK_IDS = {
 }
 
 
-def _registered_targets(desktop_check: "Check", code_check: "Check") -> list[str]:
+def _registered_targets(desktop_check: "Check", code_check: "Check", codex_check: "Check") -> list[str]:
     """실제로 등록된 MCP 타겟 slug 목록 — Manager 공통 계약 top-level `targets` 필드용."""
     targets: list[str] = []
     if desktop_check.status == "ok":
         targets.append("claude-desktop")
     if code_check.status == "ok":
         targets.append("claude-code")
+    if codex_check.status == "ok":
+        targets.append("codex")
     return targets
 
 
@@ -316,16 +321,87 @@ def check_config_code() -> Check:
     )
 
 
+def check_config_codex() -> Check:
+    return _check_config_toml_file(
+        "Codex CLI", get_codex_config_path(), required=False
+    )
+
+
+def _check_config_toml_file(label: str, config_path: Path, *, required: bool) -> Check:
+    """TOML 기반 클라이언트(Codex의 `~/.codex/config.toml`, `[mcp_servers.<key>]`)용
+    config 점검 — _check_config_file(JSON)과 같은 계약을 TOML 구조에 맞춰 재구현.
+    setup_claude._configure_toml_target()이 쓰는 것과 동일한 구조를 읽기만 한다."""
+    c = Check(f"Config — {label}")
+    c.info(f"Path:       {config_path}")
+
+    if not config_path.exists():
+        if required:
+            c.fail("Config file does not exist", fix="telegramlens-setup --target codex")
+        else:
+            c.info("Config file does not exist (target not in use — OK)")
+            c.status = "info-skip"
+            c.summary = "Config file does not exist (target not in use — OK)"
+        return c
+
+    try:
+        import tomlkit
+
+        with open(config_path, "r", encoding="utf-8") as f:
+            cfg = tomlkit.parse(f.read())
+    except Exception as e:
+        c.fail(f"Cannot read config: {e}")
+        return c
+
+    servers = cfg.get("mcp_servers", {}) or {}
+    entry = servers.get(SERVER_KEY)
+
+    if not entry:
+        if required:
+            c.fail(f"'{SERVER_KEY}' entry missing in mcp_servers", fix="telegramlens-setup --target codex")
+        else:
+            c.info(f"'{SERVER_KEY}' entry not present (target not in use — OK)")
+            c.status = "info-skip"
+            c.summary = f"'{SERVER_KEY}' entry not present (target not in use — OK)"
+        return c
+
+    cmd = entry.get("command")
+    args = list(entry.get("args") or [])
+    c.info(f"Command:    {cmd}")
+    if args:
+        c.info(f"Args:       {args}")
+
+    if not cmd:
+        c.fail("Entry has no 'command' field")
+        return c
+
+    if Path(cmd).is_absolute():
+        if Path(cmd).exists():
+            c.ok("Command points to existing file")
+        else:
+            c.fail(f"Command file missing: {cmd}", fix="telegramlens-setup --target codex")
+    else:
+        resolved = shutil.which(cmd)
+        if resolved:
+            c.ok(f"Command resolvable via PATH: {resolved}")
+        else:
+            c.fail(
+                f"Command '{cmd}' not in PATH — client will fail to launch the server",
+                fix="telegramlens-setup --target codex",
+            )
+
+    return c
+
+
 def check_at_least_one_config(*configs: Check) -> Check:
-    """두 config 모두 미등록이면 종합 fail. 하나라도 등록돼있으면 OK."""
+    """모든 config가 미등록이면 종합 fail. 하나라도 등록돼있으면 OK."""
     c = Check("Registered targets")
     registered = [cc for cc in configs if cc.status == "ok"]
     if registered:
         c.ok(f"{len(registered)} target(s) configured")
         return c
     c.fail(
-        "telegramlens not registered in any MCP client (Claude Desktop / Code)",
-        fix="telegramlens-setup --target {claude-desktop|claude-code|both}",
+        "telegramlens not registered in any MCP client (Claude Desktop / Code / Codex)",
+        fix="telegramlens-setup --target {claude-desktop|claude-code|both|codex}",
     )
     return c
 
@@ -752,6 +828,7 @@ def main():
 
     desktop_check = check_config_desktop()
     code_check = check_config_code()
+    codex_check = check_config_codex()
     daemon_check = check_daemon()
     backfill_check = check_backfill()
 
@@ -761,7 +838,8 @@ def main():
         ("command", check_telegramlens_command()),
         ("config_desktop", desktop_check),
         ("config_code", code_check),
-        ("registered_targets", check_at_least_one_config(desktop_check, code_check)),
+        ("config_codex", codex_check),
+        ("registered_targets", check_at_least_one_config(desktop_check, code_check, codex_check)),
         ("license", check_license()),
         ("telegram_login", check_telegram_login(daemon_running)),
         ("daemon", daemon_check),
@@ -789,7 +867,11 @@ def main():
 
         # daemon/backfill 문제는 `telegramlens-doctor --repair daemon --yes`로 고칠 수 있다
         # (run_repair는 scope와 무관하게 좀비 데몬 정리·상태파일 복구·정체 백필 표시를 모두 수행).
-        daemon_repairable = daemon_check.status in ("warn", "fail")
+        # daemon 쪽 좀비 정리는 데몬이 지금 떠 있어야만 의미가 있다(안 떠 있으면
+        # run_repair가 "복구 대상 없음"으로 스킵) — 그래서 daemon_running으로 한 번 더
+        # 거른다. backfill 쪽(정체된 백필을 interrupted로 표시)은 상태 파일만 보고
+        # 판단해 데몬이 죽어있어도 유효한 복구라 daemon_running 조건을 걸지 않는다.
+        daemon_repairable = daemon_running and daemon_check.status in ("warn", "fail")
         backfill_repairable = backfill_check.status in ("warn", "fail")
 
         checks_list = []
@@ -818,7 +900,7 @@ def main():
             "checked_at": datetime.now(timezone.utc).isoformat(),
             "online": online,
             "license": license_summary(),
-            "targets": _registered_targets(desktop_check, code_check),
+            "targets": _registered_targets(desktop_check, code_check, codex_check),
             "checks": checks_list,
         }
         print(json.dumps(payload, ensure_ascii=False))
