@@ -64,7 +64,7 @@ class _FakeClient:
         for ent in self._entities:
             yield SimpleNamespace(entity=ent)
 
-    async def iter_messages(self, ent, limit=500):
+    async def iter_messages(self, ent, limit=500, offset_date=None):
         if self._kind[ent.id] == "hang":
             await asyncio.sleep(999)
             return

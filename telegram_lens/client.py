@@ -118,6 +118,8 @@ async def fetch_recent(
     known_ids: set[int] | None = None,
     new_since: datetime | None = None,
     new_limit: int | None = None,
+    on_progress=None,
+    oldest_by_channel: dict[int, datetime] | None = None,
 ) -> tuple[list[dict], list[dict], dict]:
     """since 이후 메시지를 채널별로 수집.
 
@@ -127,6 +129,17 @@ async def fetch_recent(
     new_since(보통 더 과거) 까지, new_limit 만큼 깊게 1회 소급 수집한다. 그래서 새로
     가입한 방은 최근 며칠치 맥락이 한 번에 들어오고, 그 다음 사이클부터는 평소의
     짧은 창(since)으로만 따라간다.
+
+    oldest_by_channel: 선택. {channel_id: 이미 저장된 가장 오래된 메시지 시각}. 큰 백필이
+    중간에 끊겨 재시작할 때, 이미 이 지점까지 받아둔 채널은 거기서부터(Telethon
+    offset_date) 이어받는다 — 매번 '지금'부터 다시 훑어 이미 있는 최근 구간을 텔레그램
+    서버에 헛되이 재요청하지 않는다. 값이 없는 채널(처음 다루는 채널)은 평소처럼 지금부터.
+
+    on_progress: 선택. 채널 하나 처리(성공/타임아웃/실패 무관)가 끝날 때마다
+    `await on_progress(stats, fetched_so_far)`로 호출된다(90일치 백필처럼 채널이
+    많아 전체가 끝나는 데 5분 이상 걸리는 경우, daemon.py가 이걸로 daemon_status.json의
+    backfill 진행률을 채널 단위로 갱신한다 — 그래야 doctor의 "5분간 진행 없음" 정체
+    판정이 실제로 정체된 경우에만 뜬다). 콜백 실패는 수집을 막지 않는다.
 
     반환: (messages, channels, stats)
       messages : [{channel_id, title, username, subscribers, msg_id, date, text}, ...]
@@ -170,13 +183,16 @@ async def fetch_recent(
         )
         eff_since = new_since if is_new else since
         eff_limit = (new_limit or per_channel_limit) if is_new else per_channel_limit
+        offset_date = oldest_by_channel.get(ent.id) if oldest_by_channel else None
         stats["processed"] += 1
         # 채널별 격리: 한 채널이 실패(권한 상실·FloodWait·구조 변경·응답 없음)해도 그 채널만
         # 건너뛰고, 이미 수집한 정상 채널 결과는 보존한 채 다음 채널로 계속한다(P0: 내결함성).
         # asyncio.wait_for 로 감싸 '예외 없이 그냥 안 끝나는' 채널(죽은 소켓 등)도 상한을 둔다.
         try:
             msgs = await asyncio.wait_for(
-                _collect_one_channel(client, ent, title, username, subs, eff_since, eff_limit),
+                _collect_one_channel(
+                    client, ent, title, username, subs, eff_since, eff_limit, offset_date,
+                ),
                 timeout=_CHANNEL_TIMEOUT_SEC,
             )
             results.extend(msgs)
@@ -213,6 +229,15 @@ async def fetch_recent(
                 getattr(ent, "id", "?"), type(e).__name__, e,
             )
             continue
+        finally:
+            # continue/break 어느 경로든(성공·타임아웃·FloodWait·기타 실패) 채널 하나가
+            # 끝날 때마다 반드시 호출된다 — 90일 백필처럼 전체가 5분 넘게 걸려도
+            # daemon.py가 이 콜백으로 진행률을 즉시 영속화해 doctor의 정체 판정을 피한다.
+            if on_progress is not None:
+                try:
+                    await on_progress(dict(stats), len(results))
+                except Exception:  # noqa: BLE001 — 진행률 보고 실패가 수집을 막으면 안 됨
+                    pass
     return results, channels, stats
 
 
@@ -224,11 +249,16 @@ async def _collect_one_channel(
     subs: int | None,
     since: datetime,
     limit: int,
+    offset_date: datetime | None = None,
 ) -> list[dict]:
     """단일 채널의 메시지를 모아 반환. fetch_recent 가 asyncio.wait_for 로 감싸 채널별
-    타임아웃을 건다 — 이 함수 자체는 시간제한을 모른다(취소되면 그냥 중간에 멈출 뿐)."""
+    타임아웃을 건다 — 이 함수 자체는 시간제한을 모른다(취소되면 그냥 중간에 멈출 뿐).
+
+    offset_date 가 있으면 그 시각보다 오래된 메시지부터 반환한다(Telethon 표준 동작) —
+    이미 그 지점까지 받아둔 채널을 재시작 후 이어받을 때 쓴다(fetch_recent 참고).
+    """
     out: list[dict] = []
-    async for msg in client.iter_messages(ent, limit=limit):
+    async for msg in client.iter_messages(ent, limit=limit, offset_date=offset_date):
         if msg.date and msg.date < since:
             break
         text = msg.message or ""

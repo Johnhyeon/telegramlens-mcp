@@ -55,6 +55,8 @@ async def run_sync(
     per_channel_limit: int = 500,
     new_channel_minutes: int = _NEW_CHANNEL_BACKFILL_MIN,
     on_client_ready=None,
+    on_progress=None,
+    oldest_by_channel=None,
 ) -> dict:
     """최근 N분 메시지를 수집·저장. 요약 통계 반환.
 
@@ -70,6 +72,13 @@ async def run_sync(
     연결돼 있으므로(Telethon 은 그동안 백그라운드로 업데이트 수신) 여기에 '!' 명령 이벤트
     핸들러를 달면 수집 도중에도 같은 client 로 즉답할 수 있다(데몬이 명령 데드존 제거에 사용).
     같은 client 하나라 별도 세션 충돌이 없다. 콜백 실패는 수집을 막지 않는다(흡수).
+
+    on_progress: 선택. 채널 하나 처리가 끝날 때마다 `await on_progress(stats, fetched)`로
+    호출(client.fetch_recent 참고) — daemon.py가 긴 백필의 daemon_status.json 진행률을
+    채널 단위로 갱신하는 데 쓴다.
+
+    oldest_by_channel: 선택. {channel_id: 이미 저장된 가장 오래된 메시지 시각} — 큰 백필이
+    끊겨 재시작해도 이미 받은 구간을 다시 훑지 않고 이어받는다(client.fetch_recent 참고).
     """
     db.init_db()
     now = datetime.now(timezone.utc)
@@ -109,6 +118,8 @@ async def run_sync(
             known_ids=known_ids,
             new_since=new_since,
             new_limit=new_limit,
+            on_progress=on_progress,
+            oldest_by_channel=oldest_by_channel,
         )
 
         # 정상 사이클(짧은 창)에서만 조회수 시계열 snapshot 갱신(큰 창은 FloodWait 위험).

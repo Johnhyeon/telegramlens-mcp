@@ -58,20 +58,40 @@ async def _lifespan(_server):
     # 살아있어도 영영 안 되살아난다(2026-06 장애: 3일간 수집 정지). 60초 감시 루프로
     # '실제 가동(is_alive: PID + 가동 신호 신선도)'을 확인해 죽었으면 재스폰한다 — Claude 가
     # 켜진 동안 수집 신선도를 자가치유로 보장. 새 persistence 없이 부모-자식 관계 유지.
-    state: dict = {"child": None}
+    state: dict = {"child": None, "tray": None}
 
     async def _supervise() -> None:
-        from telegram_lens.daemon import is_alive, spawn_child
-
         while True:
+            # 데몬과 트레이는 반드시 별도 try/except — 트레이 쪽(예: pystray import 실패)이
+            # 죽어도 데몬 자동재기동(더 중요한 쪽)까지 같이 멈추면 안 된다. import 자체도
+            # 루프 안 try 안에서 해서, import 시점 실패조차 watchdog 코루틴을 안 죽인다.
             try:
-                if is_logged_in() and not is_alive():
-                    child = spawn_child()
-                    if child is not None:
-                        state["child"] = child
-                        _LOG.info("수집 데몬 자식 프로세스 (재)기동 (pid=%s)", child.pid)
+                if is_logged_in():
+                    from telegram_lens.daemon import is_alive, spawn_child
+
+                    if not is_alive():
+                        child = spawn_child()
+                        if child is not None:
+                            state["child"] = child
+                            _LOG.info("수집 데몬 자식 프로세스 (재)기동 (pid=%s)", child.pid)
             except Exception as e:  # noqa: BLE001 — 감시 실패가 서버를 막으면 안 됨
                 _LOG.warning("수집 데몬 감시 실패: %s", e)
+
+            try:
+                # 트레이는 수집 상태를 '보여주기'만 하는 선택적 UI라, 데몬처럼 필수는
+                # 아니지만 같은 감시 주기로 같이 살아있게 한다(수동 실행 중이면 건너뜀 —
+                # tray.spawn() 이 자체 락으로 중복 아이콘을 막는다).
+                if is_logged_in():
+                    from telegram_lens import tray
+
+                    if not tray.is_alive():
+                        tray_proc = tray.spawn()
+                        if tray_proc is not None:
+                            state["tray"] = tray_proc
+                            _LOG.info("트레이 아이콘 자식 프로세스 (재)기동 (pid=%s)", tray_proc.pid)
+            except Exception as e:  # noqa: BLE001 — 트레이 감시 실패가 데몬/서버를 막으면 안 됨
+                _LOG.warning("트레이 아이콘 감시 실패: %s", e)
+
             try:
                 await asyncio.sleep(60)
             except asyncio.CancelledError:
@@ -85,11 +105,15 @@ async def _lifespan(_server):
         await asyncio.gather(watchdog, return_exceptions=True)
         child = state.get("child")
         if child is not None:
-            await _terminate_child(child)  # Claude 종료 시 우리가 띄운 데몬도 정리(persistence 방지)
+            await _terminate_child(child, "수집 데몬")  # Claude 종료 시 우리가 띄운 데몬도 정리(persistence 방지)
+        tray_proc = state.get("tray")
+        if tray_proc is not None:
+            await _terminate_child(tray_proc, "트레이 아이콘")  # 트레이도 같이 정리
 
 
-async def _terminate_child(child) -> None:
-    """자식 수집 데몬 정리: terminate → 최대 5초 대기 → 안 죽으면 kill → 재대기.
+async def _terminate_child(child, label: str = "자식") -> None:
+    """자식 프로세스(수집 데몬·트레이 아이콘 등) 정리: terminate → 최대 5초 대기 →
+    안 죽으면 kill → 재대기.
 
     이전엔 terminate() 만 보내고 실제 종료를 기다리지 않아, 자식의 Telethon 연결 정리
     (send/recv 루프 task)가 끝나기 전에 부모(MCP 서버) 프로세스가 먼저 죽어버릴 수 있었다
@@ -99,24 +123,24 @@ async def _terminate_child(child) -> None:
     try:
         child.terminate()
     except Exception as e:  # noqa: BLE001 — 이미 죽었거나 권한 문제는 무시
-        _LOG.warning("수집 데몬 종료 신호 실패: %s: %s", type(e).__name__, e)
+        _LOG.warning("%s 종료 신호 실패: %s: %s", label, type(e).__name__, e)
         return
     try:
         await asyncio.to_thread(child.wait, 5)
-        _LOG.info("수집 데몬 자식 프로세스 정상 종료 (pid=%s, code=%s)", child.pid, child.returncode)
+        _LOG.info("%s 프로세스 정상 종료 (pid=%s, code=%s)", label, child.pid, child.returncode)
         return
     except subprocess.TimeoutExpired:
         pass
     except Exception as e:  # noqa: BLE001
-        _LOG.warning("수집 데몬 종료 대기 실패: %s: %s", type(e).__name__, e)
+        _LOG.warning("%s 종료 대기 실패: %s: %s", label, type(e).__name__, e)
         return
-    _LOG.warning("수집 데몬 5초 내 미종료 — 강제 kill (pid=%s)", child.pid)
+    _LOG.warning("%s 5초 내 미종료 — 강제 kill (pid=%s)", label, child.pid)
     try:
         child.kill()
         await asyncio.to_thread(child.wait, 5)
-        _LOG.info("수집 데몬 강제 종료 완료 (pid=%s, code=%s)", child.pid, child.returncode)
+        _LOG.info("%s 강제 종료 완료 (pid=%s, code=%s)", label, child.pid, child.returncode)
     except Exception as e:  # noqa: BLE001
-        _LOG.warning("수집 데몬 강제 종료 실패: %s: %s", type(e).__name__, e)
+        _LOG.warning("%s 강제 종료 실패: %s: %s", label, type(e).__name__, e)
 
 
 def _support_hint() -> str:

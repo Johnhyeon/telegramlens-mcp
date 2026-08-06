@@ -159,12 +159,11 @@ def compute_health(status: dict | None, lock_held: bool, interval_min: int | Non
             "problem_code": "CHANNEL_TIMEOUT",
             "message": f"이번 사이클 채널 {channels['failed']}개 수집 실패.",
         }
+    # 백필이 정체 없이(backfill_stalled 아님) 진행 중인 건 정상 동작이지 문제가 아니다 —
+    # 여기서 daemon 전체 health를 degraded로 깎지 않는다. 진행 상황 자체는
+    # doctor.py의 BACKFILL 체크(OK 상태 + Processed/Fetched 상세)가 이미 보여준다.
     if backfill.get("state") == "running":
-        return {
-            "health": "degraded",
-            "problem_code": None,
-            "message": "과거 데이터 백필 진행 중.",
-        }
+        return {"health": "healthy", "problem_code": None, "message": "정상 가동 중(백필 진행 중)."}
 
     return {"health": "healthy", "problem_code": None, "message": "정상 가동 중."}
 

@@ -515,12 +515,32 @@ async def _run_cycle(status: dict, interval_min: int, min_window: int, max_windo
     """
     req_days = _read_backfill_request()
     auto_window = _catchup_window(min_window, max_window)
+    oldest_by_channel = None
     if req_days:
         # 작은 요청(예: 1일)이 큰 다운타임 갭(예: 3일)을 덮어써, 중간 구간을 영영
         # 수집하지 않고 영구·무성 구멍을 남기던 버그를 막는다(P0: 히스토리 무결성).
         window_min = max(req_days * 1440, auto_window)
+        # 채널별로 '이미 어디까지 받았는지' 조회 — 큰 백필이 도중에 끊기고 재시작해도
+        # 매번 '지금'부터 다시 훑지 않고 그 지점부터 이어받는다(client.fetch_recent 참고).
+        # 실패해도(DB 문제 등) 백필 자체는 계속— 그냥 처음부터 훑는 예전 동작으로 폴백.
+        try:
+            with db.connect() as conn:
+                raw_oldest = db.oldest_message_dates_by_channel(conn)
+            oldest_by_channel = {}
+            for ch_id, iso in raw_oldest.items():
+                try:
+                    dt = datetime.fromisoformat(iso)
+                except ValueError:
+                    continue
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                oldest_by_channel[ch_id] = dt
+        except Exception as e:  # noqa: BLE001
+            _LOG.warning("이어받기 지점 조회 실패(처음부터 진행): %s: %s", type(e).__name__, e)
+            oldest_by_channel = None
         _LOG.info(
-            "사용자 요청 백필 — 요청 %d일, 실효 창 %d분 소급 수집", req_days, window_min,
+            "사용자 요청 백필 — 요청 %d일, 실효 창 %d분 소급 수집(%d개 채널 이어받기 지점 확인됨)",
+            req_days, window_min, len(oldest_by_channel or {}),
         )
     else:
         window_min = auto_window
@@ -552,12 +572,28 @@ async def _run_cycle(status: dict, interval_min: int, min_window: int, max_windo
         _LOG.info("캐치업 — %d분 소급 수집(채널당 최대 %d개, 타임아웃 %d초)",
                    window_min, eff_limit, cycle_timeout)
 
+    async def _backfill_progress(stats: dict, fetched_so_far: int) -> None:
+        """채널 하나 끝날 때마다 호출 — 사용자 백필(req_days)일 때만 진행률을 즉시
+        영속화한다. 90일치처럼 전체가 5분 넘게 걸려도 check_backfill()의 '5분간
+        진행 없음' 정체 판정이 실제 정체(콜백 자체가 안 불릴 때)에만 뜨게 만든다."""
+        if not req_days:
+            return
+        bf = status.setdefault("backfill", {})
+        bf["processed_channels"] = stats.get("processed", 0)
+        bf["total_channels"] = stats.get("total", 0)
+        bf["fetched_messages"] = fetched_so_far
+        bf["last_progress_at"] = _now_iso()
+        status["heartbeat_at"] = _now_iso()
+        _persist_status(status)
+
     try:
         last_result = await asyncio.wait_for(
             run_sync(
                 minutes=window_min,
                 per_channel_limit=eff_limit,
                 on_client_ready=_attach_command_listener,
+                on_progress=_backfill_progress,
+                oldest_by_channel=oldest_by_channel,
             ),
             timeout=cycle_timeout,
         )

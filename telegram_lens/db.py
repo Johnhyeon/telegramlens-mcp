@@ -421,6 +421,18 @@ def newest_message_date(conn: sqlite3.Connection) -> str | None:
     return row["d"] if row else None
 
 
+def oldest_message_dates_by_channel(conn: sqlite3.Connection) -> dict[int, str]:
+    """채널별 저장된 메시지 중 가장 오래된 날짜(ISO UTC).
+
+    백필이 중간에 끊기고 재시작할 때 '이 채널은 이미 어디까지 받았는지'를 판별해 그
+    지점부터 이어받기(resume) 위해 쓴다 — 없는 채널은 dict 에 아예 없음(= 처음부터).
+    """
+    rows = conn.execute(
+        "SELECT channel_id, MIN(date) AS d FROM messages GROUP BY channel_id"
+    ).fetchall()
+    return {r["channel_id"]: r["d"] for r in rows if r["d"]}
+
+
 def stats(conn: sqlite3.Connection) -> dict:
     row = conn.execute(
         """
