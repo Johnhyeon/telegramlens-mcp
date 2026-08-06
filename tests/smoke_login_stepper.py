@@ -7,14 +7,19 @@ monkeypatch해서 stdin을 흉내 낸 큐에서 한 번에 하나씩 소비한�
 
 import asyncio
 import os
+import sys
 import tempfile
 from unittest.mock import patch
+
+if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
+    sys.stdout.reconfigure(encoding="utf-8")
 
 _TMP = tempfile.mkdtemp(prefix="tglens_login_stepper_test_")
 os.environ["TELEGRAMLENS_HOME"] = _TMP
 
 from telegram_lens import login_cli  # noqa: E402
 from telethon.errors import (  # noqa: E402
+    FloodWaitError,
     PasswordHashInvalidError,
     PhoneCodeInvalidError,
     PhoneNumberInvalidError,
@@ -33,17 +38,29 @@ class _FakeMe:
     username = "honggd"
 
 
+class _FakeSentCode:
+    """telethon.tl.types.auth.SentCode를 흉내 — login_cli는 클래스 이름
+    (type(sent_code.type).__name__)만 보고 전송 경로를 판별하므로, 같은 이름의
+    빈 클래스 인스턴스면 충분하다."""
+
+    def __init__(self, type_class_name):
+        self.type = type(type_class_name, (), {})()
+
+
 class _FakeClient:
     """실제 TelegramClient의 필요한 부분만 흉내 — 시나리오별로 어떤 예외를 던질지
     받는다."""
 
     def __init__(self, *, already_authorized=False, code_attempts=None, needs_2fa=False,
-                 correct_password="right"):
+                 correct_password="right", sent_code_type="SentCodeTypeSms",
+                 flood_wait_seconds=None):
         self._already_authorized = already_authorized
         self._code_attempts = list(code_attempts or ["000000"])  # 마지막이 정답
         self._needs_2fa = needs_2fa
         self._correct_password = correct_password
         self._connected = True
+        self._sent_code_type = sent_code_type
+        self._flood_wait_seconds = flood_wait_seconds
 
     async def connect(self):
         return None
@@ -60,7 +77,9 @@ class _FakeClient:
     async def send_code_request(self, phone):
         if phone == "invalid":
             raise PhoneNumberInvalidError(request=None)
-        return None
+        if self._flood_wait_seconds is not None:
+            raise FloodWaitError(request=None, capture=self._flood_wait_seconds)
+        return _FakeSentCode(self._sent_code_type)
 
     async def sign_in(self, phone=None, code=None, *, password=None):
         if password is not None:
@@ -126,6 +145,38 @@ def check_happy_path_phone_then_code() -> None:
     statuses = [e["status"] for e in emitted]
     _assert(statuses == ["need_phone", "code_sent", "ok"], f"got {statuses}")
     _assert(emitted[-1]["me"]["username"] == "honggd", "me 정보 포함")
+
+
+def check_code_sent_reports_actual_delivery_channel() -> None:
+    """실사용 중 나온 문의: "코드가 안 온다"의 절반은 SMS라고 생각하고 안 보고 있었는데
+    실제론 텔레그램 앱으로 갔던 경우였다 — send_code_request의 실제 응답(type)을 그대로
+    사용자에게 보여줘야 어디를 봐야 할지 헷갈리지 않는다."""
+    print("\n=== code_sent에 실제 전송 경로(channel)가 담긴다 ===")
+    client = _FakeClient(code_attempts=["999999"], sent_code_type="SentCodeTypeApp")
+    emitted = _run_stepper_with(client, [{"phone": "+821012345678"}, {"code": "999999"}])
+    code_sent = next(e for e in emitted if e["status"] == "code_sent")
+    _assert("channel" in code_sent, f"channel 필드 포함, got {code_sent}")
+    _assert("앱" in code_sent["channel"], f"App 타입이면 앱이라고 안내, got {code_sent['channel']}")
+
+    client_sms = _FakeClient(code_attempts=["999999"], sent_code_type="SentCodeTypeSms")
+    emitted_sms = _run_stepper_with(client_sms, [{"phone": "+821012345678"}, {"code": "999999"}])
+    code_sent_sms = next(e for e in emitted_sms if e["status"] == "code_sent")
+    _assert("SMS" in code_sent_sms["channel"], f"Sms 타입이면 SMS라고 안내, got {code_sent_sms['channel']}")
+
+
+def check_flood_wait_shows_clear_message_and_retries_same_step() -> None:
+    """같은 api_id/번호로 코드 요청을 반복하면(테스트 중 재시도 등) 텔레그램이 조용히
+    발송을 막을 수 있다 — send_code_request가 예외 없이 "성공"한 것처럼 보이는 게 아니라
+    FloodWaitError로 바로 드러나야, "코드가 안 온다"를 무한정 기다리지 않는다."""
+    print("\n=== FloodWaitError는 명확한 메시지로 need_phone 재시도 ===")
+    client = _FakeClient(flood_wait_seconds=120)
+    emitted = _run_stepper_with(client, [{"phone": "+821012345678"}])
+    statuses = [e["status"] for e in emitted]
+    # 에러 후 같은 need_phone 단계를 재시도(다른 에러들과 동일 패턴) — stdin이 더 없으면
+    # 거기서 조용히 종료된다.
+    _assert(statuses == ["need_phone", "error", "need_phone"], f"got {statuses}")
+    _assert(emitted[1]["code"] == "FLOOD_WAIT", f"에러 코드 FLOOD_WAIT, got {emitted[1]}")
+    _assert("120" in emitted[1]["message"], f"대기 시간이 메시지에 포함, got {emitted[1]}")
 
 
 def check_wrong_code_retries_same_step() -> None:
@@ -201,6 +252,8 @@ def check_daemon_active_blocks_before_connecting() -> None:
 def main() -> None:
     check_already_logged_in_short_circuits()
     check_happy_path_phone_then_code()
+    check_code_sent_reports_actual_delivery_channel()
+    check_flood_wait_shows_clear_message_and_retries_same_step()
     check_wrong_code_retries_same_step()
     check_invalid_phone_retries_same_step()
     check_2fa_flow_with_wrong_then_right_password()

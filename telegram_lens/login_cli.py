@@ -164,6 +164,25 @@ def _me_dict(me) -> dict:
     return {"first_name": me.first_name, "username": me.username}
 
 
+# send_code_request()가 실제로 어떤 경로로 코드를 보냈는지 — "코드가 안 온다" 문의의
+# 절반은 SMS만 보고 텔레그램 앱 자체로 온 걸 놓치는 경우다(계정이 이미 어딘가 로그인돼
+# 있으면 텔레그램은 SMS보다 앱 내 메시지를 우선한다). 이걸 사용자에게 그대로 알려주면
+# 어디를 봐야 할지 헷갈릴 일이 없다.
+_SENT_CODE_TYPE_LABELS = {
+    "SentCodeTypeApp": "텔레그램 앱으로 전송됨 — 앱 채팅 목록 맨 위(Telegram 계정)를 확인하세요",
+    "SentCodeTypeSms": "SMS 문자로 전송됨",
+    "SentCodeTypeCall": "전화(음성 안내)로 전송됨 — 곧 전화가 옵니다",
+    "SentCodeTypeFlashCall": "발신자 번호 뒷자리가 곧 코드입니다 — 부재중 전화를 확인하세요",
+    "SentCodeTypeMissedCall": "부재중 전화 뒷자리가 코드입니다",
+    "SentCodeTypeFragmentSms": "Fragment 번호로 전송됨",
+}
+
+
+def _sent_code_channel(sent_code) -> str:
+    type_name = type(sent_code.type).__name__
+    return _SENT_CODE_TYPE_LABELS.get(type_name, f"전송됨({type_name})")
+
+
 async def _run_stepper() -> None:
     """`--stepper` 모드 — GUI(LeetKit Manager)가 단계별로 대화하며 로그인을 대신 진행할
     수 있게 stdin/stdout으로 JSON 한 줄씩 주고받는다. 기본(대화형) 흐름과 실제 Telethon
@@ -174,6 +193,7 @@ async def _run_stepper() -> None:
     """
     from telethon import TelegramClient
     from telethon.errors import (
+        FloodWaitError,
         PasswordHashInvalidError,
         PhoneCodeInvalidError,
         PhoneNumberInvalidError,
@@ -229,12 +249,21 @@ async def _run_stepper() -> None:
                     return
                 candidate = str(msg.get("phone") or "").strip()
                 try:
-                    await client.send_code_request(candidate)
+                    sent = await client.send_code_request(candidate)
                 except PhoneNumberInvalidError:
                     _emit({"status": "error", "code": "PHONE_INVALID", "message": "전화번호 형식이 올바르지 않습니다."})
                     continue
+                except FloodWaitError as e:
+                    # 같은 api_id/번호로 코드 요청을 너무 많이 반복하면(테스트 중 재시도 등)
+                    # 텔레그램이 일정 시간 코드 발송 자체를 막는다 — send_code_request는
+                    # 예외 없이 조용히 "성공"하지 않고 여기서 바로 알 수 있게 걸린다.
+                    _emit({
+                        "status": "error", "code": "FLOOD_WAIT",
+                        "message": f"요청이 너무 잦아 텔레그램이 {e.seconds}초 동안 코드 발송을 제한했습니다. 잠시 후 다시 시도하세요.",
+                    })
+                    continue
                 phone = candidate
-                _emit({"status": "code_sent"})
+                _emit({"status": "code_sent", "channel": _sent_code_channel(sent)})
 
             signed_in = False
             while not signed_in:
