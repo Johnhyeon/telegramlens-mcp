@@ -8,6 +8,7 @@ pystray.Icon.run() 은 실제 OS 트레이·디스플레이가 필요해 자동�
 
 import os
 import tempfile
+from datetime import datetime, timedelta, timezone
 
 _TMP = tempfile.mkdtemp(prefix="tglens_tray_test_")
 os.environ["TELEGRAMLENS_HOME"] = _TMP
@@ -48,6 +49,18 @@ def check_module_entry_points_importable() -> None:
     print("\n=== 엔트리포인트 함수 존재 ===")
     _assert(callable(tray.main), "tray.main 존재")
     _assert(callable(tray._build_menu), "tray._build_menu 존재")
+    _assert(callable(tray._open_status_window), "tray._open_status_window 존재(진행상황 보기)")
+
+
+def check_fmt_minutes_ago() -> None:
+    print("\n=== _fmt_minutes_ago: 상세 창 시간 표시 포맷 ===")
+    now = datetime.now(timezone.utc)
+    _assert(tray._fmt_minutes_ago(None) == "-", "None 이면 '-'")
+    _assert(tray._fmt_minutes_ago("이상한값") == "이상한값", "파싱 실패 시 원문 그대로")
+    ten_min_ago = (now - timedelta(minutes=10)).isoformat()
+    _assert(tray._fmt_minutes_ago(ten_min_ago) == "10분 전", f"got {tray._fmt_minutes_ago(ten_min_ago)!r}")
+    just_now = (now - timedelta(seconds=5)).isoformat()
+    _assert(tray._fmt_minutes_ago(just_now) == "방금", f"got {tray._fmt_minutes_ago(just_now)!r}")
 
 
 def main() -> None:
@@ -55,7 +68,8 @@ def main() -> None:
     check_current_health_reuses_procstate()
     check_icon_generation_and_cache()
     check_module_entry_points_importable()
-    print("\nOK - tray.py 순수 로직 정상(실제 트레이 표시는 수동 확인 필요)")
+    check_fmt_minutes_ago()
+    print("\nOK - tray.py 순수 로직 정상(GUI 는 수동 확인 필요 — telegramlens-tray 로 직접 확인)")
 
 
 if __name__ == "__main__":

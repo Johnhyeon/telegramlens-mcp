@@ -83,7 +83,7 @@ def _registered_targets(desktop_check: "Check", code_check: "Check") -> list[str
 class Check:
     def __init__(self, name: str):
         self.name = name
-        self.status = None  # "ok" / "warn" / "fail"
+        self.status = None  # "ok" / "active" / "warn" / "fail"
         self.lines: list[str] = []
         self.fix: str | None = None
         # ok/warn/fail 중 실제로 상태를 확정한 호출의 메시지만 담는다(.info()는 제외) —
@@ -92,6 +92,14 @@ class Check:
 
     def ok(self, msg: str):
         self.status = "ok"
+        self.summary = msg
+        self.lines.append(msg)
+        return self
+
+    def active(self, msg: str):
+        """정상이지만 지금 뭔가 진행 중(예: 백필)임을 알리는 상태 — Manager는 이걸
+        "문제"로 세지 않지만 "정상"과도 구분해 별도 "진행중" 카테고리로 보여준다."""
+        self.status = "active"
         self.summary = msg
         self.lines.append(msg)
         return self
@@ -562,7 +570,7 @@ def check_backfill() -> Check:
             fix="telegramlens-doctor --repair daemon",
         )
     else:
-        c.ok("백필 진행 중")
+        c.active("백필 진행 중")
     return c
 
 

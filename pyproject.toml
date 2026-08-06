@@ -1,6 +1,6 @@
 [project]
 name = "telegramlens-mcp"
-version = "0.4.5"
+version = "0.4.6"
 description = "TelegramLens — 텔레그램 채널의 종목 내러티브·언급 흐름을 구조화해 AI에게 전달하는 로컬 MCP 서버"
 readme = "README.md"
 license = { text = "Proprietary" }
@@ -20,7 +20,7 @@ classifiers = [
 ]
 requires-python = ">=3.11"
 dependencies = [
-    "mcp[cli]>=1.12.0",
+    "mcp[cli]>=1.12.0,<2.0.0",
     "telethon>=1.36.0",
     "httpx>=0.27.0",
     "tzdata>=2024.1",
