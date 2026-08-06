@@ -7,8 +7,12 @@ pystray.Icon.run() 은 실제 OS 트레이·디스플레이가 필요해 자동�
 """
 
 import os
+import sys
 import tempfile
 from datetime import datetime, timedelta, timezone
+
+if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
+    sys.stdout.reconfigure(encoding="utf-8")
 
 _TMP = tempfile.mkdtemp(prefix="tglens_tray_test_")
 os.environ["TELEGRAMLENS_HOME"] = _TMP
@@ -26,8 +30,8 @@ def check_current_health_reuses_procstate() -> None:
     print("\n=== current_health(): 새 판정 로직 없이 procstate 그대로 재사용 ===")
     health = tray.current_health()
     _assert(
-        health["health"] == "failed" and health["problem_code"] == "DAEMON_NOT_RUNNING",
-        f"데몬 미가동 상태에서 DAEMON_NOT_RUNNING, got {health}",
+        health["health"] == "healthy" and health["problem_code"] is None,
+        f"데몬 미가동 자체는 문제가 아니라 healthy(Claude가 안 켜져 있으면 정상), got {health}",
     )
 
 

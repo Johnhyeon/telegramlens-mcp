@@ -85,10 +85,23 @@ def compute_health(status: dict | None, lock_held: bool, interval_min: int | Non
     반환: {"health": "healthy"|"degraded"|"failed", "problem_code": str|None, "message": str}
     """
     if not lock_held:
+        # 데몬은 Claude Desktop이 열려 있을 때만 함께 뜬다 — 꺼져 있다는 사실 자체는
+        # 문제가 아니다(Claude를 안 켜놨으면 당연히 없다). 하트비트·지연 같은 "살아있어야
+        # 의미 있는" 판정은 죽은 프로세스 기준으로는 애초에 성립하지 않으니 건너뛴다.
+        # 다만 마지막으로 살아있었을 때 이미 반복 실패가 누적돼 있었다면(단순 종료가
+        # 아니라 문제가 있었을 가능성) 그 사실만 부드럽게 알려준다 — 복구 버튼은 안
+        # 띄운다(지금 당장 고칠 대상이 없다).
+        consecutive = (status or {}).get("consecutive_failures") or 0
+        if consecutive >= 3:
+            return {
+                "health": "degraded",
+                "problem_code": None,
+                "message": f"데몬이 지금 꺼져 있습니다. 마지막 실행에서 연속 {consecutive}회 수집 실패가 있었습니다 — Claude를 열어 다시 확인해보세요.",
+            }
         return {
-            "health": "failed",
-            "problem_code": "DAEMON_NOT_RUNNING",
-            "message": "수집 데몬이 실행되고 있지 않습니다.",
+            "health": "healthy",
+            "problem_code": None,
+            "message": "데몬이 지금 실행 중이지 않습니다(Claude Desktop을 열어야 동작합니다 — 정상입니다).",
         }
     if status is None:
         return {
