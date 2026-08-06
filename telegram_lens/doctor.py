@@ -599,7 +599,10 @@ def check_data() -> Check:
 
     path = db_path()
     if not path.exists():
-        c.warn("DB 파일이 아직 없습니다 — 한 번도 수집되지 않았습니다.")
+        # 첫 설치 직후엔 당연히 없다 — 수집은 Claude Desktop을 열어야 시작된다.
+        # 이걸 경고로 잡으면 갓 설치한 사용자에게 "문제 1건"으로 보여서, 잘못한 게
+        # 없는데도 뭔가 고장 난 줄 알게 된다(데몬 미가동 판정과 같은 부류의 오해).
+        c.ok("아직 수집된 데이터가 없습니다 — Claude Desktop을 열면 텔레그램 채널 메시지 수집이 시작됩니다.")
         return c
     c.info(f"Path:       {path}")
 
