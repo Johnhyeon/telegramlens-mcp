@@ -157,15 +157,35 @@ class Check:
 # ── 설치 검사 ────────────────────────────────────────────────────────
 
 
+def _find_uv() -> str | None:
+    """uv 실행 파일 경로. PATH뿐 아니라 설치 스크립트가 실제로 두는 위치까지 본다.
+
+    PATH만 보면 실사용에서 오탐이 난다 — LeetKit Manager가 uv를 자동 설치해주면 uv는
+    `~/.local/bin`에 생기지만 설치 스크립트는 *영구* PATH(레지스트리)만 갱신하므로,
+    이미 실행 중인 프로세스에는 반영되지 않는다. 그 상태로 PATH만 확인하면 설치가
+    멀쩡히 끝났는데도 계속 "uv 없음" 경고가 떠서 카드가 영영 "주의"로 남는다.
+    """
+    found = shutil.which("uv")
+    if found:
+        return found
+    home = Path.home()
+    for bin_dir in (home / ".local" / "bin", home / ".cargo" / "bin"):
+        for name in ("uv.exe", "uv"):
+            candidate = bin_dir / name
+            if candidate.exists():
+                return str(candidate)
+    return None
+
+
 def check_uv() -> Check:
     c = Check("uv (Python runtime manager)")
-    uv = shutil.which("uv")
+    uv = _find_uv()
     if uv:
         c.ok("uv is installed")
         c.info(f"Path:       {uv}")
     else:
         c.warn(
-            "uv not found in PATH",
+            "uv not found",
             fix=(
                 "Install uv (recommended):\n"
                 "  Windows: irm https://astral.sh/uv/install.ps1 | iex\n"
