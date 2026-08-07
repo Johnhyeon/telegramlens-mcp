@@ -12,6 +12,8 @@ import sysconfig
 from pathlib import Path
 
 SERVER_KEY = "telegramlens"
+# 이름을 바꾼 적이 없어 정리할 옛 키가 없다. 다른 Lens와 코드 모양을 맞추려고 둔다.
+LEGACY_KEYS: list[str] = []
 
 
 def _uv_tool_bin_dirs() -> list[Path]:
@@ -258,6 +260,72 @@ def configure(
     return results
 
 
+def _remove_one_target(config_path, label: str) -> dict:
+    """한 설정 파일에서 우리 MCP 항목만 지운다. 다른 서버 항목·주석은 안 건드린다.
+
+    파일이 없거나 항목이 없으면 "이미 없음"으로 성공 처리한다 — 해제를 두 번 눌러도
+    실패로 보이면 안 된다. 지우기 전에 항상 백업을 남긴다(등록 때와 같은 규칙).
+    """
+    from pathlib import Path as _Path
+
+    config_path = _Path(config_path)
+    result = {"target_label": label, "config_path": str(config_path), "removed": False}
+    if not config_path.exists():
+        return result
+
+    if config_path.suffix == ".toml":
+        import tomlkit
+
+        try:
+            doc = tomlkit.parse(config_path.read_text(encoding="utf-8"))
+        except Exception:
+            return result
+        config_path.with_suffix(".toml.backup").write_bytes(config_path.read_bytes())
+        servers = doc.get("mcp_servers")
+        if servers is not None:
+            for key in [SERVER_KEY, *LEGACY_KEYS]:
+                if servers.pop(key, None) is not None:
+                    result["removed"] = True
+        if result["removed"]:
+            config_path.write_text(tomlkit.dumps(doc), encoding="utf-8")
+        return result
+
+    try:
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+    except Exception:
+        return result
+    with open(config_path.with_suffix(".json.backup"), "w", encoding="utf-8") as f:
+        json.dump(config, f, indent=2, ensure_ascii=False)
+    servers = config.get("mcpServers") or {}
+    for key in [SERVER_KEY, *LEGACY_KEYS]:
+        if servers.pop(key, None) is not None:
+            result["removed"] = True
+    if result["removed"]:
+        config["mcpServers"] = servers
+        with open(config_path, "w", encoding="utf-8") as f:
+            json.dump(config, f, indent=2, ensure_ascii=False)
+    return result
+
+
+def remove(targets: list[str]) -> list[dict]:
+    """선택한 타겟들에서 MCP 등록을 해제한다.
+
+    Manager의 "MCP 등록" 모달에서 체크를 풀면 여기로 온다. 예전엔 해제 수단이 아예
+    없어서, 체크박스가 토글처럼 보이는데 실제로는 "추가만" 됐다 — 체크를 풀고 등록을
+    눌러도 그 설정이 그대로 남아 사용자 눈에는 먹통으로 보였다.
+    """
+    unknown = [t for t in targets if t not in TARGETS]
+    if unknown:
+        raise ValueError(f"Unknown target(s): {unknown}. Valid: {list(TARGETS.keys())}")
+    results = []
+    for target in targets:
+        path_func, label = TARGETS[target]
+        entry = _remove_one_target(path_func(), label)
+        entry["target"] = target
+        results.append(entry)
+    return results
+
+
 def _build_parser():
     import argparse
 
@@ -281,6 +349,11 @@ def _build_parser():
         action="store_true",
         help="배너/진행 로그를 찍지 않는다 (원래 프롬프트가 없으므로 동작 자체는 동일).",
     )
+    p.add_argument(
+        "--remove",
+        action="store_true",
+        help="등록을 해제한다(설정 파일에서 우리 항목만 삭제). Manager의 체크 해제가 이걸 쓴다.",
+    )
     return p
 
 
@@ -295,6 +368,25 @@ def main():
         print("  TelegramLens - MCP Setup")
         print("==============================================")
         print(f"  Targets: {target_labels}")
+
+    # 해제는 등록과 완전히 다른 일이라 여기서 바로 갈라진다 — 키 검증·설치 확인 같은
+    # 등록 절차를 탈 이유가 없다.
+    if args.remove:
+        try:
+            removed = remove(targets)
+        except Exception as e:  # noqa: BLE001 — 실패도 JSON 계약으로 알려야 한다
+            if args.json:
+                print(json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False))
+            else:
+                print(f"  [ERROR] {e}", file=sys.stderr)
+            sys.exit(1)
+        if args.json:
+            print(json.dumps({"ok": True, "removed": removed}, ensure_ascii=False))
+        elif not quiet:
+            for entry in removed:
+                state = "해제됨" if entry["removed"] else "원래 없음"
+                print(f"  [OK] {entry['target_label']}: {state}")
+        sys.exit(0)
 
     try:
         results = configure(args.command, targets=targets, quiet=quiet)
