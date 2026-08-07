@@ -94,6 +94,8 @@ class Check:
         # ok/warn/fail 중 실제로 상태를 확정한 호출의 메시지만 담는다(.info()는 제외) —
         # Manager 계약 checks[].summary는 이 한 줄이고, 나머지 info 라인은 details.lines로 간다.
         self.summary: str = ""
+        # 진행률(done/total/…)을 숫자 그대로 담는다. 있으면 details.progress로 나간다.
+        self.progress: dict | None = None
 
     def ok(self, msg: str):
         self.status = "ok"
@@ -143,6 +145,11 @@ class Check:
         details: dict = {}
         if self.lines:
             details["lines"] = list(self.lines)
+        # 진행률은 숫자로 따로 내보낸다. 예전엔 "Processed: 3/30 채널" 같은 텍스트 줄만
+        # 나가서, Manager가 바를 그리려면 그 문장을 파싱해야 했다 — 문구가 조금만
+        # 바뀌어도 깨지는 방식이라 아예 구조화된 값을 준다.
+        if self.progress is not None:
+            details["progress"] = self.progress
         return {
             "id": check_id,
             "status": self.status,
@@ -669,8 +676,46 @@ def check_backfill() -> Check:
             fix="telegramlens-doctor --repair daemon",
         )
     else:
-        c.active("백필 진행 중")
+        c.active("지난 기록을 가져오는 중")
+    c.progress = _backfill_progress(bf)
     return c
+
+
+def _backfill_progress(bf: dict) -> dict | None:
+    """백필 진행률을 숫자로. Manager가 이걸로 진행 바를 그린다.
+
+    "수집 중"이라는 말만으로는 얼마나 남았는지 알 수 없어, 사용자는 멈춘 건지 도는
+    건지 구분을 못 한다 — 그래서 '조치 필요'로 오해하기 쉽다. 숫자와 남은 시간을
+    같이 주면 기다리면 되는 상태라는 게 그 자리에서 보인다.
+    """
+    done = bf.get("processed_channels")
+    total = bf.get("total_channels")
+    if not isinstance(done, int) or not isinstance(total, int) or total <= 0:
+        return None
+
+    progress: dict = {
+        "done": done,
+        "total": total,
+        "unit": "채널",
+        "fetched": bf.get("fetched_messages"),
+    }
+
+    # 남은 시간은 지금까지의 평균 속도로만 어림한다. 채널마다 메시지 양이 달라 정확할
+    # 수 없으므로 화면에서도 "약"으로 말한다. 아직 한 채널도 못 끝냈으면 계산 불가.
+    started = bf.get("started_at")
+    if done > 0 and done < total and started:
+        try:
+            from datetime import datetime, timezone
+
+            begun = datetime.fromisoformat(started)
+            if begun.tzinfo is None:
+                begun = begun.replace(tzinfo=timezone.utc)
+            elapsed = (datetime.now(timezone.utc) - begun).total_seconds()
+            if elapsed > 0:
+                progress["eta_sec"] = int(elapsed / done * (total - done))
+        except (ValueError, TypeError):
+            pass
+    return progress
 
 
 # ── 복구 ────────────────────────────────────────────────────────────
