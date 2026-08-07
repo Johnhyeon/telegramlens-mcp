@@ -1389,7 +1389,16 @@ async def telegram_block_name(code: str, note: str = "") -> str:
 
 def main() -> None:
     # 수집은 _lifespan 이 띄우는 별도 자식 데몬이 담당(자동시작 레지스트리 없음).
-    db.init_db()
+    #
+    # DB 준비에 실패해도 서버는 뜬다. 예전엔 여기서 예외가 그대로 올라가 프로세스가
+    # 죽었고, 클라이언트에는 원인 없이 "server disconnected"만 보였다 — Claude Desktop과
+    # Codex가 동시에 뜨면 실제로 그렇게 됐다(둘 다 같은 DB를 초기화하려 해서).
+    # 초기화는 어느 쪽이든 한 번만 성공하면 되고, 실패한 쪽도 그 결과를 그대로 쓰면 된다.
+    # 정말로 DB가 망가진 경우라면 각 도구가 자기 오류를 돌려주므로 원인이 더 잘 보인다.
+    try:
+        db.init_db()
+    except Exception as e:  # noqa: BLE001 — 어떤 이유든 서버는 떠야 한다
+        print(f"[telegramlens] DB 초기화를 건너뜁니다: {e}", file=sys.stderr)
     mcp.run()
 
 

@@ -193,11 +193,33 @@ def connect(path: Path | None = None) -> Iterator[sqlite3.Connection]:
         conn.close()
 
 
+def _ensure_wal(conn: sqlite3.Connection) -> None:
+    """WAL 모드 보장. 이미 WAL이면 건드리지 않고, 못 바꿔도 그냥 넘어간다.
+
+    `PRAGMA journal_mode` 변경은 busy_timeout이 **적용되지 않는** 유일한 예외다 —
+    다른 연결이 열려 있으면 기다리지 않고 즉시 SQLITE_BUSY를 낸다. 그래서 30초
+    타임아웃을 걸어놨는데도 무용지물이었고, Claude Desktop과 Codex가 동시에 서버를
+    띄우면 늦게 뜬 쪽이 "database is locked"로 그 자리에서 죽었다(실제 발생).
+
+    journal_mode는 DB 파일에 영구 기록되므로 누가 한 번 켜두면 그걸로 끝이다 —
+    이미 WAL이면 다시 설정할 이유가 없고, 못 바꿨다는 건 다른 연결이 붙어 있다는 뜻이라
+    그쪽이 이미 켰거나 곧 켠다. 어느 쪽이든 여기서 죽을 이유가 없다."""
+    try:
+        current = conn.execute("PRAGMA journal_mode").fetchone()[0]
+    except sqlite3.Error:
+        current = None
+    if str(current).lower() == "wal":
+        return
+    try:
+        conn.execute("PRAGMA journal_mode = WAL")
+    except sqlite3.OperationalError:
+        pass
+
+
 def init_db(path: Path | None = None) -> None:
     with connect(path) as conn:
         # WAL: writer(데몬)가 쓰는 동안에도 reader(Claude 조회)가 막히지 않는다.
-        # journal_mode 는 DB 파일에 영구 기록되므로 1회 설정으로 충분.
-        conn.execute("PRAGMA journal_mode = WAL")
+        _ensure_wal(conn)
         conn.executescript(_SCHEMA)
         _migrate(conn)
 
