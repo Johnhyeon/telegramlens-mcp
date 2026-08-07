@@ -34,6 +34,10 @@ from telegram_lens.stocks import (
 from telegram_lens.sync import run_sync
 
 _LOG = logging.getLogger("telegramlens.server")
+
+# 트레이가 이만큼 연달아 죽으면 이 서버가 사는 동안은 다시 안 띄운다. 감시 루프가
+# 60초마다 되살리는 구조라, 뜨자마자 죽는 환경에서는 크래시 알림이 무한히 뜬다.
+_TRAY_MAX_FAILURES = 3
 # stdio MCP: stdout 은 Claude 와의 JSON-RPC 채널이다. 로그가 거기 새면 프로토콜이
 # 깨진다 → 서버 로그는 stderr 로만 보내고(propagate 차단), fallback in-process sync
 # 시 Telethon 의 수다스러운 로그도 막는다(평상시 수집은 자식 데몬이 전담).
@@ -58,7 +62,7 @@ async def _lifespan(_server):
     # 살아있어도 영영 안 되살아난다(2026-06 장애: 3일간 수집 정지). 60초 감시 루프로
     # '실제 가동(is_alive: PID + 가동 신호 신선도)'을 확인해 죽었으면 재스폰한다 — Claude 가
     # 켜진 동안 수집 신선도를 자가치유로 보장. 새 persistence 없이 부모-자식 관계 유지.
-    state: dict = {"child": None, "tray": None}
+    state: dict = {"child": None, "tray": None, "tray_failures": 0}
 
     async def _supervise() -> None:
         while True:
@@ -81,14 +85,28 @@ async def _lifespan(_server):
                 # 트레이는 수집 상태를 '보여주기'만 하는 선택적 UI라, 데몬처럼 필수는
                 # 아니지만 같은 감시 주기로 같이 살아있게 한다(수동 실행 중이면 건너뜀 —
                 # tray.spawn() 이 자체 락으로 중복 아이콘을 막는다).
-                if is_logged_in():
+                if is_logged_in() and state["tray_failures"] < _TRAY_MAX_FAILURES:
                     from telegram_lens import tray
 
                     if not tray.is_alive():
+                        # 띄우자마자 죽는 트레이를 60초마다 계속 되살리면, 사용자에게는
+                        # 크래시 알림이 무한히 뜬다(실제로 맥에서 그랬다 — Tk 초기화가
+                        # 프로세스를 죽이는데 감시 루프가 계속 다시 띄웠다). 몇 번 연달아
+                        # 실패하면 이 서버가 사는 동안은 포기한다 — 트레이는 상태를
+                        # 보여주기만 하는 선택적 UI라, 없는 것보다 반복 알림이 더 나쁘다.
+                        previous = state.get("tray")
+                        if previous is not None and previous.poll() is not None:
+                            state["tray_failures"] += 1
                         tray_proc = tray.spawn()
                         if tray_proc is not None:
                             state["tray"] = tray_proc
                             _LOG.info("트레이 아이콘 자식 프로세스 (재)기동 (pid=%s)", tray_proc.pid)
+                        if state["tray_failures"] >= _TRAY_MAX_FAILURES:
+                            _LOG.warning(
+                                "트레이 아이콘이 %d번 연달아 죽어 재기동을 멈춥니다 "
+                                "(수집·조회 기능에는 영향 없음).",
+                                _TRAY_MAX_FAILURES,
+                            )
             except Exception as e:  # noqa: BLE001 — 트레이 감시 실패가 데몬/서버를 막으면 안 됨
                 _LOG.warning("트레이 아이콘 감시 실패: %s", e)
 

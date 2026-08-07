@@ -343,10 +343,26 @@ def spawn():
 
 
 def _run(pystray) -> None:
-    try:
-        import tkinter as tk
-    except ImportError:
-        tk = None
+    tk = None
+    if sys.platform != "darwin":
+        try:
+            import tkinter as tk
+        except ImportError:
+            tk = None
+    # macOS에서는 tkinter를 아예 안 쓴다.
+    #
+    # Homebrew Tk 8.6이 창 없는 백그라운드 프로세스에서 초기화되면 그 자리에서
+    # 프로세스를 죽인다(Tk_GetColor → GetRGBA → doesNotRecognizeSelector → abort).
+    # Python 예외가 아니라 Objective-C 예외에서 온 SIGABRT라 try/except로는 못 막는다 —
+    # 실제로 구매자 맥에서 "파이썬 응용 프로그램이 예기치 않게 종료되었습니다"가
+    # 반복해서 떴다(감시 루프가 60초마다 다시 띄우니 계속).
+    #
+    # 원래 이 구조(Tk가 메인 스레드, pystray는 detached)를 택한 이유가 macOS 호환이었는데
+    # 실제로는 정반대였다 — macOS의 AppKit은 pystray 쪽이 메인 스레드를 가져야 한다.
+    # tk가 None이면 아래 폴백이 정확히 그 모양(icon.run이 메인 스레드)으로 돈다.
+    #
+    # 잃는 것은 '진행상황 보기' 창 하나뿐이고, 같은 내용은 telegram_status 도구와
+    # telegramlens-doctor로 볼 수 있다.
 
     state: dict = {"summary": "상태 확인 중..."}
     icon = pystray.Icon(
