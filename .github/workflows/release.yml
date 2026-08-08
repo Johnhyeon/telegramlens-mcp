@@ -34,6 +34,9 @@ jobs:
           fi
           echo "Version OK: $PKG_VER"
 
+      - name: Verify patch notes exist for this tag
+        run: python .github/check_patchnotes.py "${GITHUB_REF_NAME#v}"
+
       - name: Build distribution
         run: |
           python -m pip install --upgrade pip build
