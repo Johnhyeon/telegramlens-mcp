@@ -22,7 +22,7 @@ from telegram_lens import db, discover, market_clock, queries
 from telegram_lens.classify import run_classification
 from telegram_lens.config import data_dir, is_logged_in, secure_data_files
 from telegram_lens.client import NoCredentialsError, NotLoggedInError
-from telegram_lens.licensing import is_licensed, LOCKED_MESSAGE
+from telegram_lens.licensing import is_licensed, locked_message
 from telegram_lens.extract import reset_index
 from telegram_lens.stocks import (
     add_alias,
@@ -193,7 +193,7 @@ def safe_tool(func):
     @functools.wraps(func)
     async def wrapper(*args, **kwargs):
         if not is_licensed():
-            return LOCKED_MESSAGE
+            return locked_message()
         try:
             return await func(*args, **kwargs)
         except NoCredentialsError as e:

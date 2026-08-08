@@ -18,6 +18,7 @@ import base64
 import json
 import os
 import sys
+import time
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
@@ -50,6 +51,17 @@ LOCKED_MESSAGE = (
     "\n"
     "· 키는 결제 완료 후 이메일로 발송됩니다."
     + _purchase_line()
+)
+
+# 폐기된 키 전용 안내. LOCKED_MESSAGE와 달리 "키를 넣으세요"라고 하면 안 된다 —
+# 이 사람은 키를 갖고 있고, 그 키가 중지된 것이다. 할 일은 연락이지 재입력이 아니다.
+REVOKED_MESSAGE = (
+    "🔒 이 라이선스 키는 현재 사용이 중지되어 있습니다.\n"
+    "\n"
+    "환불 또는 결제 취소된 키로 확인됩니다.\n"
+    "착오라고 생각되시면 알려주세요 — 확인 후 바로 풀어드리겠습니다.\n"
+    "\n"
+    "· 문의: osy980315@gmail.com"
 )
 
 _licensed_cache = False  # 한 번 유효하면 프로세스 동안 재검증 생략
@@ -106,15 +118,117 @@ def stored_key() -> str | None:
     return None
 
 
+# ---------- 폐기(거부) 목록 ----------
+#
+# 환불·취소된 키를 막는 최소 장치. **원격 종료가 아니라 거부 목록이다** — 목록은
+# GitHub의 텍스트 파일이고, 판정은 이 컴퓨터에서 이 코드가 한다.
+#
+# 지켜야 할 규칙은 하나뿐: **모르면 통과시킨다.**
+# 네트워크 실패·파일 깨짐·목록 없음 — 전부 통과다. 목록을 못 읽는다고 돈 낸 사람이
+# 잠기는 쪽이, 환불한 사람이 며칠 더 쓰는 것보다 훨씬 비싸다.
+#
+# 한계(알고 시작한 것): 업데이트를 안 한 옛 버전에는 이 검사 자체가 없어서 안 걸린다.
+# 대신 키를 공유받아 새로 까는 사람은 최신을 받으므로 바로 걸린다.
+_REVOKED_URL = "https://raw.githubusercontent.com/Johnhyeon/leetkit-manager/main/revoked.json"
+_REVOKED_TTL = 86400.0  # 하루 한 번만 다시 받는다
+_REVOKED_TIMEOUT = 2.5  # 도구 호출을 오래 붙잡고 있으면 안 된다
+
+_revoked_fetched_this_process = False
+
+
+def _revoked_cache_path():
+    return data_dir() / "revoked_cache.json"
+
+
+def _load_revoked_cache():
+    try:
+        data = json.loads(_revoked_cache_path().read_text(encoding="utf-8"))
+        ids = [str(x).strip().lower() for x in data.get("revoked", []) if isinstance(x, str)]
+        return ids, float(data.get("fetched_at", 0))
+    except Exception:
+        return [], 0.0
+
+
+def _save_revoked_cache(ids, now) -> None:
+    try:
+        p = _revoked_cache_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps({"revoked": ids, "fetched_at": now}), encoding="utf-8")
+    except Exception:
+        pass  # 캐시를 못 써도 동작에는 영향이 없어야 한다
+
+
+def _fetch_revoked():
+    """목록을 새로 받는다. 실패하면 None(= 모름, 통과)."""
+    try:
+        import httpx
+
+        response = httpx.get(_REVOKED_URL, timeout=_REVOKED_TIMEOUT, follow_redirects=True)
+        response.raise_for_status()
+        ids = response.json().get("revoked")
+    except Exception:
+        return None
+    if not isinstance(ids, list):
+        return None
+    return [str(x).strip().lower() for x in ids if isinstance(x, str)]
+
+
+def is_revoked(license_id: str) -> bool:
+    """이 번호가 거부 목록에 있으면 True. 확실하지 않으면 언제나 False."""
+    global _revoked_fetched_this_process
+    lid = (license_id or "").strip().lower()
+    if not lid:
+        return False
+
+    ids, fetched_at = _load_revoked_cache()
+    now = time.time()
+    # 프로세스당 최대 한 번, 그것도 캐시가 하루 지났을 때만 네트워크를 탄다.
+    # is_licensed()는 도구 호출마다 불리므로 여기서 매번 받으면 안 된다.
+    if not _revoked_fetched_this_process and (now - fetched_at) > _REVOKED_TTL:
+        _revoked_fetched_this_process = True
+        fresh = _fetch_revoked()
+        if fresh is not None:
+            ids = fresh
+            _save_revoked_cache(ids, now)
+    return lid in ids
+
+
+def license_block_reason():
+    """잠긴 이유. 정상이면 None.
+
+    "없음/깨짐"과 "폐기됨"은 사용자가 할 일이 완전히 다르다 — 앞은 키를 넣어야 하고,
+    뒤는 연락해야 한다. 같은 문구를 보여주면 환불 착오인 사람이 키를 다시 넣어보며
+    시간을 버린다.
+    """
+    k = stored_key()
+    if not k:
+        return "missing"
+    res = verify_key(k)
+    if not res["valid"]:
+        return "invalid"
+    if is_revoked(res.get("license_id", "")):
+        return "revoked"
+    return None
+
+
+def locked_message() -> str:
+    return REVOKED_MESSAGE if license_block_reason() == "revoked" else LOCKED_MESSAGE
+
+
 def is_licensed() -> bool:
     global _licensed_cache
     if _licensed_cache:
         return True
     k = stored_key()
-    if k and verify_key(k)["valid"]:
-        _licensed_cache = True
-        return True
-    return False
+    if not k:
+        return False
+    res = verify_key(k)
+    if not res["valid"]:
+        return False
+    if is_revoked(res.get("license_id", "")):
+        return False  # 폐기된 키는 캐시하지 않는다 — 목록에서 빠지면 곧바로 다시 풀려야 한다
+    _licensed_cache = True
+    return True
 
 
 def save_key(key_str: str) -> dict:

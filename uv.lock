@@ -938,7 +938,7 @@ wheels = [
 
 [[package]]
 name = "telegramlens-mcp"
-version = "0.4.6"
+version = "0.4.18"
 source = { editable = "." }
 dependencies = [
     { name = "httpx" },
@@ -946,6 +946,7 @@ dependencies = [
     { name = "pillow" },
     { name = "pystray" },
     { name = "telethon" },
+    { name = "tomlkit" },
     { name = "tzdata" },
 ]
 
@@ -956,6 +957,7 @@ requires-dist = [
     { name = "pillow", specifier = ">=10.0" },
     { name = "pystray", specifier = ">=0.19.5" },
     { name = "telethon", specifier = ">=1.36.0" },
+    { name = "tomlkit", specifier = ">=0.12" },
     { name = "tzdata", specifier = ">=2024.1" },
 ]
 
@@ -970,6 +972,15 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/f5/f2/946ea3ca34740ea3bcb6033e44635e35058da5b1f349f99ba7c5b05b7296/telethon-1.43.2.tar.gz", hash = "sha256:794912eb546eacfe351ca7bf097b029f963da95985a07490653a99bf98219957", size = 687158, upload-time = "2026-04-20T08:06:42.044Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/37/85/53197127a93fd23a0ec7367a125939cb8c6cc23f0f9f2c0a04692f3ab51d/telethon-1.43.2-py3-none-any.whl", hash = "sha256:7e8a23a08f8474f3ac0c46847f3edd4e965b4452de0ba868b089acbad8041aa4", size = 773609, upload-time = "2026-04-20T08:06:44.496Z" },
+]
+
+[[package]]
+name = "tomlkit"
+version = "0.15.1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/94/96/e07752635b98536177fa1f37671c8f3cdde2e724c6bcf6034b2cfb571565/tomlkit-0.15.1.tar.gz", hash = "sha256:e25bbf38843005246210a12982776f27f99cb9be67160e14434d0c0d21ee1e97", size = 180129, upload-time = "2026-07-17T01:48:04.562Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/13/bc/8c13eb66537dce1d2bd3a57132902f38d0e7f5bb46fa9f4daed9fe9d76ee/tomlkit-0.15.1-py3-none-any.whl", hash = "sha256:177a05aece5a8ca5266fd3c448abb47b8d352f09d477d3ca8332db4d89b24304", size = 49449, upload-time = "2026-07-17T01:48:05.728Z" },
 ]
 
 [[package]]
