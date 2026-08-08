@@ -231,14 +231,13 @@ def check_telegramlens_command() -> Check:
         for name in ("telegramlens.exe", "telegramlens"):
             candidate = bin_dir / name
             if candidate.exists():
-                c.warn(
-                    "'telegramlens' exists but not on PATH",
-                    fix=(
-                        f'Add to PATH: "{bin_dir}"\n'
-                        f"(or proceed — setup_claude will use absolute path)"
-                    ),
-                )
+                # PATH에 없는 것 자체는 문제가 아니다 — MCP 등록은 절대경로로 하므로
+                # 그대로 동작한다. 예전엔 warn이라 카드가 영영 "주의"로 남았는데,
+                # 정작 안내문에 "무시 가능"이라고 적혀 있는 경고였다.
+                c.ok("'telegramlens' is installed")
                 c.info(f"Path:       {candidate}")
+                c.info("Not on PATH — MCP registration uses this absolute path, so no action is needed.")
+                c.info(f'Add "{bin_dir}" to PATH only if you want to type the command in a terminal.')
                 return c
 
     try:
