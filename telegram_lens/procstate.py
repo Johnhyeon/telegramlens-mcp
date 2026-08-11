@@ -91,17 +91,29 @@ def compute_health(status: dict | None, lock_held: bool, interval_min: int | Non
         # 다만 마지막으로 살아있었을 때 이미 반복 실패가 누적돼 있었다면(단순 종료가
         # 아니라 문제가 있었을 가능성) 그 사실만 부드럽게 알려준다 — 복구 버튼은 안
         # 띄운다(지금 당장 고칠 대상이 없다).
+        # "정상입니다"만으로는 부족하다. 사람들이 진짜로 걱정하는 건 "그럼 꺼둔 동안
+        # 온 메시지는 못 보는 건가"인데, 그 답이 어디에도 없었다(만든 사람도 헷갈렸다).
+        # 실제로는 다시 켤 때 공백을 감지해 수집 창을 그만큼 늘려 메운다
+        # (daemon._catchup_window, --max-window 기본 10080분 = 7일). 그 사실을 같이
+        # 말해줘야 "지금 꺼져 있음"이 손실로 읽히지 않는다.
+        catchup = "꺼져 있는 동안 올라온 메시지는 다시 열 때 최대 7일치까지 자동으로 메웁니다."
         consecutive = (status or {}).get("consecutive_failures") or 0
         if consecutive >= 3:
             return {
                 "health": "degraded",
                 "problem_code": None,
-                "message": f"데몬이 지금 꺼져 있습니다. 마지막 실행에서 연속 {consecutive}회 수집 실패가 있었습니다 — Claude를 열어 다시 확인해보세요.",
+                "message": (
+                    f"데몬이 지금 꺼져 있습니다. 마지막 실행에서 연속 {consecutive}회 수집 실패가 "
+                    f"있었습니다 — Claude를 열어 다시 확인해보세요. {catchup}"
+                ),
             }
         return {
             "health": "healthy",
             "problem_code": None,
-            "message": "데몬이 지금 실행 중이지 않습니다(Claude Desktop을 열어야 동작합니다 — 정상입니다).",
+            "message": (
+                "데몬이 지금 실행 중이지 않습니다(Claude Desktop을 열어야 동작합니다 — 정상입니다). "
+                + catchup
+            ),
         }
     if status is None:
         return {
