@@ -19,6 +19,7 @@ import json
 import os
 import sys
 import time
+from datetime import date, datetime, timedelta, timezone
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
@@ -64,6 +65,18 @@ REVOKED_MESSAGE = (
     "· 문의: osy980315@gmail.com"
 )
 
+# 기간이 끝난 키 전용 안내. LOCKED_MESSAGE("키를 넣으세요")도, REVOKED_MESSAGE
+# ("연락 주세요")도 여기엔 안 맞는다 — 이 사람은 잘 쓰다가 기간이 끝난 것이고,
+# 할 일은 구매다. 체험이 끝난 사람에게 가장 자주 보일 문구라 사과나 경고가 아니라
+# 다음 걸음을 적는다.
+EXPIRED_MESSAGE = (
+    "🔒 TelegramLens 사용 기간이 끝났습니다.\n"
+    "\n"
+    "계속 쓰시려면 라이선스를 구매하신 뒤 받으신 키로 활성화하세요:\n"
+    "    telegramlens-activate <라이선스-키>"
+    + _purchase_line()
+)
+
 _licensed_cache = False  # 한 번 유효하면 프로세스 동안 재검증 생략
 
 
@@ -85,6 +98,53 @@ def mask_tail(value: str, keep: int = 4) -> str:
     return "*" * 4 + v[-keep:]
 
 
+# 키 길이. 서명(64B) 앞에 붙는 payload 두 가지를 모두 받는다.
+#   기존(74B): 제품태그(4) + 라이선스ID(6)
+#   만료형(78B): 제품태그(4) + 라이선스ID(6) + 만료일(4)
+# 이미 발급한 키를 무효화하지 않으려고 둘 다 유효하게 둔다 — 체험판·구독처럼 기간이
+# 있는 키만 뒤쪽 형태로 발급하면 된다.
+_SIG_LEN = 64
+_PAYLOAD_LEN = 10
+_PAYLOAD_LEN_WITH_EXPIRY = 14
+
+# 만료일은 1970-01-01(UTC)부터의 '일수'를 4바이트 빅엔디언으로 담는다. 시각이 아니라
+# 날짜인 이유: 시:분까지 따지면 시간대가 다른 사용자에게 "오늘까진 줄 알았는데" 하는
+# 억울함이 생긴다. 그 날짜의 끝(UTC 자정)까지 유효한 것으로 본다.
+_EXPIRY_EPOCH = date(1970, 1, 1)
+
+
+def _expiry_from_payload(payload: bytes) -> date | None:
+    """payload에서 만료일을 꺼낸다. 만료가 없는 기존 키면 None."""
+    if len(payload) < _PAYLOAD_LEN_WITH_EXPIRY:
+        return None
+    days = int.from_bytes(payload[10:14], "big")
+    try:
+        return _EXPIRY_EPOCH + timedelta(days=days)
+    except OverflowError:
+        return None
+
+
+def expires_on() -> date | None:
+    """지금 저장된 키의 만료일. 기간 없는 키(기존 구매자)면 None."""
+    k = stored_key()
+    if not k:
+        return None
+    return verify_key(k).get("expires_on")
+
+
+def _is_expired(expiry: "date | None") -> bool:
+    """그 날짜가 지났는가. 만료가 없으면 언제나 False.
+
+    비교는 UTC 날짜로 한다 — 로컬 시간대로 하면 같은 키가 나라마다 하루씩 다르게
+    끝난다. 시계를 되돌리면 더 쓸 수 있다는 건 알고 있다(오프라인 검증의 한계) —
+    거기까지 막으려면 상태 파일이 하나 더 필요한데, 잘못 걸리면 멀쩡한 체험 사용자를
+    잠그게 되어 얻는 것보다 잃는 게 크다고 봤다.
+    """
+    if expiry is None:
+        return False
+    return datetime.now(timezone.utc).date() > expiry
+
+
 def verify_key(key_str: str) -> dict:
     """키 문자열이 '판매자가 서명한 이 제품의 진짜 키'인지 검증."""
     try:
@@ -95,14 +155,20 @@ def verify_key(key_str: str) -> dict:
         raw = _decode(key_str)
     except Exception:
         return {"valid": False, "reason": "형식 오류(깨진 키)"}
-    if len(raw) != 74 or raw[:4] != PRODUCT:
+    payload_len = len(raw) - _SIG_LEN
+    if payload_len not in (_PAYLOAD_LEN, _PAYLOAD_LEN_WITH_EXPIRY) or raw[:4] != PRODUCT:
         return {"valid": False, "reason": "이 제품의 키가 아님"}
-    payload, sig = raw[:10], raw[10:]
+    payload, sig = raw[:payload_len], raw[payload_len:]
     try:
         pub.verify(sig, payload)
     except InvalidSignature:
         return {"valid": False, "reason": "서명 불일치(위조/변조)"}
-    return {"valid": True, "license_id": payload[4:].hex()}
+    # 만료일은 서명 안에 들어 있다 — 고쳐 쓰면 서명이 깨지므로 위 검증에서 걸린다.
+    return {
+        "valid": True,
+        "license_id": payload[4:10].hex(),
+        "expires_on": _expiry_from_payload(payload),
+    }
 
 
 def stored_key() -> str | None:
@@ -206,13 +272,20 @@ def license_block_reason():
     res = verify_key(k)
     if not res["valid"]:
         return "invalid"
+    if _is_expired(res.get("expires_on")):
+        return "expired"
     if is_revoked(res.get("license_id", "")):
         return "revoked"
     return None
 
 
 def locked_message() -> str:
-    return REVOKED_MESSAGE if license_block_reason() == "revoked" else LOCKED_MESSAGE
+    reason = license_block_reason()
+    if reason == "revoked":
+        return REVOKED_MESSAGE
+    if reason == "expired":
+        return EXPIRED_MESSAGE
+    return LOCKED_MESSAGE
 
 
 def is_licensed() -> bool:
@@ -225,8 +298,14 @@ def is_licensed() -> bool:
     res = verify_key(k)
     if not res["valid"]:
         return False
+    if _is_expired(res.get("expires_on")):
+        return False
     if is_revoked(res.get("license_id", "")):
         return False  # 폐기된 키는 캐시하지 않는다 — 목록에서 빠지면 곧바로 다시 풀려야 한다
+    if res.get("expires_on") is not None:
+        # 기간이 있는 키는 캐시하지 않는다. 캐시하면 서버가 떠 있는 동안(Claude를
+        # 켜둔 채 며칠)에는 만료가 지나도 계속 열린다.
+        return True
     _licensed_cache = True
     return True
 
