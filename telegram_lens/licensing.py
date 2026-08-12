@@ -77,6 +77,17 @@ EXPIRED_MESSAGE = (
     + _purchase_line()
 )
 
+# 컴퓨터 날짜가 과거로 돌아가 있을 때. 일부러 돌린 사람과 시계가 고장난 사람(메인보드
+# 배터리가 닳으면 실제로 이렇게 된다)을 우리는 구분할 수 없다 — 그래서 추궁하지 않고,
+# 두 경우 모두에게 맞는 한 가지 할 일만 적는다. "부정 사용"이라고 썼다가 배터리가
+# 닳은 정직한 사용자를 범인 취급하면 그 손해가 훨씬 크다.
+CLOCK_MESSAGE = (
+    "🔒 이 컴퓨터의 날짜가 실제보다 과거로 설정되어 있어 TelegramLens를 열 수 없습니다.\n"
+    "\n"
+    "날짜와 시간을 현재에 맞춘 뒤 다시 시도해주세요.\n"
+    "(Windows: 설정 → 시간 및 언어 / Mac: 시스템 설정 → 일반 → 날짜 및 시간)"
+)
+
 _licensed_cache = False  # 한 번 유효하면 프로세스 동안 재검증 생략
 
 
@@ -136,13 +147,61 @@ def _is_expired(expiry: "date | None") -> bool:
     """그 날짜가 지났는가. 만료가 없으면 언제나 False.
 
     비교는 UTC 날짜로 한다 — 로컬 시간대로 하면 같은 키가 나라마다 하루씩 다르게
-    끝난다. 시계를 되돌리면 더 쓸 수 있다는 건 알고 있다(오프라인 검증의 한계) —
-    거기까지 막으려면 상태 파일이 하나 더 필요한데, 잘못 걸리면 멀쩡한 체험 사용자를
-    잠그게 되어 얻는 것보다 잃는 게 크다고 봤다.
+    끝난다. 날짜를 과거로 돌려 만료를 피하는 건 _clock_turned_back 이 따로 본다.
     """
     if expiry is None:
         return False
     return datetime.now(timezone.utc).date() > expiry
+
+
+# 시계 되돌리기 감지 — 기간이 있는 키에서만 본다.
+#
+# 만료일 검사는 이 컴퓨터의 날짜를 믿는다. 날짜를 과거로 돌리면 만료된 키가 다시
+# 열린다. 그래서 '지금까지 본 가장 늦은 날짜'를 적어두고, 오늘이 그보다 한참 이르면
+# 되돌린 것으로 본다.
+#
+# 관대하게 잡는 이유: 잘못 걸리면 멀쩡한 사용자가 잠긴다. NTP 보정·시간대 착오처럼
+# 하루 안팎으로 뒤로 가는 일은 정상이므로 그만큼은 봐준다. 되돌린 만큼이 누적되므로
+# (기록은 앞으로만 간다) 이 여유를 조금씩 나눠 써서 무한히 미룰 수는 없다.
+#
+# 완벽한 방어는 아니다 — 이 파일을 지우면 기준이 사라진다. 목표는 '날짜만 바꾸면
+# 되는' 수준을 넘기는 것이지, 작정한 사람을 막는 게 아니다(로컬 검증의 한계).
+_CLOCK_TOLERANCE_DAYS = 2
+
+
+def _clock_seen_path():
+    # 이 Lens는 _home()이 아니라 config.data_dir()을 쓴다(license.key와 같은 자리).
+    return data_dir() / "clock_seen"
+
+
+def _clock_turned_back(expiry: "date | None") -> bool:
+    """날짜가 과거로 돌아가 있으면 True. 기간 없는 키면 언제나 False.
+
+    읽거나 쓰지 못하면 막지 않는다 — 상태 파일 하나 때문에 돈 낸 사람이 잠기는 쪽이
+    훨씬 나쁘다(폐기 목록의 '모르면 통과'와 같은 원칙).
+    """
+    if expiry is None:
+        return False
+    today = datetime.now(timezone.utc).date()
+
+    seen = None
+    try:
+        seen = date.fromisoformat(_clock_seen_path().read_text(encoding="utf-8").strip())
+    except Exception:
+        seen = None
+
+    if seen is not None and today < seen - timedelta(days=_CLOCK_TOLERANCE_DAYS):
+        return True
+
+    # 기록은 앞으로만 간다. 뒤로 가면 되돌린 사람이 기준선을 낮춰버릴 수 있다.
+    if seen is None or today > seen:
+        try:
+            path = _clock_seen_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(today.isoformat(), encoding="utf-8")
+        except OSError:
+            pass
+    return False
 
 
 def verify_key(key_str: str) -> dict:
@@ -274,6 +333,8 @@ def license_block_reason():
         return "invalid"
     if _is_expired(res.get("expires_on")):
         return "expired"
+    if _clock_turned_back(res.get("expires_on")):
+        return "clock"
     if is_revoked(res.get("license_id", "")):
         return "revoked"
     return None
@@ -285,6 +346,8 @@ def locked_message() -> str:
         return REVOKED_MESSAGE
     if reason == "expired":
         return EXPIRED_MESSAGE
+    if reason == "clock":
+        return CLOCK_MESSAGE
     return LOCKED_MESSAGE
 
 
@@ -299,6 +362,8 @@ def is_licensed() -> bool:
     if not res["valid"]:
         return False
     if _is_expired(res.get("expires_on")):
+        return False
+    if _clock_turned_back(res.get("expires_on")):
         return False
     if is_revoked(res.get("license_id", "")):
         return False  # 폐기된 키는 캐시하지 않는다 — 목록에서 빠지면 곧바로 다시 풀려야 한다

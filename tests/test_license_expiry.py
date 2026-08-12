@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import secrets
 from datetime import date, timedelta
+from pathlib import Path
 
 import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -130,3 +131,71 @@ class TestGate:
     def test_expires_on_is_none_without_a_key(self, monkeypatch):
         monkeypatch.setattr(L, "stored_key", lambda: None)
         assert L.expires_on() is None
+
+
+class TestClockRollback:
+    """만료 검사는 이 컴퓨터의 날짜를 믿는다 — 날짜만 과거로 돌리면 만료된 키가 다시
+    열린다. '지금까지 본 가장 늦은 날짜'를 적어두고 그보다 한참 이르면 막는다."""
+
+    @pytest.fixture(autouse=True)
+    def _isolated_home(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(L, "data_dir", lambda: tmp_path)
+
+    def _shift(self, monkeypatch, days: int) -> None:
+        import datetime as _dt
+
+        class Shifted(_dt.datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return _dt.datetime.now(tz) + _dt.timedelta(days=days)
+
+        monkeypatch.setattr(L, "datetime", Shifted)
+
+    def test_first_check_records_today_and_allows(self, tmp_path):
+        assert L._clock_turned_back(date.today() + timedelta(days=5)) is False
+        assert (tmp_path / "clock_seen").read_text(encoding="utf-8") == date.today().isoformat()
+
+    def test_small_backward_drift_is_tolerated(self, monkeypatch):
+        """NTP 보정·시간대 착오로 하루쯤 뒤로 가는 건 정상이다 — 여기서 잠그면
+        멀쩡한 사용자가 갇힌다."""
+        expiry = date.today() + timedelta(days=5)
+        L._clock_turned_back(expiry)
+        self._shift(monkeypatch, -1)
+        assert L._clock_turned_back(expiry) is False
+
+    def test_large_rollback_is_caught(self, monkeypatch):
+        expiry = date.today() + timedelta(days=5)
+        L._clock_turned_back(expiry)
+        self._shift(monkeypatch, -5)
+        assert L._clock_turned_back(expiry) is True
+
+    def test_permanent_key_is_never_checked(self, monkeypatch):
+        """기존 구매자는 이 경로를 아예 안 탄다 — 시계가 어떻든 영향이 없어야 한다."""
+        self._shift(monkeypatch, -400)
+        assert L._clock_turned_back(None) is False
+
+    def test_baseline_only_moves_forward(self, tmp_path, monkeypatch):
+        """뒤로도 기록하면 되돌린 사람이 기준선을 낮춰 계속 미룰 수 있다."""
+        expiry = date.today() + timedelta(days=5)
+        L._clock_turned_back(expiry)
+        self._shift(monkeypatch, -1)
+        L._clock_turned_back(expiry)
+        assert (tmp_path / "clock_seen").read_text(encoding="utf-8") == date.today().isoformat()
+
+    def test_unwritable_state_never_locks(self, monkeypatch):
+        """상태 파일 하나 때문에 돈 낸 사람이 잠기는 쪽이 훨씬 나쁘다."""
+        monkeypatch.setattr(L, "data_dir", lambda: Path("/존재하지-않는-경로/xyz"))
+        self._shift(monkeypatch, -400)
+        assert L._clock_turned_back(date.today() + timedelta(days=5)) is False
+
+    def test_gate_reports_clock_reason(self, signer, monkeypatch):
+        """만료와 다른 사유여야 한다 — 할 일이 '구매'가 아니라 '시계 맞추기'다."""
+        key = signer(date.today() + timedelta(days=5))
+        monkeypatch.setattr(L, "stored_key", lambda: key)
+        monkeypatch.setattr(L, "is_revoked", lambda _lid: False)
+        monkeypatch.setattr(L, "_licensed_cache", False)
+        L._clock_turned_back(date.today() + timedelta(days=5))
+        self._shift(monkeypatch, -5)
+        assert L.is_licensed() is False
+        assert L.license_block_reason() == "clock"
+        assert L.locked_message() == L.CLOCK_MESSAGE
