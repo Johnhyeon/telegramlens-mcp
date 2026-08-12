@@ -450,6 +450,17 @@ def license_summary() -> dict:
     if not res["valid"]:
         return {"status": "invalid", "license_id_masked": None}
 
+    # 키는 진짜지만 지금 못 쓰는 경우(기간 종료·폐기·시계 되돌림)를 그대로 드러낸다 —
+    # 예전엔 전부 "active"라 도구는 잠겼는데 Manager는 정상이라고 말했다.
+    _blocked = licensing.license_block_reason()
+    if _blocked in ("expired", "revoked", "clock"):
+        _expiry = res.get("expires_on")
+        return {
+            "status": _blocked,
+            "license_id_masked": licensing.mask_tail((res.get("license_id") or "").upper()) or None,
+            "expires_on": _expiry.isoformat() if _expiry else None,
+        }
+
     license_id = res.get("license_id") or ""
     masked = licensing.mask_tail(license_id.upper()) if license_id else None
     return {"status": "active", "license_id_masked": masked}
@@ -465,6 +476,16 @@ def check_license() -> Check:
         return c
 
     summary = license_summary()
+    if summary["status"] in ("expired", "revoked", "clock"):
+        c.fail(
+            {
+                "expired": "License has expired",
+                "revoked": "License has been revoked",
+                "clock": "System clock is set in the past",
+            }[summary["status"]],
+            fix="telegramlens-activate <라이선스-키>" if summary["status"] == "expired" else None,
+        )
+        return c
     if summary["status"] == "missing":
         c.fail(
             "No license key found (env or license.key)",
