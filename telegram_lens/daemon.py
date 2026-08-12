@@ -162,6 +162,10 @@ def spawn_child(interval: int = 10):
     """
     if is_alive():
         return None
+    # 라이선스가 끝났으면 애초에 띄우지 않는다 — 안 그러면 감시 루프가 60초마다
+    # 다시 살려서, 방금 스스로 멈춘 데몬이 계속 되살아난다.
+    if not _licensed():
+        return None
 
     import shutil
     import subprocess
@@ -700,6 +704,20 @@ async def _idle_listen(interval_min: int) -> None:
         await disconnect_safely(listener)
 
 
+def _licensed() -> bool:
+    """지금 라이선스가 유효한지. 판정 자체를 못 하면 True(막지 않는다).
+
+    체험이 끝났는데 수집만 계속 도는 상태를 막으려고 둔다. 확인이 안 되는 상황
+    (모듈 import 실패 등)에서 멈춰버리면 돈 낸 사람의 수집이 조용히 죽는데, 그건
+    체험자가 며칠 더 모으는 것보다 훨씬 나쁘다 — 그래서 모르면 통과시킨다."""
+    try:
+        from telegram_lens.licensing import is_licensed
+
+        return is_licensed()
+    except Exception:
+        return True
+
+
 async def _loop(
     interval_min: int, min_window: int, max_window: int, per_channel_limit: int
 ) -> None:
@@ -729,6 +747,13 @@ async def _loop(
     beat_task = asyncio.create_task(_beat())
     try:
         while not _stop.is_set():
+            # 라이선스가 끝났으면 여기서 멈춘다. 도구는 잠겼는데 수집만 계속 돌면,
+            # 쓸 수도 없는 데이터를 위해 남의 PC 자원과 텔레그램 API를 계속 쓰는 셈이다.
+            # 판정은 전부 로컬(서명·만료)이고 폐기 목록은 "모르면 통과"라, 네트워크가
+            # 끊겼다고 돈 낸 사람이 멈추는 일은 없다.
+            if not _licensed():
+                _LOG.info("라이선스가 유효하지 않습니다 — 수집을 중단합니다.")
+                break
             catching_up = await _run_cycle(
                 status, interval_min, min_window, max_window, per_channel_limit
             )

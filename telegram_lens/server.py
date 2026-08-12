@@ -64,13 +64,24 @@ async def _lifespan(_server):
     # 켜진 동안 수집 신선도를 자가치유로 보장. 새 persistence 없이 부모-자식 관계 유지.
     state: dict = {"child": None, "tray": None, "tray_failures": 0}
 
+    def _licensed() -> bool:
+        """확인 자체가 안 되면 True — 돈 낸 사람의 수집이 조용히 죽는 게 더 나쁘다."""
+        try:
+            from telegram_lens.licensing import is_licensed
+
+            return is_licensed()
+        except Exception:
+            return True
+
     async def _supervise() -> None:
         while True:
             # 데몬과 트레이는 반드시 별도 try/except — 트레이 쪽(예: pystray import 실패)이
             # 죽어도 데몬 자동재기동(더 중요한 쪽)까지 같이 멈추면 안 된다. import 자체도
             # 루프 안 try 안에서 해서, import 시점 실패조차 watchdog 코루틴을 안 죽인다.
             try:
-                if is_logged_in():
+                # 라이선스가 끝나면 수집도 함께 멈춘다 — 데몬 자신도 스스로 서지만,
+                # 여기서 안 막으면 60초마다 다시 띄우려 든다.
+                if is_logged_in() and _licensed():
                     from telegram_lens.daemon import is_alive, spawn_child
 
                     if not is_alive():
@@ -85,7 +96,8 @@ async def _lifespan(_server):
                 # 트레이는 수집 상태를 '보여주기'만 하는 선택적 UI라, 데몬처럼 필수는
                 # 아니지만 같은 감시 주기로 같이 살아있게 한다(수동 실행 중이면 건너뜀 —
                 # tray.spawn() 이 자체 락으로 중복 아이콘을 막는다).
-                if is_logged_in() and state["tray_failures"] < _TRAY_MAX_FAILURES:
+                # 트레이는 수집 상태를 보여주는 물건이라, 수집이 멈추면 같이 내린다.
+                if is_logged_in() and _licensed() and state["tray_failures"] < _TRAY_MAX_FAILURES:
                     from telegram_lens import tray
 
                     if not tray.is_alive():

@@ -199,3 +199,45 @@ class TestClockRollback:
         assert L.is_licensed() is False
         assert L.license_block_reason() == "clock"
         assert L.locked_message() == L.CLOCK_MESSAGE
+
+
+class TestSaveKeyGate:
+    """저장 전에 '지금 쓸 수 있는 키인지'까지 본다. 예전엔 서명만 맞으면 저장하고
+    캐시를 켜버려서, 이미 끝난 체험 키를 다시 붙여넣으면 그 프로세스가 사는 동안
+    전부 열렸다 — 껐다 켜고 옛 키를 다시 넣으면 되는 우회였다."""
+
+    @pytest.fixture(autouse=True)
+    def _isolated(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(L, "data_dir", lambda: tmp_path)
+        monkeypatch.setattr(L, "is_revoked", lambda _lid: False)
+        monkeypatch.setattr(L, "_licensed_cache", False)
+
+    def test_expired_key_is_refused(self, signer):
+        res = L.save_key(signer(date.today() - timedelta(days=1)))
+        assert res["valid"] is False
+        assert "기간" in res["reason"]
+
+    def test_expired_key_does_not_turn_on_the_cache(self, signer):
+        L.save_key(signer(date.today() - timedelta(days=1)))
+        assert L._licensed_cache is False
+        assert L.is_licensed() is False
+
+    def test_revoked_key_is_refused(self, signer, monkeypatch):
+        monkeypatch.setattr(L, "is_revoked", lambda _lid: True)
+        res = L.save_key(signer())
+        assert res["valid"] is False
+        assert "중지" in res["reason"]
+
+    def test_live_trial_key_is_saved(self, signer):
+        res = L.save_key(signer(date.today() + timedelta(days=5)))
+        assert res["valid"] is True
+        assert L.is_licensed() is True
+
+    def test_permanent_key_is_saved(self, signer):
+        assert L.save_key(signer())["valid"] is True
+        assert L.is_licensed() is True
+
+    def test_cache_is_not_forced_on(self, signer):
+        """캐시는 켜지 않고 비운다 — 다음 is_licensed 가 만료·폐기까지 보고 정한다."""
+        L.save_key(signer(date.today() + timedelta(days=5)))
+        assert L._licensed_cache is False

@@ -376,14 +376,28 @@ def is_licensed() -> bool:
 
 
 def save_key(key_str: str) -> dict:
+    """키를 저장한다. 저장 전에 '지금 쓸 수 있는 키인지'까지 본다.
+
+    예전엔 서명만 맞으면 저장하고 곧바로 _licensed_cache 를 True 로 켰다. verify_key 는
+    만료를 안 보므로(그건 is_licensed 의 일이다), **이미 끝난 체험 키를 다시 붙여넣으면
+    그 프로세스가 사는 동안 전부 열렸다** — 껐다 켜고 옛 키를 다시 넣으면 되는 우회였다.
+    이제 기간이 끝났거나 중지된 키는 저장 자체를 거부하고, 캐시는 켜지 않고 비운다
+    (다음 is_licensed 가 파일을 다시 읽어 스스로 판정한다)."""
     res = verify_key(key_str)
     if not res["valid"]:
         return res
+
+    expiry = res.get("expires_on")
+    if _is_expired(expiry):
+        return {"valid": False, "reason": "사용 기간이 끝난 키입니다", "expires_on": expiry}
+    if is_revoked(res.get("license_id", "")):
+        return {"valid": False, "reason": "현재 사용이 중지된 키입니다"}
+
     p = _license_path()
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(key_str.strip(), encoding="utf-8")
     global _licensed_cache
-    _licensed_cache = True
+    _licensed_cache = False  # 다음 is_licensed 가 만료·폐기까지 보고 스스로 정한다
     return res
 
 
