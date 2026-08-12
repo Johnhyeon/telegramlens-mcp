@@ -207,13 +207,22 @@ def safe_tool(func):
         if not is_licensed():
             return locked_message()
         try:
-            return await func(*args, **kwargs)
+            result = await func(*args, **kwargs)
         except NoCredentialsError as e:
             return f"⚠️ {e}"
         except NotLoggedInError as e:
             return f"⚠️ {e}"
         except Exception as e:  # noqa: BLE001
             return f"⚠️ 처리 중 오류: {type(e).__name__}: {e}" + _support_hint()
+        # 새 버전이 나오면 Claude 응답 안에서 알린다 — 사람들은 Manager를 잘 안 열어서
+        # 거기에만 표시하면 옛 버전을 계속 쓰게 된다(StockLens·DartLens와 같은 동작).
+        try:
+            from telegram_lens._update_check import get_update_notice
+
+            notice = await get_update_notice()
+        except Exception:
+            notice = ""
+        return result + notice if (notice and isinstance(result, str)) else result
 
     return wrapper
 
