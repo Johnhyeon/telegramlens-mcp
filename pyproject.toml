@@ -1,6 +1,6 @@
 [project]
 name = "telegramlens-mcp"
-version = "0.4.22"
+version = "0.4.23"
 description = "TelegramLens — 텔레그램 채널의 종목 내러티브·언급 흐름을 구조화해 AI에게 전달하는 로컬 MCP 서버"
 readme = "README.md"
 license = { text = "Proprietary" }
@@ -27,6 +27,9 @@ dependencies = [
     "pystray>=0.19.5",
     "Pillow>=10.0",
     "tomlkit>=0.12",
+    # TLS 검증에 OS 인증서 저장소를 쓴다. 백신·회사망 프록시가 TLS를 가로채는 PC에서
+    # certifi 번들만 믿으면 CERTIFICATE_VERIFY_FAILED 로 죽는다(_tls.py 참고).
+    "truststore>=0.9",
 ]
 
 [project.scripts]

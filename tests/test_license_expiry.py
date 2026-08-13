@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import base64
 import secrets
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -11,6 +11,17 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from telegram_lens import licensing as L
 
 _EPOCH = date(1970, 1, 1)
+
+
+def _today() -> date:
+    """오늘 날짜를 UTC 로 센다.
+
+    제품 코드가 UTC 로 판단하기 때문이다(`licensing._is_expired`). 여기서만
+    `_today()`(로컬)를 쓰면 KST 00~09시에 하루가 어긋나 테스트가 깨진다.
+    CI(우분투, UTC)는 늘 통과하므로 로컬에서만, 그것도 아침에만 터진다 —
+    가장 알아채기 어려운 종류의 실패다.
+    """
+    return datetime.now(timezone.utc).date()
 
 
 @pytest.fixture
@@ -49,18 +60,18 @@ class TestBackwardCompatibility:
 
 class TestExpiringKey:
     def test_key_with_expiry_is_78_bytes(self, signer):
-        assert len(L._decode(signer(date.today()))) == 78
+        assert len(L._decode(signer(_today()))) == 78
 
     def test_expiry_round_trips(self, signer):
-        target = date.today() + timedelta(days=7)
+        target = _today() + timedelta(days=7)
         assert L.verify_key(signer(target))["expires_on"] == target
 
     def test_valid_until_the_end_of_the_expiry_day(self, signer):
         """"7일 체험"이 6일 반으로 끝나면 억울하다 — 그날까지는 열려 있어야 한다."""
-        assert L._is_expired(L.verify_key(signer(date.today()))["expires_on"]) is False
+        assert L._is_expired(L.verify_key(signer(_today()))["expires_on"]) is False
 
     def test_expired_the_day_after(self, signer):
-        yesterday = date.today() - timedelta(days=1)
+        yesterday = _today() - timedelta(days=1)
         assert L._is_expired(L.verify_key(signer(yesterday))["expires_on"]) is True
 
 
@@ -69,14 +80,14 @@ class TestTampering:
     이게 안 되면 체험판을 아무나 영구 키로 바꿀 수 있다."""
 
     def test_extending_the_expiry_breaks_the_signature(self, signer):
-        raw = bytearray(L._decode(signer(date.today() - timedelta(days=1))))
-        raw[10:14] = ((date.today() + timedelta(days=365) - _EPOCH).days).to_bytes(4, "big")
+        raw = bytearray(L._decode(signer(_today() - timedelta(days=1))))
+        raw[10:14] = ((_today() + timedelta(days=365) - _EPOCH).days).to_bytes(4, "big")
         forged = base64.b32encode(bytes(raw)).decode().rstrip("=")
         assert L.verify_key(forged)["valid"] is False
 
     def test_stripping_the_expiry_breaks_the_signature(self, signer):
         """만료 4바이트를 떼어내 74바이트 영구 키처럼 만들 수 없어야 한다."""
-        raw = L._decode(signer(date.today() - timedelta(days=1)))
+        raw = L._decode(signer(_today() - timedelta(days=1)))
         stripped = raw[:10] + raw[14:]
         forged = base64.b32encode(stripped).decode().rstrip("=")
         assert L.verify_key(forged)["valid"] is False
@@ -98,22 +109,22 @@ class TestGate:
         monkeypatch.setattr(L, "_licensed_cache", False)
 
     def test_expired_key_locks(self, signer, monkeypatch):
-        self._use(monkeypatch, signer(date.today() - timedelta(days=1)))
+        self._use(monkeypatch, signer(_today() - timedelta(days=1)))
         assert L.is_licensed() is False
         assert L.license_block_reason() == "expired"
 
     def test_live_trial_key_unlocks(self, signer, monkeypatch):
-        self._use(monkeypatch, signer(date.today() + timedelta(days=3)))
+        self._use(monkeypatch, signer(_today() + timedelta(days=3)))
         assert L.is_licensed() is True
         assert L.license_block_reason() is None
 
     def test_expired_message_is_used(self, signer, monkeypatch):
-        self._use(monkeypatch, signer(date.today() - timedelta(days=1)))
+        self._use(monkeypatch, signer(_today() - timedelta(days=1)))
         assert L.locked_message() == L.EXPIRED_MESSAGE
 
     def test_expiring_key_is_not_cached(self, signer, monkeypatch):
         """캐시하면 Claude를 켜둔 채로 며칠 지나도 안 잠긴다 — 서버가 오래 산다."""
-        self._use(monkeypatch, signer(date.today() + timedelta(days=3)))
+        self._use(monkeypatch, signer(_today() + timedelta(days=3)))
         assert L.is_licensed() is True
         assert L._licensed_cache is False
 
@@ -124,7 +135,7 @@ class TestGate:
         assert L._licensed_cache is True
 
     def test_expires_on_reports_the_stored_key(self, signer, monkeypatch):
-        target = date.today() + timedelta(days=5)
+        target = _today() + timedelta(days=5)
         monkeypatch.setattr(L, "stored_key", lambda: signer(target))
         assert L.expires_on() == target
 
@@ -152,19 +163,19 @@ class TestClockRollback:
         monkeypatch.setattr(L, "datetime", Shifted)
 
     def test_first_check_records_today_and_allows(self, tmp_path):
-        assert L._clock_turned_back(date.today() + timedelta(days=5)) is False
-        assert (tmp_path / "clock_seen").read_text(encoding="utf-8") == date.today().isoformat()
+        assert L._clock_turned_back(_today() + timedelta(days=5)) is False
+        assert (tmp_path / "clock_seen").read_text(encoding="utf-8") == _today().isoformat()
 
     def test_small_backward_drift_is_tolerated(self, monkeypatch):
         """NTP 보정·시간대 착오로 하루쯤 뒤로 가는 건 정상이다 — 여기서 잠그면
         멀쩡한 사용자가 갇힌다."""
-        expiry = date.today() + timedelta(days=5)
+        expiry = _today() + timedelta(days=5)
         L._clock_turned_back(expiry)
         self._shift(monkeypatch, -1)
         assert L._clock_turned_back(expiry) is False
 
     def test_large_rollback_is_caught(self, monkeypatch):
-        expiry = date.today() + timedelta(days=5)
+        expiry = _today() + timedelta(days=5)
         L._clock_turned_back(expiry)
         self._shift(monkeypatch, -5)
         assert L._clock_turned_back(expiry) is True
@@ -176,25 +187,25 @@ class TestClockRollback:
 
     def test_baseline_only_moves_forward(self, tmp_path, monkeypatch):
         """뒤로도 기록하면 되돌린 사람이 기준선을 낮춰 계속 미룰 수 있다."""
-        expiry = date.today() + timedelta(days=5)
+        expiry = _today() + timedelta(days=5)
         L._clock_turned_back(expiry)
         self._shift(monkeypatch, -1)
         L._clock_turned_back(expiry)
-        assert (tmp_path / "clock_seen").read_text(encoding="utf-8") == date.today().isoformat()
+        assert (tmp_path / "clock_seen").read_text(encoding="utf-8") == _today().isoformat()
 
     def test_unwritable_state_never_locks(self, monkeypatch):
         """상태 파일 하나 때문에 돈 낸 사람이 잠기는 쪽이 훨씬 나쁘다."""
         monkeypatch.setattr(L, "data_dir", lambda: Path("/존재하지-않는-경로/xyz"))
         self._shift(monkeypatch, -400)
-        assert L._clock_turned_back(date.today() + timedelta(days=5)) is False
+        assert L._clock_turned_back(_today() + timedelta(days=5)) is False
 
     def test_gate_reports_clock_reason(self, signer, monkeypatch):
         """만료와 다른 사유여야 한다 — 할 일이 '구매'가 아니라 '시계 맞추기'다."""
-        key = signer(date.today() + timedelta(days=5))
+        key = signer(_today() + timedelta(days=5))
         monkeypatch.setattr(L, "stored_key", lambda: key)
         monkeypatch.setattr(L, "is_revoked", lambda _lid: False)
         monkeypatch.setattr(L, "_licensed_cache", False)
-        L._clock_turned_back(date.today() + timedelta(days=5))
+        L._clock_turned_back(_today() + timedelta(days=5))
         self._shift(monkeypatch, -5)
         assert L.is_licensed() is False
         assert L.license_block_reason() == "clock"
@@ -213,12 +224,12 @@ class TestSaveKeyGate:
         monkeypatch.setattr(L, "_licensed_cache", False)
 
     def test_expired_key_is_refused(self, signer):
-        res = L.save_key(signer(date.today() - timedelta(days=1)))
+        res = L.save_key(signer(_today() - timedelta(days=1)))
         assert res["valid"] is False
         assert "기간" in res["reason"]
 
     def test_expired_key_does_not_turn_on_the_cache(self, signer):
-        L.save_key(signer(date.today() - timedelta(days=1)))
+        L.save_key(signer(_today() - timedelta(days=1)))
         assert L._licensed_cache is False
         assert L.is_licensed() is False
 
@@ -229,7 +240,7 @@ class TestSaveKeyGate:
         assert "중지" in res["reason"]
 
     def test_live_trial_key_is_saved(self, signer):
-        res = L.save_key(signer(date.today() + timedelta(days=5)))
+        res = L.save_key(signer(_today() + timedelta(days=5)))
         assert res["valid"] is True
         assert L.is_licensed() is True
 
@@ -239,5 +250,5 @@ class TestSaveKeyGate:
 
     def test_cache_is_not_forced_on(self, signer):
         """캐시는 켜지 않고 비운다 — 다음 is_licensed 가 만료·폐기까지 보고 정한다."""
-        L.save_key(signer(date.today() + timedelta(days=5)))
+        L.save_key(signer(_today() + timedelta(days=5)))
         assert L._licensed_cache is False

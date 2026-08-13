@@ -16,7 +16,12 @@ import sys
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 
-from mcp.server.fastmcp import FastMCP
+# TLS 신뢰 기준(OS 인증서 저장소)을 httpx 를 쓰는 무엇보다 먼저 세운다.
+from telegram_lens import _tls as _tls_bootstrap
+
+_tls_bootstrap.apply()
+
+from mcp.server.fastmcp import FastMCP  # noqa: E402
 
 from telegram_lens import db, discover, market_clock, queries
 from telegram_lens.classify import run_classification

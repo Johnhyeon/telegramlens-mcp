@@ -3,7 +3,7 @@ from __future__ import annotations
 import base64
 import secrets
 import sys
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -13,6 +13,12 @@ from telegram_lens import daemon as D
 from telegram_lens import licensing as L
 
 _EPOCH = date(1970, 1, 1)
+
+
+def _today() -> date:
+    """오늘 날짜를 UTC 로 센다 — 제품 코드가 UTC 로 판단하기 때문이다.
+    로컬 날짜를 쓰면 KST 00~09시에만 하루가 어긋나 아침에만 깨진다."""
+    return datetime.now(timezone.utc).date()
 
 
 @pytest.fixture
@@ -29,7 +35,7 @@ def key(tmp_path, monkeypatch):
     def use(days_left: int | None) -> None:
         payload = L.PRODUCT + secrets.token_bytes(6)
         if days_left is not None:
-            expiry = date.today() + timedelta(days=days_left)
+            expiry = _today() + timedelta(days=days_left)
             payload += ((expiry - _EPOCH).days).to_bytes(4, "big")
         raw = payload + priv.sign(payload)
         monkeypatch.setattr(L, "stored_key", lambda: base64.b32encode(raw).decode().rstrip("="))
