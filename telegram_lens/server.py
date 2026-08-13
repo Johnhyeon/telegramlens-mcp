@@ -198,6 +198,29 @@ def _support_hint() -> str:
     return hint
 
 
+_QUERY_RE = re.compile(r"\?[^\s'\"]*")
+_CAUSE_MAX = 160
+
+
+def _cause_text(exc: Exception) -> str:
+    """예외 메시지를 사용자에게 보여줄 수 있는 형태로. 없으면 예외 타입 이름.
+
+    StockLens·DartLens와 같은 규칙으로 둔다 — 세 Lens의 오류 문구가 제각각이면
+    같은 증상을 문의받고도 매번 다르게 읽어야 한다.
+
+    쿼리스트링을 지우는 것과 길이를 자르는 것 두 가지를 한다. 이 문자열은 화면에
+    뜨고 로그에 남고 지원 번들로 밖에 나가므로, 예외에 실려 온 것을 그대로
+    통과시키지 않는다.
+    """
+    msg = str(exc).strip()
+    if not msg:
+        return type(exc).__name__
+    msg = _QUERY_RE.sub("?…", msg)
+    if len(msg) > _CAUSE_MAX:
+        msg = msg[:_CAUSE_MAX] + "…"
+    return f"{type(exc).__name__}: {msg}"
+
+
 def safe_tool(func):
     """예외를 사용자 친화 메시지로 변환. 아울러 라이선스 게이트를 적용한다 —
     모든 도구가 이 래퍼를 거치므로, 미활성화 시 조회 없이 안내 메시지를 반환한다."""
@@ -213,7 +236,7 @@ def safe_tool(func):
         except NotLoggedInError as e:
             return f"⚠️ {e}"
         except Exception as e:  # noqa: BLE001
-            return f"⚠️ 처리 중 오류: {type(e).__name__}: {e}" + _support_hint()
+            return f"⚠️ 처리 중 오류: {_cause_text(e)}" + _support_hint()
         # 새 버전이 나오면 Claude 응답 안에서 알린다 — 사람들은 Manager를 잘 안 열어서
         # 거기에만 표시하면 옛 버전을 계속 쓰게 된다(StockLens·DartLens와 같은 동작).
         try:
