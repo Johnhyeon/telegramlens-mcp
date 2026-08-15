@@ -25,6 +25,7 @@ from mcp.server.fastmcp import FastMCP  # noqa: E402
 
 from telegram_lens import db, discover, market_clock, queries
 from telegram_lens.classify import run_classification
+from telegram_lens._metrics import track_metrics
 from telegram_lens.config import data_dir, is_logged_in, secure_data_files
 from telegram_lens.client import NoCredentialsError, NotLoggedInError
 from telegram_lens.licensing import is_licensed, locked_message
@@ -385,6 +386,7 @@ trending·momentum 결과의 수치는 '무엇이 얼마나 언급됐나'(빈도
 
 @mcp.tool()
 @safe_tool
+@track_metrics("telegram_status")
 async def telegram_status() -> str:
     """로그인·수집 상태와 백그라운드 수집 데몬 상태를 반환합니다.
 
@@ -500,6 +502,7 @@ async def telegram_status() -> str:
 
 @mcp.tool()
 @safe_tool
+@track_metrics("telegram_collect_history")
 async def telegram_collect_history(days: int = 7) -> str:
     """더 오래된 과거 데이터를 소급 수집하도록 백그라운드 데몬에 요청합니다.
 
@@ -533,6 +536,7 @@ async def telegram_collect_history(days: int = 7) -> str:
 
 @mcp.tool()
 @safe_tool
+@track_metrics("telegram_dismiss_backfill")
 async def telegram_dismiss_backfill() -> str:
     """과거 데이터 추가 수집 제안을 거절(제안 플래그 제거)합니다."""
     try:
@@ -544,6 +548,7 @@ async def telegram_dismiss_backfill() -> str:
 
 @mcp.tool()
 @safe_tool
+@track_metrics("telegram_send_me")
 async def telegram_send_me(messages: list[str]) -> str:
     """데일리 브리핑 등을 사용자 본인 텔레그램 'Saved Messages(나에게)'로 전송합니다.
 
@@ -619,6 +624,7 @@ async def telegram_send_me(messages: list[str]) -> str:
 
 @mcp.tool()
 @safe_tool
+@track_metrics("telegram_sync")
 async def telegram_sync(minutes: int = 60, per_channel_limit: int = 500) -> str:
     """최근 N분간의 텔레그램 메시지를 수집·구조화해 로컬 DB에 저장합니다.
 
@@ -654,6 +660,7 @@ async def telegram_sync(minutes: int = 60, per_channel_limit: int = 500) -> str:
 @mcp.tool()
 @safe_tool
 @warn_if_collecting
+@track_metrics("telegram_trending")
 async def telegram_trending(hours: float = 24, top: int = 20, kind: str = "all") -> str:
     """기간 내 텔레그램 언급량 상위 종목을 반환합니다.
 
@@ -670,6 +677,7 @@ async def telegram_trending(hours: float = 24, top: int = 20, kind: str = "all")
 @mcp.tool()
 @safe_tool
 @warn_if_collecting
+@track_metrics("telegram_momentum")
 async def telegram_momentum(
     hours: float = 6, baseline_hours: float = 72, top: int = 15, kind: str = "all"
 ) -> str:
@@ -1015,6 +1023,7 @@ def _briefing_session(krx: dict) -> str:
 @mcp.tool()
 @safe_tool
 @warn_if_collecting
+@track_metrics("telegram_briefing")
 async def telegram_briefing(hours: float = 12) -> str:
     """'오늘 브리핑 / 장전 / (텔레그램) 시황 / 시장 브리핑' 등을 요청받으면 호출하세요.
 
@@ -1084,6 +1093,7 @@ def _resolve_code(query: str) -> tuple[str | None, str]:
 @mcp.tool()
 @safe_tool
 @warn_if_collecting
+@track_metrics("telegram_watchlist")
 async def telegram_watchlist(hours: float = 24) -> str:
     """'내 종목/보유 종목'이 텔레그램에서 어떻게 거론되는지 — 언급 원문·요약 근거를 반환합니다.
 
@@ -1115,6 +1125,7 @@ async def telegram_watchlist(hours: float = 24) -> str:
 @mcp.tool()
 @safe_tool
 @warn_if_collecting
+@track_metrics("telegram_velocity")
 async def telegram_velocity(
     query: str | None = None,
     bucket_minutes: int = 30,
@@ -1155,6 +1166,7 @@ async def telegram_velocity(
 @mcp.tool()
 @safe_tool
 @warn_if_collecting
+@track_metrics("telegram_timeline")
 async def telegram_timeline(
     query: str, hours: float = 72, bucket_minutes: int = 60
 ) -> str:
@@ -1187,6 +1199,7 @@ async def telegram_timeline(
 @mcp.tool()
 @safe_tool
 @warn_if_collecting
+@track_metrics("telegram_buzz_score")
 async def telegram_buzz_score(
     window_hours: float = 24,
     only_types: list[str] | None = None,
@@ -1224,6 +1237,7 @@ async def telegram_buzz_score(
 @mcp.tool()
 @safe_tool
 @warn_if_collecting
+@track_metrics("telegram_stock_buzz")
 async def telegram_stock_buzz(query: str, hours: float = 24, samples: int = 8) -> str:
     """특정 종목의 텔레그램 언급 요약과 원문 샘플을 반환합니다.
 
@@ -1258,6 +1272,7 @@ async def telegram_stock_buzz(query: str, hours: float = 24, samples: int = 8) -
 @mcp.tool()
 @safe_tool
 @warn_if_collecting
+@track_metrics("telegram_messages")
 async def telegram_messages(
     channel: str | None = None, hours: float = 6, limit: int = 30
 ) -> str:
@@ -1274,6 +1289,7 @@ async def telegram_messages(
 @mcp.tool()
 @safe_tool
 @warn_if_collecting
+@track_metrics("telegram_search")
 async def telegram_search(
     query: str, hours: float = 72, limit: int = 30, channel: str | None = None
 ) -> str:
@@ -1295,6 +1311,7 @@ async def telegram_search(
 
 @mcp.tool()
 @safe_tool
+@track_metrics("telegram_classify_channels")
 async def telegram_classify_channels(
     sample: int = 80, threshold: float = 0.05, min_mentions: int = 3
 ) -> str:
@@ -1327,6 +1344,7 @@ async def telegram_classify_channels(
 
 @mcp.tool()
 @safe_tool
+@track_metrics("telegram_channels")
 async def telegram_channels() -> str:
     """수집된 채널 목록과 채널별 누적 메시지 수·tier(분류)·weight 를 반환합니다."""
     return _json({"channels": queries.channels()})
@@ -1337,6 +1355,7 @@ _VALID_TIERS = ("analyst", "research", "info", "gossip")
 
 @mcp.tool()
 @safe_tool
+@track_metrics("telegram_set_tier")
 async def telegram_set_tier(
     channel: str, tier: str, weight: float | None = None, note: str = ""
 ) -> str:
@@ -1388,6 +1407,7 @@ async def telegram_set_tier(
 
 @mcp.tool()
 @safe_tool
+@track_metrics("telegram_fp_candidates")
 async def telegram_fp_candidates(
     days: float = 7, max_name_len: int = 3, min_count: int = 3, top: int = 40
 ) -> str:
@@ -1411,6 +1431,7 @@ async def telegram_fp_candidates(
 
 @mcp.tool()
 @safe_tool
+@track_metrics("telegram_alias_candidates")
 async def telegram_alias_candidates(days: float = 7, min_count: int = 2, top: int = 40) -> str:
     """누락된 별칭 후보를 반환합니다.
 
@@ -1428,6 +1449,7 @@ async def telegram_alias_candidates(days: float = 7, min_count: int = 2, top: in
 
 @mcp.tool()
 @safe_tool
+@track_metrics("telegram_add_alias")
 async def telegram_add_alias(alias: str, code: str) -> str:
     """별칭을 사전에 등록합니다(통용어/약어 → 6자리 코드). 즉시 반영됩니다.
 
@@ -1442,6 +1464,7 @@ async def telegram_add_alias(alias: str, code: str) -> str:
 
 @mcp.tool()
 @safe_tool
+@track_metrics("telegram_block_name")
 async def telegram_block_name(code: str, note: str = "") -> str:
     """종목을 모호어 차단 목록에 추가합니다(이름 단독 매칭 차단, 코드 동반 시만 인정).
 

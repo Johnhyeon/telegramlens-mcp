@@ -269,8 +269,22 @@ def _check_config_file(label: str, config_path: Path, *, required: bool) -> Chec
     """단일 config 파일에 대한 점검. required=False면 부재 시 fail 대신 info."""
     c = Check(f"Config — {label}")
 
+    # Store 버전은 앱이 격리된 공간에서 돌아, 우리가 띄우는 프로세스도 그 안에 갇힌다.
+    # 그 자체가 고장은 아니고 실제로 잘 쓰는 사람도 있어서 막지는 않는다 — 다만 문제가
+    # 생겼을 때 원인 후보가 하나 더 붙는 환경이라, 진단에서는 눈에 띄게 알린다.
+    # info 로 찍으면 화면을 스쳐 지나가서, 정작 막힌 사람이 이 줄을 못 보고 넘어갔다.
     if "Packages" in str(config_path) and "LocalCache" in str(config_path):
-        c.info("Detected: Microsoft Store version (sandboxed path)")
+        c.warn(
+            "Microsoft Store 버전 Claude Desktop 을 쓰고 계십니다 (격리된 경로). "
+            "지금 잘 되신다면 그대로 쓰셔도 됩니다.",
+            fix=(
+                "문제가 있다면 일반 설치판을 권합니다: "
+                "① 설정 > 설치된 앱에서 Claude 제거 "
+                "② %LOCALAPPDATA%\\Packages 에서 Claude_* 폴더 삭제 "
+                "③ https://claude.ai/download 에서 설치 파일로 재설치 "
+                "(스토어 페이지 말고 이 주소에서 받으세요)"
+            ),
+        )
     c.info(f"Path:       {config_path}")
 
     if not config_path.exists():
@@ -454,7 +468,8 @@ def license_summary() -> dict:
     # 예전엔 전부 "active"라 도구는 잠겼는데 Manager는 정상이라고 말했다.
     _blocked = licensing.license_block_reason()
     if _blocked in ("expired", "revoked", "clock"):
-        _expiry = res.get("expires_on")
+        # 키에 박힌 날짜가 아니라 실제로 끝나는 날 — 매니저 배지가 이 값을 읽는다.
+        _expiry = licensing.effective_expiry(res)
         return {
             "status": _blocked,
             "license_id_masked": licensing.mask_tail((res.get("license_id") or "").upper()) or None,

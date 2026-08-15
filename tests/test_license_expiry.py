@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import json
 import secrets
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -40,6 +41,20 @@ def signer(monkeypatch):
         return base64.b32encode(raw).decode().rstrip("=")
 
     return mint
+
+
+@pytest.fixture(autouse=True)
+def _isolate_trial_marks(tmp_path, monkeypatch):
+    """체험 시작일은 두 곳에 적힌다. 한 곳은 Lens 폴더 밖(~/.leetkit)이라 _home 만
+    돌려놔서는 진짜 홈이 더럽혀진다 — 실제로 그렇게 당했다. 이 파일 전체에 건다."""
+    monkeypatch.setattr(
+        L,
+        "_trial_mark_paths",
+        lambda: [
+            tmp_path / "lens" / "trial_started.json",
+            tmp_path / "shared" / "trial_started.json",
+        ],
+    )
 
 
 class TestBackwardCompatibility:
@@ -102,6 +117,13 @@ class TestTampering:
 class TestGate:
     """잠금 판정과 안내 문구 — 기간이 끝난 사람에게 할 일은 재입력도 연락도 아니고
     구매다. 문구가 갈려야 그 사람이 헛수고를 안 한다."""
+
+    @pytest.fixture(autouse=True)
+    def _isolated_home(self, tmp_path, monkeypatch):
+        """이 클래스는 is_licensed/expires_on 을 부른다 — 둘 다 체험 시작일을 파일에
+        적는다. 홈을 안 돌려놓으면 테스트가 진짜 ~/.telegramlens 에 가짜 license_id 를
+        쌓는다(실제로 그랬다)."""
+        monkeypatch.setattr(L, "data_dir", lambda: tmp_path)
 
     def _use(self, monkeypatch, key: str) -> None:
         monkeypatch.setattr(L, "stored_key", lambda: key)
@@ -252,3 +274,164 @@ class TestSaveKeyGate:
         """캐시는 켜지 않고 비운다 — 다음 is_licensed 가 만료·폐기까지 보고 정한다."""
         L.save_key(signer(_today() + timedelta(days=5)))
         assert L._licensed_cache is False
+
+
+class TestActivationWindow:
+    """키에 박히는 만료일은 '만든 날 + N일'로 굳는다. 그대로 두면 미리 뽑아둔 키가
+    팔리기도 전에 기간이 흘러가서, 늦게 등록한 사람은 며칠만 쓴다. 그래서 키에는
+    넉넉한 만료일을 넣어두고 실제 기간은 '이 컴퓨터에서 처음 확인된 날'부터 센다."""
+
+    @pytest.fixture(autouse=True)
+    def _isolated(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(L, "data_dir", lambda: tmp_path)
+        monkeypatch.setattr(L, "is_revoked", lambda _lid: False)
+        monkeypatch.setattr(L, "_licensed_cache", False)
+
+    def test_window_starts_today_not_at_mint(self, signer):
+        """넉넉한 만료(120일)로 뽑아둔 키라도 실제로는 등록일부터 14일이다."""
+        res = L.verify_key(signer(_today() + timedelta(days=120)))
+        assert L.effective_expiry(res) == _today() + timedelta(days=L._TRIAL_WINDOW_DAYS)
+
+    def test_repasting_the_same_key_does_not_extend(self, signer):
+        """메일에 키가 그대로 남아 있다 — 다시 붙여넣어 기간을 늘릴 수 없어야 한다."""
+        key = signer(_today() + timedelta(days=120))
+        first = L.effective_expiry(L.verify_key(key))
+        self._shift_days(5)
+        try:
+            again = L.effective_expiry(L.verify_key(key))
+        finally:
+            self._unshift()
+        assert again == first
+
+    def test_signed_expiry_wins_when_it_comes_first(self, signer):
+        """창보다 키 만료가 빠르면 그쪽이 이긴다 — 이게 무한 체험을 막는 상한이다."""
+        soon = _today() + timedelta(days=3)
+        assert L.effective_expiry(L.verify_key(signer(soon))) == soon
+
+    def test_perpetual_key_has_no_window(self, signer):
+        """구매자 키(기간 없음)에는 창이 붙으면 안 된다 — 붙으면 산 사람이 잠긴다."""
+        assert L.effective_expiry(L.verify_key(signer())) is None
+
+    def test_each_key_gets_its_own_window(self, signer):
+        """지원 과정에서 키를 새로 발급하면 그 키는 새 창을 받아야 한다."""
+        far = _today() + timedelta(days=120)
+        L.effective_expiry(L.verify_key(signer(far)))
+        second = L.verify_key(signer(far))
+        assert L.effective_expiry(second) == _today() + timedelta(days=L._TRIAL_WINDOW_DAYS)
+
+    def test_unwritable_marker_falls_back_to_signed_date(self, signer, tmp_path, monkeypatch):
+        """상태 파일을 못 쓰면 잠그지 않는다 — 파일 하나 때문에 쓰던 사람이 갇히는
+        쪽이 훨씬 나쁘다.
+
+        '없는 경로'로는 이걸 못 만든다 — 없으면 그냥 만들어버리기 때문이다(윈도우에서
+        루트 경로가 드라이브 루트로 잡혀 실제로 폴더가 생겼다). 폴더 자리에 파일을
+        놓아 mkdir 이 확실히 실패하게 한다."""
+        blocked = tmp_path / "blocked"
+        blocked.write_text("나는 폴더가 아니다", encoding="utf-8")
+        monkeypatch.setattr(L, "_trial_mark_paths", lambda: [blocked / "a.json", blocked / "b.json"])
+        far = _today() + timedelta(days=120)
+        assert L.effective_expiry(L.verify_key(signer(far))) == far
+
+    def test_expired_window_locks_even_though_key_is_alive(self, signer, monkeypatch):
+        """키는 12월까지 살아 있어도, 창이 끝났으면 잠겨야 한다."""
+        key = signer(_today() + timedelta(days=120))
+        L.save_key(key)
+        assert L.is_licensed() is True
+        self._shift_days(L._TRIAL_WINDOW_DAYS + 1)
+        try:
+            monkeypatch.setattr(L, "_licensed_cache", False)
+            assert L.license_block_reason() == "expired"
+        finally:
+            self._unshift()
+
+    def test_expires_on_reports_the_window(self, signer):
+        """매니저 배지가 읽는 값 — 서명 날짜를 그대로 주면 '12월까지'라고 떴다가
+        9월에 잠긴다."""
+        L.save_key(signer(_today() + timedelta(days=120)))
+        assert L.expires_on() == _today() + timedelta(days=L._TRIAL_WINDOW_DAYS)
+
+    # ── 날짜 이동 도우미 ────────────────────────────────────────────────
+    def _shift_days(self, days: int) -> None:
+        import datetime as _dt
+
+        real = _dt.datetime
+
+        class Shifted(_dt.datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return real.now(tz) + _dt.timedelta(days=days)
+
+        self._real_datetime = L.datetime
+        L.datetime = Shifted
+
+    def _unshift(self) -> None:
+        L.datetime = self._real_datetime
+
+
+class TestTrialMarkRedundancy:
+    """시작일이 한 파일에만 있으면 그것만 지우고 다시 활성화해서 창을 새로 연다.
+    서로 다른 폴더 두 곳에 적고 더 이른 날짜를 쓴다 — 둘 다 찾아 지워야 열린다."""
+
+    @pytest.fixture(autouse=True)
+    def _paths(self, tmp_path, monkeypatch):
+        self.lens = tmp_path / "lens" / "trial_started.json"
+        self.shared = tmp_path / "shared" / "trial_started.json"
+        monkeypatch.setattr(L, "data_dir", lambda: tmp_path)
+        monkeypatch.setattr(L, "is_revoked", lambda _lid: False)
+
+    def test_start_is_written_to_both_places(self, signer):
+        L.effective_expiry(L.verify_key(signer(_today() + timedelta(days=30))))
+        assert self.lens.exists() and self.shared.exists()
+        assert json.loads(self.lens.read_text("utf-8")) == json.loads(self.shared.read_text("utf-8"))
+
+    def test_deleting_the_lens_folder_copy_does_not_reset(self, signer):
+        """~/.stocklens 를 통째로 지우고 다시 깔아도 창은 그대로여야 한다."""
+        key = signer(_today() + timedelta(days=30))
+        first = L.effective_expiry(L.verify_key(key))
+        self.lens.unlink()
+        assert L.effective_expiry(L.verify_key(key)) == first
+
+    def test_deleting_the_shared_copy_does_not_reset(self, signer):
+        key = signer(_today() + timedelta(days=30))
+        first = L.effective_expiry(L.verify_key(key))
+        self.shared.unlink()
+        assert L.effective_expiry(L.verify_key(key)) == first
+
+    def test_survivor_restores_the_deleted_one(self, signer):
+        """지워진 자리는 살아남은 값으로 되살아난다 — 한 번 지워봐야 소용없게."""
+        key = signer(_today() + timedelta(days=30))
+        L.effective_expiry(L.verify_key(key))
+        self.lens.unlink()
+        L.effective_expiry(L.verify_key(key))
+        assert self.lens.exists()
+
+    def test_erasing_both_starts_over(self, signer):
+        """정직하게 적어둔 한계 — 둘 다 지우면 열린다. 대신 키 만료일이 상한이다."""
+        key = signer(_today() + timedelta(days=30))
+        L.effective_expiry(L.verify_key(key))
+        self.lens.unlink()
+        self.shared.unlink()
+        assert L.effective_expiry(L.verify_key(key)) == _today() + timedelta(days=L._TRIAL_WINDOW_DAYS)
+
+    def test_earliest_date_wins(self, signer):
+        """한쪽을 늦은 날짜로 고쳐 써도 이른 쪽이 이긴다."""
+        key = signer(_today() + timedelta(days=30))
+        lid = L.verify_key(key)["license_id"]
+        L.effective_expiry(L.verify_key(key))
+        self.lens.write_text(
+            json.dumps({lid: (_today() + timedelta(days=10)).isoformat()}), encoding="utf-8"
+        )
+        assert L.effective_expiry(L.verify_key(key)) == _today() + timedelta(days=L._TRIAL_WINDOW_DAYS)
+
+    def test_one_unwritable_place_still_works(self, signer, tmp_path):
+        """한 자리가 막혀도 나머지로 굴러가야 한다 — 권한 문제로 잠기면 안 된다."""
+        blocked = tmp_path / "blocked"
+        blocked.write_text("나는 폴더가 아니다", encoding="utf-8")
+        L._trial_mark_paths = lambda: [blocked / "trial_started.json", self.shared]
+        try:
+            assert L.effective_expiry(L.verify_key(signer(_today() + timedelta(days=30)))) == _today() + timedelta(
+                days=L._TRIAL_WINDOW_DAYS
+            )
+            assert self.shared.exists()
+        finally:
+            del L._trial_mark_paths
