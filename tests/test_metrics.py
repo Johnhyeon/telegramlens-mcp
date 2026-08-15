@@ -77,23 +77,21 @@ class TestRecording:
         assert r["error"] == "CancelledError"
 
     def test_schema_matches_the_other_lenses(self):
-        """지원 번들에 세 Lens 로그를 나란히 담아 한 번에 훑는다 — 필드가 어긋나면 그 대조가 깨진다."""
+        """지원 번들에 세 Lens 로그를 나란히 담아 한 번에 훑는다 — 필드가 어긋나면 그 대조가 깨진다.
+
+        같은지(==)가 아니라 포함하는지(<=)로 본다. 각 Lens 가 자기만 쓰는 필드를 더
+        넣는 건 괜찮다 — StockLens 는 get_metrics_summary 도구 때문에 output_tokens 를
+        더 남긴다. 빠지는 것만 막으면 된다. 자세한 계약은 test_metrics_contract.py 에.
+        """
 
         @_metrics.track_metrics("demo")
         async def tool():
             return "x"
 
         _run(tool)
-        assert set(_records()[0]) == {
-            "timestamp",
-            "tool",
-            "kwargs",
-            "duration_ms",
-            "output_chars",
-            "cache_hit",
-            "error",
-            "error_detail",
-        }
+        from tests.test_metrics_contract import METRICS_CONTRACT_FIELDS
+
+        assert METRICS_CONTRACT_FIELDS <= set(_records()[0])
 
 
 class TestSecretsStayOut:
