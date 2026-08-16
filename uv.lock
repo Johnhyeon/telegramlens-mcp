@@ -938,7 +938,7 @@ wheels = [
 
 [[package]]
 name = "telegramlens-mcp"
-version = "0.4.24"
+version = "0.5.0"
 source = { editable = "." }
 dependencies = [
     { name = "httpx" },
