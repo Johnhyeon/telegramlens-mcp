@@ -39,9 +39,35 @@ def tracked_path() -> Path:
     return data_dir() / "tracked.json"
 
 
+def leetkit_dir() -> Path:
+    """세 Lens 공용 폴더(~/.leetkit). Lens 하나에 갇히면 안 되는 것만 여기 둔다.
+
+    관심종목이 대표적이다 — 지금은 텔레그램 버즈에만 쓰지만, 같은 종목의 시세·
+    공시를 보는 것도 결국 같은 '내 종목'이다. TelegramLens DB 안에 있으면 다른
+    Lens가 못 읽는다.
+    """
+    override = os.environ.get("LEETKIT_HOME")
+    base = Path(override) if override else (Path.home() / ".leetkit")
+    base.mkdir(parents=True, exist_ok=True)
+    return base
+
+
 def watchlist_path() -> Path:
-    """보유/관심 종목 목록('내 종목 관리'). 명령(!보유)·브리핑 내종목 섹션이 사용."""
-    return data_dir() / "watchlist.json"
+    """보유/관심 종목 목록('내 종목 관리'). 명령(!보유)·브리핑 내종목 섹션이 사용.
+
+    공용 폴더로 옮겼다. 예전 경로(~/.telegramlens/watchlist.json)에만 있으면
+    한 번 복사해 온다 — 쓰던 사람이 목록을 잃으면 안 된다. 원본은 지우지 않아
+    구버전으로 되돌아가도 그대로 쓸 수 있다.
+    """
+    shared = leetkit_dir() / "watchlist.json"
+    if not shared.exists():
+        legacy = data_dir() / "watchlist.json"
+        if legacy.exists():
+            try:
+                shared.write_text(legacy.read_text(encoding="utf-8"), encoding="utf-8")
+            except OSError:
+                return legacy
+    return shared
 
 
 def _credentials_file() -> Path:

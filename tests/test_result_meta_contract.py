@@ -32,7 +32,7 @@ def _iso_hours_ago(h: float) -> str:
 
 class ContractVersionTests(unittest.TestCase):
     def test_meta_version_matches_other_lenses(self):
-        self.assertEqual(rmeta.META_VERSION, 1)
+        self.assertEqual(rmeta.META_VERSION, 2)
 
     def test_marker_matches_stocklens(self):
         self.assertEqual(rmeta.MARKER_START, "RESULT_META_JSON_START")
@@ -84,7 +84,7 @@ class PayloadShapeTests(unittest.TestCase):
             payload = tserver._stocks_payload(stocks, hours=24)
         self.assertEqual(payload["codes"], ["005930", "000660"])
         self.assertEqual(payload["_meta"]["data_period"], "최근 24시간")
-        self.assertEqual(payload["_meta"]["meta_v"], 1)
+        self.assertEqual(payload["_meta"]["meta_v"], rmeta.META_VERSION)
 
 
 if __name__ == "__main__":

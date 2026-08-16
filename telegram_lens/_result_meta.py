@@ -21,6 +21,13 @@
     in_progress_bar  장중 미완성 봉 — 지표·크로스 판정이 마감 때 뒤집힐 수 있음
     filing           공시 접수 기준
     aggregate        수집 구간 집계 (버즈 등)
+
+## viewer_tz — 사용자가 어디서 보고 있는가 (v2)
+
+해외 구매자가 있다. as_of·data_as_of는 한국 시장 기준(KST)이라 로스앤젤레스
+사용자에게는 날짜가 하루 앞선다. 그 상태로 "오늘 시세"라고 말하면 사용자는
+내일 날짜로 읽는다. 사용자 PC의 타임존을 같이 실어, 읽는 쪽이 '오늘/어제'를
+현지 기준으로 환산할 수 있게 한다.
 """
 
 from __future__ import annotations
@@ -29,7 +36,7 @@ import json
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-META_VERSION = 1
+META_VERSION = 2
 
 KST = ZoneInfo("Asia/Seoul")
 
@@ -83,6 +90,27 @@ def normalize_day(value) -> str | None:
     except ValueError:
         return None
     return f"{raw[:4]}-{raw[4:6]}-{raw[6:]}"
+
+
+def viewer_tz(local: datetime | None = None) -> dict | None:
+    """사용자 PC의 타임존. KST와 같으면 None(국내 사용자에겐 노이즈).
+
+    반환: {"tz": "PDT", "utc_offset": "-0700", "local_date": "2026-08-15"}
+    local_date가 핵심이다 — 이게 data_as_of와 다르면 '오늘'이 서로 다른 날이다.
+
+    local은 테스트에서 해외 사용자를 흉내 낼 때만 넘긴다(빈 인자면 실제 PC 시각).
+    """
+    try:
+        local = local or datetime.now().astimezone()
+    except Exception:
+        return None
+    if local.utcoffset() == datetime.now(KST).utcoffset():
+        return None
+    return {
+        "tz": local.tzname() or "",
+        "utc_offset": local.strftime("%z"),
+        "local_date": local.date().isoformat(),
+    }
 
 
 def entity(
@@ -150,6 +178,10 @@ def build_meta(
     # 원문 표기 그대로 넣는다 (예: "2026.03 확정", "2026 반기").
     if data_period:
         meta["data_period"] = data_period
+    # 사용자 타임존이 KST와 다를 때만. 국내 사용자에겐 붙지 않는다.
+    viewer = viewer_tz()
+    if viewer:
+        meta["viewer_tz"] = viewer
     if session:
         meta["session"] = session
     if entity_info:
