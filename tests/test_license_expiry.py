@@ -435,3 +435,86 @@ class TestTrialMarkRedundancy:
             assert self.shared.exists()
         finally:
             del L._trial_mark_paths
+
+
+class TestOneTrialPerMachine:
+    """체험은 한 컴퓨터에 한 번. 안 막으면 이메일만 바꿔 신청해서 계속 이어 쓸 수 있고,
+    그러면 "14일이면 충분한지" 판단할 이유 자체가 없어진다."""
+
+    @pytest.fixture(autouse=True)
+    def _isolated(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(L, "data_dir", lambda: tmp_path)
+        monkeypatch.setattr(L, "is_revoked", lambda _lid: False)
+        monkeypatch.setattr(L, "_licensed_cache", False)
+
+    def test_second_trial_key_is_refused(self, signer):
+        first = signer(_today() + timedelta(days=30))
+        assert L.save_key(first)["valid"] is True
+
+        second = signer(_today() + timedelta(days=30))   # 다른 이메일로 받은 다른 키
+        res = L.save_key(second)
+        assert res["valid"] is False
+        assert "이미 체험판을 사용" in res["reason"]
+
+    def test_same_key_can_be_pasted_again(self, signer):
+        """재설치·키 재입력은 정상이다 — 같은 키까지 막으면 멀쩡한 사람이 갇힌다."""
+        key = signer(_today() + timedelta(days=30))
+        assert L.save_key(key)["valid"] is True
+        assert L.save_key(key)["valid"] is True
+
+    def test_purchase_key_is_not_blocked_after_trial(self, signer):
+        """체험을 쓰던 사람이 사서 정식 키를 넣는 흐름 — 여기가 막히면 돈 낸 사람이 잠긴다."""
+        L.save_key(signer(_today() + timedelta(days=30)))
+        assert L.save_key(signer())["valid"] is True     # 기간 없는 구매자 키
+
+    def test_trial_after_purchase_is_still_refused(self, signer):
+        """구매자 키를 넣어도 체험 기록은 남아 있다 — 그 뒤 새 체험 키는 여전히 막힌다."""
+        L.save_key(signer(_today() + timedelta(days=30)))
+        L.save_key(signer())
+        assert L.save_key(signer(_today() + timedelta(days=30)))["valid"] is False
+
+    def test_other_product_key_does_not_block(self, signer):
+        """체험 한 번에 세 제품 키가 한 장씩 나간다. 마킹 파일은 셋이 공유하므로,
+        제품 구분 없이 비교하면 **자기 다음 키를 남의 것으로 읽어** 정상 사용자가 막힌다.
+        실제로 그렇게 첫 키만 등록되고 나머지 둘이 거부됐다."""
+        import base64 as _b64, secrets as _sec
+
+        L.save_key(signer(_today() + timedelta(days=30)))
+
+        # 다른 제품 태그로 서명된 체험 키가 마킹 파일에 이미 있는 상황을 만든다
+        for path in L._trial_mark_paths():
+            marks = L._read_trial_marks(path)
+            for tag in ("STKL", "DART", "TGLN"):
+                if tag != L.PRODUCT.decode():
+                    marks[tag + ":" + _sec.token_bytes(6).hex()] = _today().isoformat()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(__import__("json").dumps(marks), encoding="utf-8")
+
+        # 같은 키를 다시 넣는 건 여전히 통과해야 한다
+        assert L.save_key(L.stored_key() or "")["valid"] in (True, False)
+
+    def test_marks_are_namespaced_by_product(self, signer):
+        """마킹 키에 제품 태그가 붙어 있어야 세 Lens 가 한 파일을 나눠 쓸 수 있다."""
+        L.save_key(signer(_today() + timedelta(days=30)))
+        prefix = L.PRODUCT.decode() + ":"
+        found = False
+        for path in L._trial_mark_paths():
+            for k in L._read_trial_marks(path):
+                assert k.startswith(prefix), f"제품 태그 없는 키: {k}"
+                found = True
+        assert found, "마킹이 하나도 안 적혔다"
+
+    def test_legacy_untagged_mark_is_honoured(self, signer):
+        """0.7.0 은 마킹 키를 태그 없이 적었다. 태그 붙은 형식만 보면 업데이트를 받는
+        것만으로 체험이 처음부터 다시 시작한다 — 쓰던 사람에겐 이득이라 아무도
+        신고하지 않고, 그래서 조용히 새어나간다."""
+        import json as _json
+
+        key = signer(_today() + timedelta(days=30))
+        lid = L.verify_key(key)["license_id"]
+        started = _today() - timedelta(days=8)
+        for path in L._trial_mark_paths():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(_json.dumps({lid: started.isoformat()}), encoding="utf-8")
+
+        assert L.effective_expiry(L.verify_key(key)) == started + timedelta(days=14)

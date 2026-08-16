@@ -194,6 +194,13 @@ def _trial_mark_paths() -> "list[Path]":
     ]
 
 
+# 마킹 키에 제품 태그를 붙인다. 세 Lens 가 같은 파일을 쓰는데 태그가 없으면,
+# 체험 한 번에 나가는 키 3장(각각 license_id 가 다르다)이 서로를 '남의 체험 키'로
+# 읽는다 — 실제로 첫 키만 등록되고 나머지 둘이 거부됐다.
+def _mark_key(license_id: str) -> str:
+    return PRODUCT.decode() + ":" + license_id
+
+
 def _read_trial_marks(path: Path) -> dict:
     """그 자리에 적힌 {license_id: 날짜}. 없거나 깨졌으면 빈 dict."""
     try:
@@ -206,9 +213,10 @@ def _read_trial_marks(path: Path) -> dict:
 def _write_trial_mark(path: Path, license_id: str, day: date) -> bool:
     """그 자리에 시작일을 적는다(다른 키 기록은 보존). 성공하면 True."""
     marks = _read_trial_marks(path)
-    if marks.get(license_id) == day.isoformat():
+    slot = _mark_key(license_id)
+    if marks.get(slot) == day.isoformat():
         return True  # 이미 같은 값 — 매번 다시 쓸 이유가 없다
-    marks[license_id] = day.isoformat()
+    marks[slot] = day.isoformat()
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(marks), encoding="utf-8")
@@ -231,7 +239,13 @@ def _trial_started_on(license_id: str) -> "date | None":
     paths = _trial_mark_paths()
     found = []
     for path in paths:
-        recorded = _read_trial_marks(path).get(license_id)
+        marks = _read_trial_marks(path)
+        # 태그 붙은 키를 먼저 보고, 없으면 태그 없던 옛 형식(0.7.0 이전)을 본다.
+        # 이걸 빠뜨리면 업데이트를 받는 것만으로 체험 기간이 처음부터 다시 시작한다 —
+        # 쓰던 사람에게는 이득이라 아무도 신고하지 않고, 그래서 조용히 새어나간다.
+        recorded = marks.get(_mark_key(license_id))
+        if recorded is None:
+            recorded = marks.get(license_id)
         if isinstance(recorded, str):
             try:
                 found.append(date.fromisoformat(recorded))
@@ -249,6 +263,33 @@ def _trial_started_on(license_id: str) -> "date | None":
     if not found and not wrote_any:
         return None
     return started
+
+
+def _other_trial_used(res: dict) -> str | None:
+    """이 컴퓨터가 예전에 **다른** 체험 키를 쓴 적이 있으면 그 license_id 를 준다.
+
+    기간 있는 키(체험)에만 적용한다. 구매자 키는 만료가 없어 여기 안 걸린다 —
+    체험을 쓰던 사람이 사서 정식 키를 넣는 흐름이 막히면 안 된다.
+    같은 키를 다시 넣는 것도 막지 않는다(재설치·키 재입력은 정상적인 일이다).
+
+    한계는 분명하다. 기록 파일을 지우면 풀린다 — clock_seen 과 같은 수준의 방어이고,
+    작정한 사람을 막는 게 목적이 아니라 '이메일만 바꿔 계속 이어 쓰는' 쉬운 길을
+    닫는 게 목적이다. 키에 박힌 절대 만료일이 그 위의 상한으로 남는다.
+    """
+    if res.get("expires_on") is None:
+        return None
+    mine = res.get("license_id") or ""
+    if not mine:
+        return None
+    # **같은 제품끼리만 본다.** 체험 한 번에 세 제품 키가 한 장씩 나가는데, 태그 없이
+    # 비교하면 자기 다음 키를 남의 것으로 읽어 정상 사용자가 막힌다.
+    prefix = PRODUCT.decode() + ":"
+    slot = _mark_key(mine)
+    for path in _trial_mark_paths():
+        for other in _read_trial_marks(path):
+            if other.startswith(prefix) and other != slot:
+                return other[len(prefix):]
+    return None
 
 
 def effective_expiry(res: dict) -> "date | None":
@@ -500,6 +541,20 @@ def save_key(key_str: str) -> dict:
     res = verify_key(key_str)
     if not res["valid"]:
         return res
+
+    # 체험은 한 컴퓨터에 한 번이다. 안 막으면 이메일만 바꿔 신청해서 계속 이어 쓸 수
+    # 있는데, 그건 재고를 태우는 것보다 "14일이면 충분한지" 판단할 이유 자체를 없앤다.
+    # 우리는 이 PC 가 예전에 어떤 체험 키를 썼는지 이미 적어두고 있다(체험 시작일 기록).
+    already = _other_trial_used(res)
+    if already:
+        return {
+            "valid": False,
+            "reason": (
+                "이 컴퓨터에서는 이미 체험판을 사용하셨습니다.\n"
+                "체험은 한 대에 한 번만 드립니다. 계속 쓰시려면 정식 라이선스를 구매해주세요.\n"
+                "착오라고 생각되시면 osy980315@gmail.com 으로 알려주세요."
+            ),
+        }
 
     # 여기서 effective_expiry 를 부르는 순간이 곧 '체험 시작'이다 — 키를 붙여넣는
     # 행위가 활성화이므로, 그날이 창의 첫날로 기록된다.
