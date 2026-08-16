@@ -26,6 +26,7 @@ from mcp.server.fastmcp import FastMCP  # noqa: E402
 from telegram_lens import db, discover, market_clock, queries
 from telegram_lens.classify import run_classification
 from telegram_lens._metrics import track_metrics
+from telegram_lens import _result_meta as rmeta
 from telegram_lens.config import data_dir, is_logged_in, secure_data_files
 from telegram_lens.client import NoCredentialsError, NotLoggedInError
 from telegram_lens.licensing import is_licensed, locked_message
@@ -260,7 +261,51 @@ def _json(data) -> str:
     return json.dumps(data, ensure_ascii=False, indent=2)
 
 
-def _stocks_payload(stocks: list) -> dict:
+def _tl_meta(*, hours: int | None = None, codes: list[str] | None = None) -> dict:
+    """TelegramLens 조회 도구 메타. 기준일은 **DB의 마지막 메시지 시각**이다.
+
+    버즈 결과의 함정은 '집계 창'과 '마지막 수집 시각'이 다르다는 점이다.
+    telegram_trending(hours=24)는 "최근 24시간"이라고 말하지만, 마지막 수집이
+    사흘 전이면 실제로는 사흘 전 시점의 24시간 창이다. 읽는 쪽은 "지금 뜨는
+    종목"으로 오해한다. 그래서 data_as_of(마지막 메시지)와 data_period(요청 창)를
+    나란히 싣고, 창보다 수집이 더 오래됐으면 경고를 붙인다.
+    """
+    with db.connect() as conn:
+        newest = db.newest_message_date(conn)
+    newest_kst = queries._to_kst(newest) if newest else None
+
+    warnings: list[str] = []
+    completeness = rmeta.COMPLETE
+    if newest_kst is None:
+        completeness = rmeta.NONE
+        warnings.append("수집된 메시지가 없습니다.")
+    elif hours:
+        try:
+            gap_h = (
+                datetime.now(timezone.utc) - datetime.fromisoformat(newest).replace(tzinfo=timezone.utc)
+            ).total_seconds() / 3600
+        except (TypeError, ValueError):
+            gap_h = 0
+        if gap_h > hours:
+            completeness = rmeta.PARTIAL
+            warnings.append(
+                f"마지막 수집이 약 {gap_h:.0f}시간 전이라 요청한 {hours}시간 창보다 오래됐습니다. "
+                "이 결과는 '지금'이 아니라 그 시점 기준입니다 — telegram_sync 후 다시 조회하세요."
+            )
+
+    return rmeta.build_meta(
+        lens="telegramlens",
+        data_basis=rmeta.BASIS_AGGREGATE,
+        data_as_of=(newest_kst or "")[:10] or None,
+        data_period=f"최근 {hours}시간" if hours else None,
+        market="KR",
+        data_completeness=completeness,
+        entity_info=rmeta.entity(stock_code=codes[0]) if codes and len(codes) == 1 else None,
+        warnings=warnings,
+    )
+
+
+def _stocks_payload(stocks: list, *, hours: int | None = None) -> dict:
     """리스트형 결과 공통 포장 — 종목코드 배열(codes)을 맨 위에 같이 준다.
 
     텔레그램 버즈 결과의 종목들을 외부 시세·수급 도구(예: StockLens get_multi_stocks /
@@ -274,6 +319,7 @@ def _stocks_payload(stocks: list) -> dict:
         s["is_etf"] = s["code"] in etf
     return {
         "_guidance": _WHY_GUIDANCE,
+        "_meta": _tl_meta(hours=hours),
         "codes": [s["code"] for s in stocks],
         "etf_codes": [s["code"] for s in stocks if s["code"] in etf],
         "stocks": stocks,
@@ -357,6 +403,19 @@ trending·momentum·velocity·buzz_score·search 결과 맨 위에 `codes` 배�
 순위 순)이 있습니다. 이 종목들의 시세·수급을 외부 도구로 확인할 때는 **종목당 개별 호출
 대신** `codes` 를 그대로 배치 도구(예: StockLens get_multi_stocks / get_flow_batch)에
 한 번에 넘기세요(토큰 절약). 버즈(심리) 위에 시세·수급(데이터)을 얹는 흐름.
+
+## 🕐 결과 메타 (`_meta`) — 이 버즈가 '언제' 것인가
+
+조회 도구 결과 안에 `_meta` 키가 있습니다. **"지금 뜨는 종목"이라고 말하기 전에
+반드시 보세요.**
+
+- `data_period` = 요청한 집계 창(예: `최근 24시간`).
+  `data_as_of` = **DB에 들어온 마지막 메시지 날짜**. 둘은 다릅니다.
+- 마지막 수집이 집계 창보다 오래됐으면 `data_completeness`가 `partial`이 되고
+  `warnings`에 그 사실이 적힙니다. 그때 이 결과는 **'지금'이 아니라 그 시점 기준**
+  입니다. "현재 급등 중"처럼 쓰지 말고, 먼저 `telegram_sync`를 권하세요.
+- `data_basis`는 항상 `aggregate`입니다 — 시세가 아니라 언급 집계라는 뜻입니다.
+- 메타 블록은 내부용입니다. 사용자에게 JSON을 그대로 보여주지 마세요.
 
 ## 과거 데이터 추가 수집 제안
 
@@ -671,7 +730,7 @@ async def telegram_trending(hours: float = 24, top: int = 20, kind: str = "all")
         top: 상위 N개. 기본 20.
         kind: 종목 종류 — "stock"(개별주만)/"etf"(ETF만)/"all"(전체). 기본 all.
     """
-    return _json(_stocks_payload(queries.trending(hours=hours, top=top, kind=kind)))
+    return _json(_stocks_payload(queries.trending(hours=hours, top=top, kind=kind), hours=hours))
 
 
 @mcp.tool()
@@ -695,7 +754,8 @@ async def telegram_momentum(
         _stocks_payload(
             queries.momentum(
                 hours=hours, baseline_hours=baseline_hours, top=top, kind=kind
-            )
+            ),
+            hours=hours,
         )
     )
 
@@ -1158,7 +1218,8 @@ async def telegram_velocity(
                 window_hours=window_hours,
                 spike_min=spike_min,
                 top=top,
-            )
+            ),
+            hours=window_hours,
         )
     )
 
@@ -1229,7 +1290,8 @@ async def telegram_buzz_score(
                 sentiment=sentiment,
                 top=top,
                 kind=kind,
-            )
+            ),
+            hours=window_hours,
         )
     )
 
