@@ -34,3 +34,19 @@ def test_auto_keeps_claude_desktop_fallback_when_nothing_found(tmp_path):
              return_value=tmp_path / "nope" / ".codex" / "config.toml",
          ):
         assert setup_claude._resolve_targets("auto") == ["claude-desktop"]
+
+
+def test_registered_command_prefers_uv_managed_binary(tmp_path):
+    """설정 파일에 적히는 실행 파일은 uv 관리본이어야 한다 — 옛 pip 잔재가 PATH 앞에
+    있으면 Manager 로 최신을 올려도 호스트 앱이 옛 버전을 띄운다(실기기 확인)."""
+    uv_bin = tmp_path / "uv" / "bin"
+    uv_bin.mkdir(parents=True)
+    uv_exe = uv_bin / "telegramlens.exe"
+    uv_exe.write_text("", encoding="utf-8")
+    pip_exe = tmp_path / "Scripts" / "telegramlens.exe"
+    pip_exe.parent.mkdir(parents=True)
+    pip_exe.write_text("", encoding="utf-8")
+
+    with patch.object(setup_claude, "_uv_tool_bin_dirs", return_value=[uv_bin]), \
+         patch.object(setup_claude.shutil, "which", return_value=str(pip_exe)):
+        assert setup_claude.resolve_server_entry("telegramlens")["command"] == str(uv_exe)
