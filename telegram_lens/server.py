@@ -13,6 +13,7 @@ import logging
 import re
 import subprocess
 import sys
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 
@@ -66,10 +67,28 @@ async def _lifespan(_server):
     db.init_db()
     secure_data_files()
     # 수집 데몬을 '한 번만' 스폰하면, 데몬이 절전/재개·일시정지 등으로 죽었을 때 서버가
-    # 살아있어도 영영 안 되살아난다(2026-06 장애: 3일간 수집 정지). 60초 감시 루프로
-    # '실제 가동(is_alive: PID + 가동 신호 신선도)'을 확인해 죽었으면 재스폰한다 — Claude 가
-    # 켜진 동안 수집 신선도를 자가치유로 보장. 새 persistence 없이 부모-자식 관계 유지.
-    state: dict = {"child": None, "tray": None, "tray_failures": 0}
+    # 살아있어도 영영 안 되살아난다(2026-06 장애: 3일간 수집 정지). 감시 루프가
+    # '실제 가동(is_alive: PID + 가동 신호 신선도)'을 확인해 죽었으면 재스폰한다 — 호스트
+    # 앱이 켜진 동안 수집 신선도를 자가치유로 보장. 새 persistence 없이 부모-자식 관계 유지.
+    state: dict = {"child": None, "tray": None, "tray_failures": 0, "daemon_checked_at": 0.0}
+
+    # 감시 주기를 트레이·데몬으로 나눈다.
+    #   트레이: 15초 — 호스트 앱을 바꿔 켜거나 [다시 시작]을 누르면 이 앱이 소유하던
+    #     트레이가 같이 죽는다. 60초였을 때는 그 사이 아이콘이 사라져 있어서 "꺼졌나?"
+    #     로 보였다(수집 자체는 데몬이 다음 사이클에 공백을 캐치업하므로 문제없다).
+    #   데몬: 60초 그대로 — 크래시 루프에 빠진 데몬을 4배 빠르게 되살리면 텔레그램
+    #     재접속을 그만큼 더 두드린다(flood wait 위험). 여기는 서둘러서 얻을 게 없다.
+    _TRAY_CHECK_SEC = 15
+    _DAEMON_CHECK_SEC = 60
+
+    # 이 서버가 새로 떴다 = 새 세션이다. 지난 세션에 사용자가 트레이를 직접 껐던
+    # 표시를 지운다(그 표시가 남아 있으면 아이콘이 영영 안 보인다).
+    try:
+        from telegram_lens import tray as _tray_init
+
+        _tray_init.clear_dismissed()
+    except Exception:  # noqa: BLE001 — 초기화 실패가 서버 기동을 막으면 안 됨
+        pass
 
     def _licensed() -> bool:
         """확인 자체가 안 되면 True — 돈 낸 사람의 수집이 조용히 죽는 게 더 나쁘다."""
@@ -88,7 +107,9 @@ async def _lifespan(_server):
             try:
                 # 라이선스가 끝나면 수집도 함께 멈춘다 — 데몬 자신도 스스로 서지만,
                 # 여기서 안 막으면 60초마다 다시 띄우려 든다.
-                if is_logged_in() and _licensed():
+                now = time.monotonic()
+                if now - state["daemon_checked_at"] >= _DAEMON_CHECK_SEC and is_logged_in() and _licensed():
+                    state["daemon_checked_at"] = now
                     from telegram_lens.daemon import is_alive, spawn_child
 
                     if not is_alive():
@@ -100,15 +121,17 @@ async def _lifespan(_server):
                 _LOG.warning("수집 데몬 감시 실패: %s", e)
 
             try:
-                # 트레이는 수집 상태를 '보여주기'만 하는 선택적 UI라, 데몬처럼 필수는
-                # 아니지만 같은 감시 주기로 같이 살아있게 한다(수동 실행 중이면 건너뜀 —
-                # tray.spawn() 이 자체 락으로 중복 아이콘을 막는다).
-                # 트레이는 수집 상태를 보여주는 물건이라, 수집이 멈추면 같이 내린다.
+                # 트레이는 수집 상태를 '보여주기'만 하는 선택적 UI라 데몬처럼 필수는
+                # 아니지만, 사라져 있으면 "꺼졌나?"로 보이므로 데몬보다 짧은 주기로 본다
+                # (수동 실행 중이면 건너뜀 — tray.spawn() 이 자체 락으로 중복을 막는다).
+                # 수집이 멈추면(로그아웃·만료) 트레이도 같이 내린다.
                 if is_logged_in() and _licensed() and state["tray_failures"] < _TRAY_MAX_FAILURES:
                     from telegram_lens import tray
 
-                    if not tray.is_alive():
-                        # 띄우자마자 죽는 트레이를 60초마다 계속 되살리면, 사용자에게는
+                    # 사용자가 메뉴 [종료]로 직접 껐으면 되살리지 않는다 — 껐는데 또 뜨면
+                    # 우리가 사용자 의사를 무시하는 것으로 읽힌다.
+                    if not tray.is_alive() and not tray.is_dismissed():
+                        # 띄우자마자 죽는 트레이를 계속 되살리면, 사용자에게는
                         # 크래시 알림이 무한히 뜬다(실제로 맥에서 그랬다 — Tk 초기화가
                         # 프로세스를 죽이는데 감시 루프가 계속 다시 띄웠다). 몇 번 연달아
                         # 실패하면 이 서버가 사는 동안은 포기한다 — 트레이는 상태를
@@ -130,7 +153,7 @@ async def _lifespan(_server):
                 _LOG.warning("트레이 아이콘 감시 실패: %s", e)
 
             try:
-                await asyncio.sleep(60)
+                await asyncio.sleep(_TRAY_CHECK_SEC)
             except asyncio.CancelledError:
                 break
 

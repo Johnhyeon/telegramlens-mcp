@@ -115,6 +115,10 @@ def _open_status_window(icon=None, item=None) -> None:
 
 
 def _quit(icon) -> None:
+    # 사용자가 직접 껐다는 사실을 남긴다 — 안 남기면 MCP 서버 감시 루프가 곧 되살려서
+    # "껐는데 또 뜬다"가 된다(트레이는 상태를 보여주는 UI라, 껐다고 수집이 멈추는 것도
+    # 아니다). 호스트 앱을 새로 켜면 서버가 이 표시를 지우므로 그때 다시 보인다.
+    mark_dismissed()
     icon.visible = False
     icon.stop()
     _gui_queue.put(_QUIT)
@@ -303,6 +307,36 @@ def _poll_loop(icon, state: dict) -> None:
 
 def lock_path():
     return data_dir() / "tray.pid"
+
+
+def dismissed_path():
+    return data_dir() / "tray_dismissed"
+
+
+def mark_dismissed() -> None:
+    """트레이 메뉴 [종료]로 사용자가 직접 껐음을 표시한다."""
+    try:
+        dismissed_path().write_text("1", encoding="utf-8")
+    except Exception:
+        pass  # 표시를 못 남겨도 종료 자체는 진행한다
+
+
+def is_dismissed() -> bool:
+    """사용자가 이 세션에서 트레이를 직접 껐는지 — 감시 루프가 재기동을 건너뛴다."""
+    try:
+        return dismissed_path().exists()
+    except Exception:
+        return False
+
+
+def clear_dismissed() -> None:
+    """호스트 앱(MCP 서버)이 새로 뜰 때 초기화 — 새 세션에서는 아이콘이 다시 보인다."""
+    try:
+        dismissed_path().unlink()
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
 
 
 _tray_lock = procstate.DaemonLock(lock_path())
