@@ -113,6 +113,18 @@ TARGETS: dict[str, tuple] = {
 }
 
 
+def _has_codex() -> bool:
+    """codex 타겟을 쓸 수 있는 환경인지 — Codex CLI 또는 ChatGPT 데스크탑 앱.
+    통합 이후 둘은 같은 `~/.codex/config.toml` 을 읽으므로 하나로 본다.
+
+    ChatGPT 앱을 깔았지만 MCP 설정을 한 번도 안 건드린 사람은 이 폴더가 없을 수 있다 —
+    그때는 아래 auto 판정이 결국 claude-desktop 으로 떨어진다(앱 자체를 찾아내는 일은
+    OS별 설치 경로 탐색이 필요해서 LeetKit Manager 쪽이 담당한다)."""
+    if shutil.which("codex"):
+        return True
+    return get_codex_config_path().parent.exists()
+
+
 def _resolve_targets(arg: str) -> list[str]:
     if arg == "both":
         return ["claude-desktop", "claude-code"]
@@ -128,6 +140,13 @@ def _resolve_targets(arg: str) -> list[str]:
             return ["claude-desktop", "claude-code"]
         if has_code:
             return ["claude-code"]
+        if has_desktop:
+            return ["claude-desktop"]
+        # Claude 가 하나도 없으면 codex(ChatGPT 앱·Codex CLI)를 본다. 예전에는 무조건
+        # claude-desktop 으로 떨어져서, ChatGPT 만 쓰는 사람에게 **없는 앱의 설정 파일**을
+        # 만들고 "등록 완료"라고 말했다.
+        if _has_codex():
+            return ["codex"]
         return ["claude-desktop"]
     raise ValueError(f"Invalid target: {arg}")
 
