@@ -122,7 +122,7 @@ TARGETS: dict[str, tuple] = {
 
 
 def _has_codex() -> bool:
-    """codex 타겟을 쓸 수 있는 환경인지 — Codex CLI 또는 ChatGPT 데스크탑 앱.
+    """codex 타겟을 쓸 수 있는 환경인지 — Codex CLI 또는 ChatGPT 앱.
     통합 이후 둘은 같은 `~/.codex/config.toml` 을 읽으므로 하나로 본다.
 
     ChatGPT 앱을 깔았지만 MCP 설정을 한 번도 안 건드린 사람은 이 폴더가 없을 수 있다 —
