@@ -66,23 +66,47 @@ _CITATION_WORDS = (
 )
 
 
+# 이름 **앞**에 오는 인용 신호어. "작성자: 현대차증권" 처럼 출처를 앞에서
+# 밝히는 형태가 리포트 요약 채널에서 가장 흔하다.
+_CITATION_LEAD = (
+    "작성자", "작성", "애널리스트", "출처", "제공", "자료출처", "by", "By", "BY",
+)
+
+# 이름 뒤 가까운 범위에 나오면 인용으로 보는 말. 이름과 신호어 사이에
+# 의견·목표가가 끼어드는 형태가 흔하다 — "한화투자증권 Buy(유지) 보고서 발행".
+_CITATION_NEAR = ("리서치", "리포트", "레포트", "보고서", "코멘트", "발간", "발행")
+_CITATION_NEAR_WINDOW = 24
+
+
 def _is_citation(text: str, idx: int, length: int) -> bool:
     """위치 idx 의 출처명이 '종목'이 아니라 '인용(출처)'으로 쓰였는지.
 
     데이터에서 관찰된 인용 패턴:
       [삼성증권] / 키움증권(2026.06.01) / 교보증권 리포트 / 부국증권 - 보고서 / 교보증권/공시
+      작성자: 현대차증권 (박현욱)            ← 이름 앞에서 출처를 밝히는 형태
+      당일 한화투자증권 Buy(유지) 보고서 발행  ← 이름과 신호어 사이에 의견이 낌
     """
-    before = text[idx - 1] if idx > 0 else ""
+    before_text = text[:idx]
+    before = before_text[-1:] if idx > 0 else ""
     after = text[idx + length:]
     after_strip = after.lstrip(" 　")
 
     if before == "[":
         return True
-    if after[:1] in ("(", "/"):
+    # 공백을 사이에 두고 괄호가 오는 형태도 인용이다 — "현대차증권 (박현욱)".
+    if after_strip[:1] in ("(", "/"):
         return True
     if after_strip[:1] == "-":
         return True
     if after_strip.startswith(_CITATION_WORDS):
+        return True
+    # 앞에서 출처를 밝히는 형태: "작성자: 현대차증권"
+    lead = before_text.rstrip(" 　:：-–—·|>[(")
+    if lead.endswith(_CITATION_LEAD):
+        return True
+    # 뒤쪽 가까운 곳에 인용 신호어: "한화투자증권 Buy(유지) 보고서 발행"
+    window = after_strip[:_CITATION_NEAR_WINDOW]
+    if any(w in window for w in _CITATION_NEAR):
         return True
     return False
 

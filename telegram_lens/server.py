@@ -752,6 +752,17 @@ async def telegram_trending(hours: float = 24, top: int = 20, kind: str = "all")
         hours: 집계 시간 범위(시간). 기본 24.
         top: 상위 N개. 기본 20.
         kind: 종목 종류 — "stock"(개별주만)/"etf"(ETF만)/"all"(전체). 기본 all.
+        sort_by: 정렬 기준. "buzz_score"(기본, 절대 버즈 크기) /
+            **"baseline_ratio"(평소 대비 배율)**.
+            ⚠️ buzz_score 는 절대 언급량이라 삼성전자·SK하이닉스 같은 대형주가
+            거의 항상 상위에 옵니다. 이 종목들은 평소에도 많이 언급되므로
+            "지금 새로 뜨는 곳"과는 다릅니다. **새로 관심이 붙는 종목을 찾으려면
+            sort_by="baseline_ratio" 를 쓰세요** — 그 종목의 평소 언급량 대비
+            몇 배인지로 줄을 세웁니다(3배 이상이면 새 이야기가 붙는 중).
+        min_independent: baseline_ratio 정렬에서 요구할 최소 독립 언급 수.
+            0이면 기본값 3이 적용됩니다. 배율은 평소 언급이 적을수록 커지므로
+            (7일에 1건 → 오늘 1건 = 7배), 이 바닥이 없으면 한두 건짜리 종목이
+            상위를 채웁니다. buzz_score 정렬에는 영향을 주지 않습니다.
     """
     return _json(_stocks_payload(queries.trending(hours=hours, top=top, kind=kind), hours=hours))
 
@@ -1291,6 +1302,8 @@ async def telegram_buzz_score(
     sentiment: str | None = None,
     top: int = 20,
     kind: str = "all",
+    sort_by: str = "buzz_score",
+    min_independent: int = 0,
 ) -> str:
     """종목별 종합 버즈 스코어(독립언급×tier×확산×velocity). 감성·유형 필터 지원.
 
@@ -1313,6 +1326,8 @@ async def telegram_buzz_score(
                 sentiment=sentiment,
                 top=top,
                 kind=kind,
+                sort_by=sort_by,
+                min_independent=min_independent,
             ),
             hours=window_hours,
         )

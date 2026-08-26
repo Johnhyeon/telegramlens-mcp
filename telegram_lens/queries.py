@@ -450,6 +450,8 @@ def buzz_score(
     top: int = 20,
     samples_per_stock: int = 1,
     kind: str = "all",
+    sort_by: str = "buzz_score",
+    min_independent: int = 0,
 ) -> list[dict]:
     """종목별 종합 버즈 스코어 (Phase 2-3).
 
@@ -569,7 +571,22 @@ def buzz_score(
                     "baseline_ratio": baseline_ratio,
                 }
             )
-        out.sort(key=lambda x: x["buzz_score"], reverse=True)
+        if sort_by == "baseline_ratio":
+            # buzz_score 는 절대 언급량이 커서 대형주가 늘 위를 차지한다.
+            # baseline_ratio 는 '그 종목의 평소 대비 몇 배'라, 새로 관심이
+            # 붙는 자리를 찾을 때는 이쪽이 맞다(없으면 0으로 내린다).
+            #
+            # 다만 배율은 분모가 작을수록 폭발한다 — 평소 7일에 1건 언급되던
+            # 종목이 오늘 1건만 나와도 7배가 되어, 한두 건짜리가 상위를
+            # 독식한다. 배율로 줄 세울 때는 최소 언급 수를 요구한다.
+            floor = min_independent if min_independent > 0 else 3
+            ranked = [d for d in out if d["independent"] >= floor]
+            if not ranked:  # 조용한 날 빈손으로 돌려보내지 않는다
+                ranked = out
+            ranked.sort(key=lambda x: ((x.get("baseline_ratio") or 0.0), x["buzz_score"]), reverse=True)
+            out = ranked
+        else:
+            out.sort(key=lambda x: x["buzz_score"], reverse=True)
         out = out[:top]
         for d in out:
             # 샘플도 동일 필터를 적용 — report 필터 결과엔 report 원문만 보이게(신뢰도).
