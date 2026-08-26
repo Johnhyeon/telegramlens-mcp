@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import re
 import time
+from contextvars import ContextVar
 from datetime import datetime
 from functools import wraps
 from pathlib import Path
@@ -78,6 +79,7 @@ def track_metrics(tool_name: str) -> Callable:
     def decorator(func: Callable[..., Awaitable[Any]]):
         @wraps(func)
         async def wrapper(*args, **kwargs):
+            token = _current_tool.set(tool_name)
             start = time.monotonic()
             error_type: str | None = None
             error_detail: str | None = None
@@ -112,7 +114,81 @@ def track_metrics(tool_name: str) -> Callable:
                         f.write(json.dumps(record, ensure_ascii=False) + "\n")
                 except Exception:
                     pass  # 기록 실패가 도구를 막으면 안 된다
+                # 도구 밖에서 current_tool() 이 남아 있지 않게 되돌린다.
+                _current_tool.reset(token)
 
         return wrapper
 
     return decorator
+
+
+# ---------------------------------------------------------------------------
+# 커버리지 한계 카운터 (메타 규약 v3)
+# ---------------------------------------------------------------------------
+# 도구가 요청보다 적게 돌려주는 일이 얼마나 자주 일어나는지 세지 않으면, 계약을
+# 만들어 놓고도 "그래서 실제로 얼마나 잘리나"에 답할 수 없다.
+#
+# 라벨은 고정 집합만 받는다. 종목코드·티커·검색어를 라벨로 받으면 두 가지가
+# 동시에 깨진다: 시계열 카디널리티가 종목 수만큼 늘어나고, 지원 번들로 나가는
+# 로그에 고객이 무엇을 조회했는지가 그대로 남는다.
+
+COUNTER_LABELS: dict[str, tuple[str, ...]] = {
+    "lens_coverage_truncated_total": ("lens", "tool", "reason"),
+    "lens_incomplete_bar_total": ("tool", "timeframe"),
+    "lens_mixed_period_total": ("tool",),
+    "lens_unknown_adjustment_total": ("tool",),
+}
+
+_LABEL_VALUE_MAX = 40
+
+# 실행 중인 도구 이름. 카운터 라벨 하나 때문에 도구 이름을 40곳 호출부까지
+# 인자로 실어 나르지 않으려고 여기 둔다.
+_current_tool: ContextVar = ContextVar("lens_current_tool", default=None)
+
+
+def current_tool():
+    """지금 실행 중인 MCP 도구 이름. 도구 밖에서는 None."""
+    return _current_tool.get()
+
+
+def get_counters_file() -> Path:
+    """오늘 날짜의 카운터 파일. 도구 호출 기록과 **다른 파일**이다.
+
+    한 파일에 섞으면 기존 파서(load_metrics 등)가 모양이 다른 줄을 만나 조용히
+    어긋난다. 지원 번들에는 같은 폴더째로 담기므로 나눠도 함께 나간다.
+    """
+    date_str = datetime.now().strftime("%Y%m%d")
+    return get_metrics_dir() / f"counters_{date_str}.jsonl"
+
+
+def count_limitation(metric: str, **labels) -> None:
+    """커버리지 한계를 1 센다. 허용 라벨 밖의 값은 받지 않는다.
+
+    라벨이 틀리면 조용히 넘어가지 않고 ValueError 로 올린다. 라벨은 전부 코드에
+    박힌 상수라, 틀렸다면 그건 버그이지 사용자 입력이 아니다. 파일 쓰기 실패만
+    삼킨다 - 메트릭 때문에 도구 호출이 죽으면 안 된다.
+    """
+    allowed = COUNTER_LABELS.get(metric)
+    if allowed is None:
+        raise ValueError(f"정의되지 않은 카운터: {metric!r} (허용: {sorted(COUNTER_LABELS)})")
+    if set(labels) != set(allowed):
+        raise ValueError(
+            f"{metric} 의 라벨은 정확히 {sorted(allowed)} 여야 합니다 (받음: {sorted(labels)})"
+        )
+    for key, value in labels.items():
+        if not isinstance(value, str) or not value:
+            raise ValueError(f"라벨 {key} 는 비어 있지 않은 문자열이어야 합니다 (받음: {value!r})")
+        if len(value) > _LABEL_VALUE_MAX:
+            raise ValueError(f"라벨 {key} 가 너무 깁니다({len(value)}자). 자유 문자열은 라벨이 아닙니다.")
+
+    record = {
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "metric": metric,
+        "labels": {k: labels[k] for k in allowed},
+        "value": 1,
+    }
+    try:
+        with open(get_counters_file(), "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception:
+        pass

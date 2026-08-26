@@ -90,3 +90,98 @@ def test_error_is_none_when_the_call_succeeds():
 
     asyncio.run(tool())
     assert _last_record()["error"] is None
+
+
+# ── 커버리지 한계 카운터 (v3) ────────────────────────────────────────────
+# 도구가 요청보다 적게 돌려주는 일이 얼마나 자주 일어나는지 세지 않으면, 계약을
+# 만들어 놓고도 "그래서 실제로 얼마나 잘리나"에 답할 수 없다. 라벨은 고정 집합만
+# 받는다 - 종목코드·티커·검색어가 라벨로 들어가면 시계열 카디널리티가 터지고,
+# 지원 번들로 나가는 로그에 고객의 질의가 그대로 남는다.
+
+COUNTER_CONTRACT = {
+    "lens_coverage_truncated_total": {"lens", "tool", "reason"},
+    "lens_incomplete_bar_total": {"tool", "timeframe"},
+    "lens_mixed_period_total": {"tool"},
+    "lens_unknown_adjustment_total": {"tool"},
+}
+
+
+def _last_counter() -> dict:
+    lines = _metrics.get_counters_file().read_text(encoding="utf-8").splitlines()
+    return json.loads(lines[-1])
+
+
+def test_counter_names_and_labels_are_exactly_the_contract():
+    assert set(_metrics.COUNTER_LABELS) == set(COUNTER_CONTRACT)
+    for name, labels in COUNTER_CONTRACT.items():
+        assert set(_metrics.COUNTER_LABELS[name]) == labels
+
+
+def test_counting_writes_a_record_with_only_allowed_labels():
+    _metrics.count_limitation(
+        "lens_incomplete_bar_total", tool="probe", timeframe="week"
+    )
+    rec = _last_counter()
+    assert rec["metric"] == "lens_incomplete_bar_total"
+    assert rec["labels"] == {"tool": "probe", "timeframe": "week"}
+    assert rec["value"] == 1
+
+
+def test_user_input_cannot_become_a_label():
+    """종목코드·티커·검색어가 라벨에 남으면 카디널리티가 터지고 질의가 로그에 남는다."""
+    for bad in (
+        {"code": "005930"},
+        {"ticker": "AAPL"},
+        {"query": "삼성전자 배당"},
+        {"corp_code": "00126380"},
+        {"keyword": "조기상환"},
+    ):
+        with pytest.raises(ValueError):
+            _metrics.count_limitation("lens_mixed_period_total", tool="probe", **bad)
+
+
+def test_missing_required_label_is_rejected():
+    with pytest.raises(ValueError):
+        _metrics.count_limitation("lens_coverage_truncated_total", tool="probe")
+
+
+def test_unknown_counter_name_is_rejected():
+    with pytest.raises(ValueError):
+        _metrics.count_limitation("lens_something_total", tool="probe")
+
+
+def test_non_string_label_value_is_rejected():
+    with pytest.raises(ValueError):
+        _metrics.count_limitation("lens_mixed_period_total", tool=object())
+
+
+def test_counters_do_not_pollute_the_call_record_file():
+    """도구 호출 기록 형식을 건드리면 지원 번들 파서가 조용히 깨진다."""
+    assert _metrics.get_counters_file() != _metrics.get_metrics_file()
+
+    @_metrics.track_metrics("probe")
+    async def tool():
+        return "x"
+
+    asyncio.run(tool())
+    _metrics.count_limitation("lens_mixed_period_total", tool="probe")
+    call_rec = json.loads(
+        _metrics.get_metrics_file().read_text(encoding="utf-8").splitlines()[-1]
+    )
+    assert METRICS_CONTRACT_FIELDS <= set(call_rec)
+    assert "metric" not in call_rec
+
+
+def test_running_tool_name_is_available_to_counters():
+    """라벨을 호출부까지 인자로 실어 나르지 않기 위해 실행 중 도구 이름을 노출한다."""
+    seen = {}
+
+    @_metrics.track_metrics("probe")
+    async def tool():
+        seen["tool"] = _metrics.current_tool()
+        return "x"
+
+    assert _metrics.current_tool() is None
+    asyncio.run(tool())
+    assert seen["tool"] == "probe"
+    assert _metrics.current_tool() is None
