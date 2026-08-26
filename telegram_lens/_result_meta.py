@@ -22,6 +22,22 @@
     filing           공시 접수 기준
     aggregate        수집 구간 집계 (버즈 등)
 
+## coverage - 요청한 범위와 실제로 돌려준 범위 (v3)
+
+    requested  사용자가 요청한 범위      {"unit": "day", "value": 60}
+    effective  도구가 실제로 적용한 범위  {"unit": "day", "value": 20}
+
+도구는 상한·페이지·원천 한계 때문에 요청보다 적게 돌려주는 일이 잦은데, 지금까지
+그 사실이 응답 어디에도 남지 않았다. 60일을 물어보고 20일치를 받은 사람은 그걸
+60일 분석으로 읽는다. 두 값을 나란히 실으면 그 오독이 구조적으로 막힌다.
+
+`coverage_complete=false`인데 `data_completeness=complete`인 조합은 금지다.
+"잘라놓고 전부라고 말하기"가 정확히 이 계약이 없애려는 것이라, 값 검증에서
+ValueError로 막는다. `reason`은 열거값이다 - 자유 문자열이면 집계도 대응도 못 한다.
+
+범위 개념이 없는 도구는 coverage를 넘기지 않으면 되고, 그러면 키 자체가 생기지
+않는다. 기존 응답은 그대로다.
+
 ## viewer_tz — 사용자가 어디서 보고 있는가 (v2)
 
 해외 구매자가 있다. as_of·data_as_of는 한국 시장 기준(KST)이라 로스앤젤레스
@@ -36,7 +52,7 @@ import json
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-META_VERSION = 2
+META_VERSION = 3
 
 KST = ZoneInfo("Asia/Seoul")
 
@@ -65,11 +81,42 @@ NONE = "none"
 
 _VALID_COMPLETENESS = {COMPLETE, PARTIAL, NONE}
 
+# coverage.reason - 왜 요청보다 적게 돌려줬는가 (v3)
+_VALID_COVERAGE_REASONS = {
+    "server_cap",       # 도구가 스스로 건 상한 (예: 수급 배치 20일)
+    "pagination",       # 원천이 페이지로 끊어 준다 (예: DART 공시 목록)
+    "source_limit",     # 원천이 전체 건수를 아예 알려주지 않는다
+    "incomplete_tail",  # 마지막 봉이 아직 진행 중이라 구간이 덜 찼다
+    "mixed_periods",    # 종목마다 기준 기간이 달라 한 범위로 못 묶는다
+    "unknown",          # 이유를 모른다. 모른다고 적는 편이 낫다
+}
+
 # 미완성 봉으로 계산된 값을 확정으로 읽지 않도록 붙이는 경고.
 IN_PROGRESS_WARNING = (
     "장중 조회 — 마지막 봉이 아직 마감되지 않았습니다. "
     "이 봉으로 계산된 지표·크로스·신고가 판정은 장 마감 시 달라질 수 있습니다."
 )
+
+
+def validate_coverage(coverage: dict | None, data_completeness: str) -> dict | None:
+    """coverage 값을 검증해 그대로 돌려준다. None이면 None(키를 만들지 않는다).
+
+    막는 것은 딱 두 가지다. 정의되지 않은 reason과, 잘라놓고 complete라고
+    주장하는 조합. 나머지 필드는 도구마다 담는 내용이 달라 형태를 강제하지 않는다.
+    """
+    if coverage is None:
+        return None
+    out = dict(coverage)
+    reason = out.get("reason")
+    if reason is not None and reason not in _VALID_COVERAGE_REASONS:
+        raise ValueError(
+            f"coverage reason 미정의 값: {reason!r} (허용: {sorted(_VALID_COVERAGE_REASONS)})"
+        )
+    if out.get("coverage_complete") is False and data_completeness == COMPLETE:
+        raise ValueError(
+            "coverage_complete=false이면 data_completeness=complete일 수 없습니다."
+        )
+    return out
 
 
 def normalize_day(value) -> str | None:
@@ -145,6 +192,7 @@ def build_meta(
     session: str | None = None,
     is_delayed: bool = False,
     data_completeness: str = COMPLETE,
+    coverage: dict | None = None,
     entity_info: dict | None = None,
     warnings: list[str] | None = None,
     now: datetime | None = None,
@@ -158,6 +206,7 @@ def build_meta(
         raise ValueError(f"data_basis 미정의 값: {data_basis!r} (허용: {sorted(_VALID_BASIS)})")
     if data_completeness not in _VALID_COMPLETENESS:
         raise ValueError(f"data_completeness 미정의 값: {data_completeness!r}")
+    coverage_out = validate_coverage(coverage, data_completeness)
 
     warns = list(warnings or [])
     if data_basis == BASIS_IN_PROGRESS_BAR and IN_PROGRESS_WARNING not in warns:
@@ -178,6 +227,9 @@ def build_meta(
     # 원문 표기 그대로 넣는다 (예: "2026.03 확정", "2026 반기").
     if data_period:
         meta["data_period"] = data_period
+    # 요청 범위와 실제 반환 범위가 다를 수 있는 도구만 싣는다 (v3).
+    if coverage_out is not None:
+        meta["coverage"] = coverage_out
     # 사용자 타임존이 KST와 다를 때만. 국내 사용자에겐 붙지 않는다.
     viewer = viewer_tz()
     if viewer:
