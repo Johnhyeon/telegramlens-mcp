@@ -88,6 +88,7 @@ _VALID_COVERAGE_REASONS = {
     "source_limit",     # 원천이 전체 건수를 아예 알려주지 않는다
     "incomplete_tail",  # 마지막 봉이 아직 진행 중이라 구간이 덜 찼다
     "mixed_periods",    # 종목마다 기준 기간이 달라 한 범위로 못 묶는다
+    "indicator_error",  # 요청한 지표 중 일부가 계산에 실패했다
     "unknown",          # 이유를 모른다. 모른다고 적는 편이 낫다
 }
 
