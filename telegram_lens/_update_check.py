@@ -97,14 +97,44 @@ async def _fetch_latest() -> tuple[str, str] | None:
     return None
 
 
+def _version_key(v: str) -> tuple[int, ...] | None:
+    """"0.5.4" / "v1.2" -> 숫자 튜플. 그 밖의 형태는 None.
+
+    숫자만 뽑아 비교하면 "0.5.5rc1"의 숫자가 (0,5,5,1)이 되어 프리릴리스가
+    정식판 위로 올라간다. 순수한 v?숫자.숫자... 형태만 받고, 끝의 0은 지운다
+    (0.5.4.0 == 0.5.4). StockLens 와 같은 규칙이다.
+    """
+    import re
+
+    s = (v or "").strip()
+    if not re.fullmatch(r"[vV]?\d+(?:\.\d+)*", s):
+        return None
+    nums = [int(x) for x in s.lstrip("vV").split(".")]
+    while nums and nums[-1] == 0:
+        nums.pop()
+    return tuple(nums)
+
+
 def _version_gt(latest: str, current: str) -> bool:
-    """semver 비교. 실패 시 단순 비교로 물러난다."""
+    """semver 비교. packaging 이 없으면 숫자 튜플로 비교한다.
+
+    예전 fallback 은 "다르면 새 버전"이라, 실행 코드가 0.5.4 인데 캐시된
+    최신이 0.5.2 면 다운그레이드 안내가 나갔다(실측 UAT). 숫자를 못 뽑으면
+    새 버전이라고 주장하지 않는다.
+    """
     try:
         from packaging.version import Version
 
         return Version(latest) > Version(current)
     except Exception:
-        return latest != current and latest != ""
+        pass
+    try:
+        lk, ck = _version_key(latest), _version_key(current)
+        if lk is None or ck is None:
+            return False
+        return lk > ck
+    except Exception:
+        return False
 
 
 def _format_notice(latest: str, current: str, notes: str) -> str:

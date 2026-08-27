@@ -202,13 +202,92 @@ def check_uv() -> Check:
     return c
 
 
+def version_report(code_version: str, dist: str | None) -> dict:
+    """실행 코드 버전 vs 설치 메타 버전(TL-01 요구 2).
+
+    dist=None 은 메타를 못 읽은 것(editable 등)이지 불일치가 아니다.
+    """
+    mismatch = dist is not None and dist != code_version
+    return {
+        "code_version": code_version,
+        "dist_version": dist,
+        "version_mismatch": mismatch,
+    }
+
+
+def scan_dist_metadata(package_name: str,
+                       site_packages: list | None = None) -> dict:
+    """site-packages 의 이 패키지 배포 메타를 훑는다(TL-01 요구 5).
+
+    실측(UAT): pip 임시 리네임이 깨진 채 남은 "~elegramlens_mcp-*.dist-info"
+    와 옛 버전 dist-info 가 정상 배포판 옆에 공존했다. importlib.metadata 는
+    그중 아무거나 집을 수 있어 버전이 과거로 보인다.
+    """
+    normalized = package_name.replace("-", "_").lower()
+    # pip 임시 리네임은 첫 글자를 "~" 로 바꾼다: telegramlens -> ~elegramlens
+    broken_stem = "~" + normalized[1:]
+    if site_packages is None:
+        site_packages = [Path(pth) for pth in {
+            sysconfig.get_paths().get("purelib") or "",
+            sysconfig.get_paths().get("platlib") or "",
+        } if pth]
+
+    valid: list[dict] = []
+    broken: list[str] = []
+    for root in site_packages:
+        root = Path(root)
+        if not root.is_dir():
+            continue
+        for entry in root.iterdir():
+            name = entry.name
+            low = name.lower()
+            if low.startswith(broken_stem):
+                broken.append(str(entry))
+                continue
+            if not low.endswith(".dist-info"):
+                continue
+            stem = low[:-len(".dist-info")]
+            pkg, _, ver = stem.rpartition("-")
+            if pkg == normalized:
+                valid.append({"path": str(entry), "version": ver})
+    return {
+        "valid": valid,
+        "broken": broken,
+        "duplicated": len(valid) > 1,
+    }
+
+
 def check_package() -> Check:
     c = Check("Package (telegramlens-mcp)")
     try:
         import telegram_lens  # noqa: F401
         c.ok("telegramlens-mcp is importable")
         c.info(f"Location:   {Path(telegram_lens.__file__).parent}")
-        c.info(f"Version:    {telegram_lens.__version__}")
+        from telegram_lens._version import dist_version
+
+        vr = version_report(telegram_lens.__version__, dist_version())
+        c.info(f"Version:    {vr['code_version']} (실행 코드 기준)")
+        if vr["version_mismatch"]:
+            c.warn(
+                f"version_mismatch: 실행 코드 {vr['code_version']} vs 설치 메타 "
+                f"{vr['dist_version']} - 업그레이드가 덜 끝났거나 옛 dist-info 가 "
+                "남아 있습니다. 재설치를 권합니다."
+            )
+        scan = scan_dist_metadata(PACKAGE_NAME)
+        if scan["broken"]:
+            c.warn(
+                f"깨진 배포 메타 {len(scan['broken'])}개 발견(~ 로 시작하는 pip "
+                "임시 리네임 잔재): " + ", ".join(
+                    Path(b).name for b in scan["broken"][:3])
+                + " - 삭제해도 안전합니다."
+            )
+        if scan["duplicated"]:
+            vers = ", ".join(v["version"] for v in scan["valid"])
+            c.warn(
+                f"같은 패키지의 dist-info 가 {len(scan['valid'])}개입니다({vers}). "
+                "importlib.metadata 가 아무거나 집을 수 있어 버전이 과거로 보일 수 "
+                "있습니다. 하나만 남기세요."
+            )
         c.info(f"Python:     {sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}")
         c.info(f"Executable: {sys.executable}")
     except ImportError:
@@ -997,6 +1076,14 @@ def main():
             "product": PRODUCT,
             "package_name": PACKAGE_NAME,
             "installed_version": __version__,
+            "version_truth": version_report(
+                __version__,
+                __import__("telegram_lens._version",
+                           fromlist=["dist_version"]).dist_version()),
+            "dist_metadata_scan": {
+                key: value for key, value in
+                scan_dist_metadata(PACKAGE_NAME).items() if key != "valid"
+            },
             "latest_version": None,
             "update_available": None,
             "overall": "fail" if any_fail else ("degraded" if any_warn else "ok"),
