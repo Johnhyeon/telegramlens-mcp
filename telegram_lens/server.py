@@ -1565,16 +1565,36 @@ async def telegram_add_alias(alias: str, code: str) -> str:
 @mcp.tool()
 @safe_tool
 @track_metrics("telegram_block_name")
-async def telegram_block_name(code: str, note: str = "") -> str:
+async def telegram_block_name(code: str, note: str = "", dry_run: bool = False) -> str:
     """종목을 모호어 차단 목록에 추가합니다(이름 단독 매칭 차단, 코드 동반 시만 인정).
+
+    dry_run=True 면 아무것도 바꾸지 않고, 최근 30일 집계에서 빠질 언급 수와
+    원문 표본을 보여줍니다. 실제 적용 시 같은 조건으로 이름 단독 언급을
+    집계에서 제거하므로 두 건수는 일치합니다. 적용 후에는
+    telegram_trending / telegram_fp_candidates 를 다시 돌려 순위 변화와
+    오탐 회귀를 확인하세요.
 
     Args:
         code: 6자리 종목코드 (예: 001680).
         note: 메모(예: '대상 = target/object 충돌').
+        dry_run: True 면 미리보기만(기본 False).
     """
+    preview = discover.block_preview(code)
+    if dry_run:
+        return _json({"dry_run": True, **preview,
+                      "note": "아무것도 변경되지 않았습니다. 표본을 확인한 뒤 "
+                              "dry_run 없이 다시 호출하면 적용됩니다."})
     result = add_ambiguous(code, note)
     reset_index()
-    return _json({"blocked": result})
+    purged = discover.purge_name_only_mentions(code)
+    return _json({
+        "blocked": result,
+        "excluded_from_aggregates": purged,
+        "dry_run_matched": purged == preview["would_exclude"],
+        "verify": "telegram_trending 재실행으로 순위 변화, "
+                  "telegram_fp_candidates 재실행으로 회귀를 확인하세요. "
+                  "원문(messages)은 남아 있어 정책을 되돌리면 재추출로 복원됩니다.",
+    })
 
 
 def main() -> None:
