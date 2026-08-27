@@ -144,8 +144,54 @@ def reset_index() -> None:
     _name_index.cache_clear()
 
 
+_CASHTAG_RE = re.compile(r"\$([A-Z]{1,5}(?:\.[AB])?)\b")
+_BARE_US_RE = re.compile(r"(?<![A-Za-z$])([A-Z]{2,5})(?![A-Za-z])")
+
+
+def _us_mentions(text: str) -> dict[str, str]:
+    """미국 티커 언급(TL-03). cashtag 는 항상, bare 티커는 가드를 통과할 때만.
+
+    "we are ALL in" 의 ALL(올스테이트)처럼 일반 영어 단어와 겹치는 티커를
+    문맥 없이 잡으면 오탐 기계가 된다(요구 3). bare 매칭은 사전에 있는
+    티커이면서, 일반 단어가 아니거나 시장 문맥어가 근처에 있을 때만 인정한다.
+    """
+    from telegram_lens import us_stocks
+
+    found: dict[str, str] = {}
+    table = us_stocks.load_us_map()
+
+    for m in _CASHTAG_RE.finditer(text):
+        ticker = m.group(1)
+        info = table.get(ticker)
+        if info:
+            found[ticker] = info["name"]
+
+    low = text.lower()
+    has_market_context = any(w in low for w in us_stocks.MARKET_CONTEXT_WORDS)
+    for m in _BARE_US_RE.finditer(text):
+        ticker = m.group(1)
+        if ticker in found:
+            continue
+        info = table.get(ticker)
+        if not info:
+            continue
+        if ticker in us_stocks.COMMON_WORD_TICKERS and not has_market_context:
+            continue
+        # 시드 밖(SEC 전체 목록)의 짧은 티커는 문맥 없이는 인정하지 않는다 -
+        # 영어 문장 대문자 단어 전부가 후보가 되기 때문이다.
+        if ticker not in us_stocks.US_SEED and not has_market_context:
+            continue
+        found[ticker] = info["name"]
+    return found
+
+
 def extract_mentions(text: str) -> list[tuple[str, str]]:
-    """텍스트에서 (code, name) 언급 목록을 중복 제거해 반환."""
+    """텍스트에서 (code, name) 언급 목록을 중복 제거해 반환.
+
+    한국 종목은 6자리 코드·이름·별칭으로, 미국 종목은 cashtag($PLTR)·한글
+    통용명(팔란티어)·가드된 bare 티커로 잡는다(TL-03). code 자리에는 한국은
+    6자리 코드, 미국은 티커가 들어간다.
+    """
     if not text:
         return []
 
@@ -186,6 +232,20 @@ def extract_mentions(text: str) -> list[tuple[str, str]]:
                     for i in span:
                         consumed[i] = True
             start = idx + 1
+
+    # 2.5) 미국 종목(TL-03): cashtag·가드된 bare 티커. 한글 통용명은 아래
+    #      name_index 경로가 아니라 여기서 함께 처리한다(사전이 분리되어 있다).
+    try:
+        from telegram_lens import us_stocks as _us
+
+        for alias, ticker in _us.alias_terms():
+            if alias in text and ticker not in found:
+                found[ticker] = _us.load_us_map().get(
+                    ticker, {}).get("name") or ticker
+        for ticker, name in _us_mentions(text).items():
+            found.setdefault(ticker, name)
+    except Exception:
+        pass   # 미국 사전 문제로 한국 추출까지 죽으면 안 된다
 
     # 3) 모회사·자회사 이름 포함관계 억제: 자식 이름(예: '두산로보틱스')이 함께 잡혔으면,
     #    코드로 확인되지 않은 부모(예: '두산')는 제거한다. '두산로보틱스 … 두산 그룹'처럼

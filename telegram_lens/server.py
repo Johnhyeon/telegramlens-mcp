@@ -1184,6 +1184,37 @@ def _resolve_code(query: str) -> tuple[str | None, str]:
     return resolve_code(query)
 
 
+def _entity_status(query: str) -> dict:
+    """질의를 시장·상태로 해석한다(TL-03 요구 2).
+
+    0건이 "실제 무언급"인지 "사전에 없음"인지 "미지원 시장"인지는 서로 다른
+    상태다. 같은 '결과 없음'으로 뭉개면 읽는 쪽이 구분할 수 없다.
+    """
+    from telegram_lens import us_stocks
+
+    by_code = load_stocks()
+    if query in by_code:
+        return {"market": "KR", "code": query, "name": by_code[query],
+                "entity_status": "supported"}
+    for c, n in by_code.items():
+        if n == query:
+            return {"market": "KR", "code": c, "name": n,
+                    "entity_status": "supported"}
+    for c, n in by_code.items():
+        if query in n:
+            return {"market": "KR", "code": c, "name": n,
+                    "entity_status": "supported"}
+    if us_stocks.is_unsupported_market(query):
+        return {"market": "OTHER", "code": None, "name": query,
+                "entity_status": "unsupported_market"}
+    us = us_stocks.resolve_us(query)
+    if us:
+        return {"market": "US", "code": us["ticker"], "name": us["name"],
+                "entity_status": "supported"}
+    return {"market": None, "code": None, "name": query,
+            "entity_status": "entity_not_found"}
+
+
 @mcp.tool()
 @safe_tool
 @warn_if_collecting
@@ -1278,12 +1309,19 @@ async def telegram_timeline(
         bucket_minutes: 시간 버킷 크기(분). 기본 60.
     """
     code, name = _resolve_code(query)
+    ent = None
     if code is None:
-        return f"⚠️ '{query}' 종목을 사전에서 찾지 못했습니다."
+        ent = _entity_status(query)
+        if ent["entity_status"] == "supported":
+            code, name = ent["code"], ent["name"]
+        else:
+            return _json({**ent, "status_note":
+                          "사전에서 특정하지 못했습니다 - 무언급과 다른 상태입니다."})
     return _json(
         {
             "_guidance": _WHY_GUIDANCE,
             "is_etf": code in load_etf_codes(),
+            "market": (ent or {}).get("market", "KR"),
             "timeline": queries.stock_timeline(
                 code=code, name=name, hours=hours, bucket_minutes=bucket_minutes
             ),
@@ -1346,26 +1384,32 @@ async def telegram_stock_buzz(query: str, hours: float = 24, samples: int = 8) -
         hours: 집계 시간 범위(시간). 기본 24.
         samples: 원문 샘플 개수. 기본 8.
     """
-    by_code = load_stocks()
-    code = None
-    name = query
-    if query in by_code:  # 코드로 들어옴
-        code, name = query, by_code[query]
-    else:  # 이름으로 들어옴 — 부분일치 우선
-        for c, n in by_code.items():
-            if n == query:
-                code, name = c, n
-                break
-        if code is None:
-            for c, n in by_code.items():
-                if query in n:
-                    code, name = c, n
-                    break
-    if code is None:
-        return f"⚠️ '{query}' 종목을 사전에서 찾지 못했습니다."
+    ent = _entity_status(query)
+    if ent["entity_status"] == "unsupported_market":
+        return _json({**ent, "status_note":
+                      "거래소 접미사가 붙은 외국(미국 외) 종목 표기입니다. "
+                      "이 도구는 한국·미국 종목만 지원합니다."})
+    if ent["entity_status"] == "entity_not_found":
+        return _json({**ent, "status_note":
+                      "한국·미국 종목 사전 어디에도 없는 이름입니다. 언급이 "
+                      "없다는 뜻이 아니라 무엇을 찾는지 특정하지 못한 것입니다. "
+                      "티커나 정확한 종목명으로 다시 시도하세요."})
+    code, name = ent["code"], ent["name"]
     result = queries.stock_buzz(code=code, name=name, hours=hours, samples=samples)
     if isinstance(result, dict):
         result["is_etf"] = code in load_etf_codes()
+        result["market"] = ent["market"]
+        zero = not (result.get("independent") or result.get("raw_messages"))
+        if zero:
+            # 지원 종목의 0건은 무언급이지 미지원이 아니다(수용 2).
+            result["entity_status"] = "supported_but_zero_mentions"
+            result["status_note"] = (
+                "사전에 있는 종목이고 조회는 정상입니다 - 이 기간 수집분에 "
+                "무언급일 뿐입니다."
+                + (" 미국 종목 언급 수집은 이 기능 도입 이후 메시지부터 "
+                   "쌓이므로 과거 데이터에는 없습니다." if ent["market"] == "US" else ""))
+        else:
+            result["entity_status"] = "supported"
     return _json(result)
 
 
