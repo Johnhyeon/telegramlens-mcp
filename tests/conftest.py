@@ -11,7 +11,30 @@
 
 from __future__ import annotations
 
+import os
+import tempfile
+
 import pytest
+
+# 수집(import) 시점에 data_dir() 를 부르는 테스트 모듈이 있다 - fixture 는
+# 수집 이후에나 돌므로, 홈 격리는 conftest 모듈 레벨에서 가장 먼저 건다.
+# 바깥에서 어떤 TELEGRAMLENS_HOME 이 걸려 있어도(오염 포함) 여기서 덮는다.
+_SUITE_HOME = tempfile.mkdtemp(prefix="tl_suite_home_")
+os.environ["TELEGRAMLENS_HOME"] = _SUITE_HOME
+
+
+@pytest.fixture(autouse=True)
+def _isolate_home(monkeypatch):
+    """모든 테스트를 스위트 전용 임시 TELEGRAMLENS_HOME 에서 돌린다.
+
+    실측(UAT 검수): 상태 테스트가 실제 사용자 홈의 DB 를 열어, 임시 HOME 을
+    지정한 실행에서는 전부 통과하는데 기본 `pytest -q` 에서는 환경에 따라
+    깨졌다. 격리는 실행자가 환경변수로 챙길 일이 아니라 테스트 스위트가
+    스스로 보장할 일이다. 경로는 위 모듈 레벨에서 이미 고정됐고, 여기서는
+    개별 테스트가 setenv 로 바꿔도 다음 테스트로 새지 않게 되돌린다.
+    """
+    monkeypatch.setenv("TELEGRAMLENS_HOME", _SUITE_HOME)
+    yield
 
 
 @pytest.fixture(autouse=True)
