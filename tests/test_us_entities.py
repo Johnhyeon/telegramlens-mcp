@@ -106,7 +106,12 @@ class BuzzStatusTests(unittest.IsolatedAsyncioTestCase):
         async def run():
             return await server.telegram_stock_buzz(query=query, hours=24)
 
-        with patch.object(server, "load_stocks", lambda: {"005930": "삼성전자"}), \
+        # 라이선스 게이트·ETF 목록은 이 테스트의 대상이 아니다 - 깨끗한 환경
+        # (라이선스 없음, 로컬 DB 없음)에서도 상태 구분 로직만 검증한다.
+        with patch.object(server, "is_licensed", lambda: True), \
+             patch.object(server, "_collecting_notice", lambda: None), \
+             patch.object(server, "load_etf_codes", lambda: set()), \
+             patch.object(server, "load_stocks", lambda: {"005930": "삼성전자"}), \
              patch.object(server.queries, "stock_buzz",
                           lambda code, name, hours, samples: {
                               "code": code, "name": name,
@@ -122,14 +127,18 @@ class BuzzStatusTests(unittest.IsolatedAsyncioTestCase):
     async def test_unknown_name_is_entity_not_found(self):
         from telegram_lens import server
 
-        with patch.object(server, "load_stocks", lambda: {"005930": "삼성전자"}):
+        with patch.object(server, "is_licensed", lambda: True), \
+             patch.object(server, "_collecting_notice", lambda: None), \
+             patch.object(server, "load_stocks", lambda: {"005930": "삼성전자"}):
             out = json.loads(await server.telegram_stock_buzz(query="없는종목명임"))
         self.assertEqual(out["entity_status"], "entity_not_found")
 
     async def test_foreign_market_is_unsupported(self):
         from telegram_lens import server
 
-        with patch.object(server, "load_stocks", lambda: {"005930": "삼성전자"}):
+        with patch.object(server, "is_licensed", lambda: True), \
+             patch.object(server, "_collecting_notice", lambda: None), \
+             patch.object(server, "load_stocks", lambda: {"005930": "삼성전자"}):
             out = json.loads(await server.telegram_stock_buzz(query="7203.T"))
         self.assertEqual(out["entity_status"], "unsupported_market")
 

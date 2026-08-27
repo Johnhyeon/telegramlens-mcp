@@ -369,8 +369,16 @@ def _collecting_notice() -> str | None:
     → 결론: DB 에 메시지가 하나라도 있으면 '가장 최신 가용 데이터'로 그냥 답한다(신선도는
     결과에 찍힌 KST 시각으로 드러남). 진짜 막아야 할 경우는 'DB가 텅 빈 최초 수집' 뿐.
     """
-    with db.connect() as conn:
-        newest = db.newest_message_date(conn)
+    import sqlite3
+
+    try:
+        with db.connect() as conn:
+            newest = db.newest_message_date(conn)
+    except sqlite3.OperationalError:
+        # 신규 설치는 스키마조차 없다(no such table). 이것도 '최초 수집 전'이지
+        # 오류가 아니다 - 여기서 죽으면 첫 도구 호출이 "처리 중 오류"로 보인다.
+        db.init_db()
+        newest = None
     if newest is None:
         return "⏳ 텔레그램 데이터를 처음 수집하는 중입니다. 잠시 후(약 1분) 다시 물어봐 주세요."
     return None
@@ -482,6 +490,16 @@ async def telegram_status() -> str:
     with db.connect() as conn:
         s = db.stats(conn)
     logged_in = is_logged_in()
+    # 실행 코드 버전 vs 설치 메타 버전(TL-01). doctor 만이 아니라 status 에서도
+    # 보여야 한다 - 사용자는 문제가 생기면 doctor 보다 status 를 먼저 본다.
+    try:
+        from telegram_lens._version import CODE_VERSION, dist_version
+        from telegram_lens.doctor import version_report
+
+        s["version"] = version_report(CODE_VERSION, dist_version())
+    except Exception:
+        s["version"] = {"code_version": None, "dist_version": None,
+                        "version_mismatch": None}
     s["logged_in"] = logged_in
     s["stocks_loaded"] = len(load_stocks())
     # 사용자에게 보이는 시각은 KST 로(저장은 UTC). 한국 사용자가 status 의 UTC 보고
