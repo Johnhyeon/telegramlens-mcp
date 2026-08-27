@@ -13,7 +13,7 @@ version 과 같아야 하며, tests/test_version_truth.py 가 릴리스 전에 �
 
 from __future__ import annotations
 
-CODE_VERSION = "0.5.4"
+CODE_VERSION = "0.6.0"
 
 
 def dist_version() -> str | None:

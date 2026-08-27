@@ -25,8 +25,10 @@ class StatusVersionTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(server, "is_licensed", lambda: True), \
              patch.object(server, "is_logged_in", lambda: False):
             out = json.loads(await server.telegram_status())
+        from telegram_lens._version import CODE_VERSION
+
         v = out["version"]
-        self.assertEqual(v["code_version"], "0.5.4")
+        self.assertEqual(v["code_version"], CODE_VERSION)
         self.assertIn("dist_version", v)
         self.assertIn("version_mismatch", v)
 
