@@ -37,6 +37,10 @@ description: >
 2. **codes 추출** — 결과 맨 위 `codes` 배열을 그대로 쓴다(재파싱 X).
    `codes` 가 30개를 넘으면 `codes[:30]` (StockLens get_multi_stocks 30종목 제한). 보통 상위
    10~15개면 충분.
+   집계는 **국내주식·미국주식·국내ETF·미국ETF** 네 갈래다. `codes` 는 국내 코드만,
+   미국 티커는 `us_codes` 에 따로 온다(국내 배치 도구는 6자리 코드만 받는다).
+   미국 종목까지 볼 때는 `us_codes` 를 StockLens 미국 배치 도구로 한 번 더 부른다.
+   한 시장만 필요하면 애초에 `market="KR"` 또는 `market="US"` 로 좁혀 부른다.
 3. **배치 시세 1콜** — `get_multi_stocks(codes)` → [{code, name, price, change_rate, volume}]
 4. **배치 수급 1콜** — `get_flow_batch(codes, days=5)` → 종목별 기관·외국인 순매매(최근 합)
 5. **통합 테이블 출력** — 버즈 순서를 유지해 한 표로 병합.

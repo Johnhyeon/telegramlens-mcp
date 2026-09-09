@@ -446,12 +446,27 @@ mcp = FastMCP(
 - 중복제거: independent(독립 언급=클러스터 수)가 헤드라인. raw_messages 는 포워드/복붙
   포함 원시 건수, spread_copies·total_forwards 는 확산 강도. 순위는 independent 기준.
 
-## 종목코드 배치 연계 (codes)
+## 집계는 네 갈래 — 국내주식·미국주식·국내ETF·미국ETF
 
-trending·momentum·velocity·buzz_score·search 결과 맨 위에 `codes` 배열(등장 종목코드,
-순위 순)이 있습니다. 이 종목들의 시세·수급을 외부 도구로 확인할 때는 **종목당 개별 호출
-대신** `codes` 를 그대로 배치 도구(예: StockLens get_multi_stocks / get_flow_batch)에
-한 번에 넘기세요(토큰 절약). 버즈(심리) 위에 시세·수급(데이터)을 얹는 흐름.
+언급 규모가 시장마다 달라 한 랭킹에 섞으면 큰 쪽(보통 국내주식)이 정원을 다 먹습니다.
+trending·momentum·buzz_score 는 **세그먼트마다 top 개씩** 뽑아 국내주식 → 미국주식 →
+국내ETF → 미국ETF 순으로 이어 돌려줍니다. 결과의 `segments` 에 세그먼트별 코드 배열이
+있고, 종목마다 `market`("KR"/"US")·`segment`·`is_etf` 가 붙습니다.
+
+한 갈래만 보려면 `market`("KR"/"US")과 `kind`("stock"/"etf")를 조합하세요.
+"미국 ETF 중 뭐가 뜨나" → `market="US", kind="etf"`.
+
+## 종목코드 배치 연계 (codes / us_codes)
+
+결과 맨 위의 코드 배열은 **시장별로 나뉘어** 있습니다. 받는 도구가 다르기 때문입니다.
+
+- `codes` — 국내 코드만(주식+ETF). StockLens `get_multi_stocks` / `get_flow_batch` 로.
+- `us_codes` — 미국 티커만. StockLens 미국 도구(`get_us_multi_price` 등)로.
+- `etf_codes` / `us_etf_codes` — 각 시장의 ETF 만.
+
+종목당 개별 호출 대신 이 배열을 그대로 배치 도구에 넘기세요(토큰 절약).
+버즈(심리) 위에 시세·수급(데이터)을 얹는 흐름입니다. **국내 배치 도구에 미국 티커를
+넣지 마세요** — 국내 6자리 코드만 받습니다.
 
 ## 🕐 결과 메타 (`_meta`) — 이 버즈가 '언제' 것인가
 
