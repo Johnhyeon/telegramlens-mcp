@@ -188,20 +188,26 @@ def load_etf_codes() -> set[str]:
 
 
 def _load_json(name: str) -> dict:
-    """번들 data/ 파일을 읽고, 사용자 홈에 같은 이름이 있으면 병합(사용자 우선)."""
+    """번들 data/ 파일을 읽고, 사용자 홈에 같은 이름이 있으면 병합(사용자 우선).
+
+    **중첩 dict 는 키 단위로 병합한다.** 통째로 덮어쓰면 사용자가 도구로 한 건만
+    추가해도 번들 목록이 통째로 사라진다 — ambiguous_codes.json 의 codes /
+    us_bare_blocked 가 그런 구조라, telegram_block_name 한 번에 기본 차단
+    목록이 날아갔다(실측: 116종 → 1종).
+    """
     out: dict = {}
-    bundled = _DATA_DIR / name
-    if bundled.exists():
+    for path in (_DATA_DIR / name, data_dir() / name):
+        if not path.exists():
+            continue
         try:
-            out.update(json.loads(bundled.read_text(encoding="utf-8")))
+            data = json.loads(path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
-            pass
-    override = data_dir() / name
-    if override.exists():
-        try:
-            out.update(json.loads(override.read_text(encoding="utf-8")))
-        except (json.JSONDecodeError, OSError):
-            pass
+            continue
+        for key, value in data.items():
+            if isinstance(value, dict) and isinstance(out.get(key), dict):
+                out[key] = {**out[key], **value}
+            else:
+                out[key] = value
     return out
 
 

@@ -151,7 +151,8 @@
     "ADC": "Agree Realty — 항체약물접합체",
     "NPO": "— 비영리단체",
     "KAI": "Kadant — 한국항공우주 약어(별칭 047810 으로 돌림)",
-    "SNT": "Senstar — 에스엔티 그룹 약어"
+    "SNT": "Senstar — 에스엔티 그룹 약어",
+    "NOW": "ServiceNow — 영어 단어 now"
   },
   "_us_comment": "미국 bare 티커 차단 — 한국 증권 텍스트에서 이 철자는 단어지 티커가 아니다. cashtag($AI)로 쓰면 여전히 인정한다. 30일 실측 기준으로 이 철자들은 cashtag 사용이 0회다. telegram_fp_candidates(market=\"US\") 로 후보를 보고 telegram_block_name 으로 추가한다. ~/.telegramlens/ambiguous_codes.json 으로 확장 가능."
 }

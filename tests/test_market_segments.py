@@ -194,5 +194,45 @@ class KoreanAbbreviationAliasTests(unittest.TestCase):
         self.assertIn("002380", self._codes("KCC 실적 개선"))
 
 
+class AliasCandidatePatternTests(unittest.TestCase):
+    """`이름(코드)` 표기에서 이름을 통째로 떠와야 한다.
+
+    실측: 옛 패턴은 10자에서 끊고 왼쪽 경계가 없어 '한국타이어앤테크놀로지' 를
+    '국타이어앤테크놀로지' 로, 'S-Oil' 을 'Oil' 로 잘라 후보에 올렸다.
+    """
+
+    def _find(self, text):
+        from telegram_lens.discover import _NAME_CODE_RE
+
+        return _NAME_CODE_RE.findall(text)
+
+    def test_long_korean_name_is_not_truncated(self):
+        self.assertEqual(
+            self._find("한국타이어앤테크놀로지(161390) 실적"),
+            [("한국타이어앤테크놀로지", "161390")],
+        )
+        self.assertEqual(
+            self._find("LIG디펜스앤에어로스페이스(079550)"),
+            [("LIG디펜스앤에어로스페이스", "079550")],
+        )
+
+    def test_hyphen_and_ampersand_are_left_boundaries(self):
+        self.assertEqual(self._find("S-Oil(010950) 정제마진"), [("S-Oil", "010950")])
+        self.assertEqual(self._find("삼성E&A(028050) 수주"), [("삼성E&A", "028050")])
+
+    def test_ascii_name_keeps_its_internal_space(self):
+        self.assertEqual(self._find("LS ELECTRIC(010120)"), [("LS ELECTRIC", "010120")])
+        self.assertEqual(self._find("NHN KCP(060250)"), [("NHN KCP", "060250")])
+
+    def test_korean_name_does_not_swallow_the_previous_word(self):
+        # 한글로 시작하는 이름에는 내부 구분자를 허용하지 않는다
+        self.assertEqual(self._find("오늘의 리포트 삼성전자(005930)"), [("삼성전자", "005930")])
+
+    def test_new_style_alphanumeric_code_is_matched(self):
+        self.assertEqual(
+            self._find("삼성에피스홀딩스(0126Z0) 상장"), [("삼성에피스홀딩스", "0126Z0")]
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

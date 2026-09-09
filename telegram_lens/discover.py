@@ -19,7 +19,29 @@ from telegram_lens.extract import extract_mentions
 from telegram_lens.stocks import load_ambiguous, load_stocks
 
 # 이름(123456) — 한국 증시 글에서 매우 흔한 표기. 고정밀 별칭 신호.
-_NAME_CODE_RE = re.compile(r"([가-힣A-Za-z][가-힣A-Za-z0-9]{1,9})\s*\(\s*(\d{6})\s*\)")
+#
+# 세 가지를 지켜야 후보가 쓸 만해진다:
+#   1. 왼쪽 경계. 없으면 더 긴 말의 꼬리를 문다 — "S-Oil(010950)" 에서 "Oil" 만 잡혔다.
+#   2. 길이 상한을 넉넉히. 10자에서 끊겨 "한국타이어앤테크놀로지" 가
+#      "국타이어앤테크놀로지" 로, "LIG디펜스앤에어로스페이스" 가 "펜스앤에어로스페이스" 로
+#      잘려 나왔다. 잘린 조각은 사전에 없으니 전부 후보가 됐다.
+#   3. 영문 상호의 내부 구분자(공백·&·-)를 허용. "LS ELECTRIC", "NHN KCP", "KT&G",
+#      "S-Oil" 이 한 덩어리로 잡혀야 한다. 한글로 시작하는 이름에는 구분자를 허용하지
+#      않는다 — "리포트 삼성전자(005930)" 에서 "리포트 삼성전자" 를 물면 안 되기 때문이다.
+#
+# 코드는 extract 와 같은 KRX 단축코드 규칙(신형 영숫자 포함)을 쓴다.
+_NAME_CODE_RE = re.compile(
+    r"(?<![가-힣A-Za-z0-9\-&])"
+    r"("
+    # 영문 시작 — 내부에 한글·&·- 가 섞이고(LIG디펜스앤에어로스페이스, S-Oil),
+    # 공백은 한 번만 허용한다(LS ELECTRIC, NHN KCP, TIGER 미국나스닥100).
+    # 두 번 허용하면 "AI 데이터센터 삼성전자(005930)" 를 통째로 문다.
+    r"[A-Za-z][가-힣A-Za-z0-9&\-]{0,24}(?:[ ][가-힣A-Za-z0-9&\-]{1,24})?"
+    # 한글 시작 — 공백은 허용하지 않는다("리포트 삼성전자" 를 물면 안 된다).
+    r"|[가-힣][가-힣A-Za-z0-9&\-]{1,24}"
+    r")"
+    r"\s*\(\s*(\d{4}[0-9A-Z]\d)\s*\)"
+)
 
 
 def _cutoff(days: float) -> str:
@@ -362,27 +384,41 @@ def alias_candidates(days: float = 7, min_count: int = 2, top: int = 40) -> list
 
     counter: dict[tuple[str, str], int] = {}
     for r in rows:
-        for token, code in _NAME_CODE_RE.findall(r["text"]):
-            if code not in by_code:
+        for token, code in _NAME_CODE_RE.findall(r["text"] or ""):
+            token = token.strip()
+            if code not in by_code or len(token) < 2:
                 continue
             official = by_code[code]
             if token == official:
                 continue
+            # 정식명의 앞부분은 버리지 않는다 — 삼성화재(삼성화재해상보험)·
+            # 한국전력(한국전력공사)처럼 실제로 쓰이는 약칭이 그 모양이다.
+            # 뒷부분 잘림은 위 정규식의 왼쪽 경계와 길이 상한이 이미 막는다.
             # 이미 현재 로직(이름/별칭)으로 이 코드가 잡히면 후보 아님
             extracted = dict(extract_mentions(token))
             if code in extracted:
                 continue
             counter[(token, code)] = counter.get((token, code), 0) + 1
 
-    out = [
-        {
+    out = []
+    for (token, code), cnt in counter.items():
+        if cnt < min_count:
+            continue
+        official = by_code[code]
+        # 검토를 빠르게 하는 신호 — 이게 없으면 사람이 매번 원문을 열어야 한다.
+        ascii_only = all(ch.isascii() for ch in token)
+        out.append({
             "alias": token,
             "code": code,
-            "official_name": by_code[code],
+            "official_name": official,
             "count": cnt,
-        }
-        for (token, code), cnt in counter.items()
-        if cnt >= min_count
-    ]
+            "signals": {
+                "alias_length": len(token),
+                "ascii_only": ascii_only,
+                "has_separator": any(s in token for s in " &-"),
+                # 정식명과 글자를 공유하지 않는 약어(KAI↔한국항공우주)인지
+                "shares_chars_with_official": bool(set(token) & set(official)),
+            },
+        })
     out.sort(key=lambda x: x["count"], reverse=True)
     return out[:top]
