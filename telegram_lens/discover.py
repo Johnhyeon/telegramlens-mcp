@@ -30,12 +30,18 @@ def _cutoff(days: float) -> str:
 _ISSUER_HINTS = ("리서치", "리포트", "레포트", "보고서", "작성자", "애널리스트", "출처")
 
 
-def _fp_samples(conn, code: str, name: str, cut: str, limit: int = 3) -> list[dict]:
+def _fp_samples(
+    conn, code: str, name: str, cut: str, limit: int = 3,
+    confirm_token: str | None = None,
+) -> list[dict]:
     """후보의 대표 표본 - 문맥·채널·시각·유형·링크(요구 1).
 
     문맥 없이 이름과 건수만 보면 안전한 차단 결정을 내릴 수 없다.
-    코드 동반이 없는(=차단 시 사라질) 언급만 표본으로 뽑는다.
+    '확인 표기'가 없는(=차단 시 사라질) 언급만 표본으로 뽑는다. 확인 표기는
+    한국은 6자리 코드, 미국은 cashtag($TICKER)다 — 둘 다 "글쓴이가 종목임을
+    명시한 흔적"이라는 같은 역할을 한다.
     """
+    token = confirm_token if confirm_token is not None else code
     rows = conn.execute(
         """
         SELECT m.text, m.date, m.msg_id, m.msg_type,
@@ -47,7 +53,7 @@ def _fp_samples(conn, code: str, name: str, cut: str, limit: int = 3) -> list[di
           AND m.text NOT LIKE '%' || ? || '%'
         ORDER BY m.date DESC LIMIT ?
         """,
-        (code, cut, code, limit),
+        (code, cut, token, limit),
     ).fetchall()
     samples = []
     for r in rows:
@@ -75,17 +81,139 @@ def _fp_samples(conn, code: str, name: str, cut: str, limit: int = 3) -> list[di
     return samples
 
 
-def false_positive_candidates(
-    days: float = 7, max_name_len: int = 3, min_count: int = 3, top: int = 40
+def _us_fp_candidates(
+    days: float, max_ticker_len: int, min_count: int, top: int
 ) -> list[dict]:
-    """코드 동반 없이 이름만으로 자주 잡힌 종목명 → 오탐 후보.
+    """cashtag 없이 bare 로만 잡힌 미국 티커 → 오탐 후보.
 
-    의심도는 코드 동반 비율 하나로 정하지 않는다(TL-02 요구 3). 실측에서
+    한국 종목의 '코드 동반' 신호와 같은 자리에 cashtag($TICKER)를 놓는다.
+    한국 채널에서 진짜 미국 종목을 말할 때는 $NVDA 처럼 쓰거나 한글 통용명을
+    쓴다. 30일 실측에서 NVDA 는 cashtag 14회, AMD 는 3회였고 AI·IR·HBM 은
+    0회였다 — 단어인 철자는 아무도 cashtag 로 쓰지 않는다.
+    """
+    from telegram_lens import us_stocks
+    from telegram_lens.stocks import load_us_blocked
+
+    cut = _cutoff(days)
+    blocked = load_us_blocked()
+    aliased = {t for _, t in us_stocks.alias_terms()}
+
+    with db.connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT men.code, men.name,
+                   COUNT(*) AS total,
+                   SUM(CASE WHEN m.text LIKE '%$' || men.code || '%' THEN 1 ELSE 0 END)
+                       AS cashtag_confirmed,
+                   COUNT(DISTINCT men.channel_id) AS channels,
+                   COUNT(DISTINCT m.text_sig) AS distinct_sigs,
+                   COUNT(DISTINCT m.text) AS distinct_texts
+            FROM mentions men
+            JOIN messages m ON m.id = men.message_id
+            WHERE men.date >= ?
+            GROUP BY men.code
+            """,
+            (cut,),
+        ).fetchall()
+
+        out = []
+        for r in rows:
+            ticker = r["code"]
+            if queries_market_of(ticker) != "US" or ticker in blocked:
+                continue
+            if len(ticker) > max_ticker_len:
+                continue
+            bare = r["total"] - (r["cashtag_confirmed"] or 0)
+            if bare < min_count:
+                continue
+            total = max(r["total"], 1)
+            base = bare / total
+            distinct = max(r["distinct_sigs"] or 0, r["distinct_texts"] or 0)
+            distinct_ratio = round(distinct / total, 2)
+            in_seed = ticker in us_stocks.US_SEED
+            has_alias = ticker in aliased
+
+            factor = 1.0
+            if in_seed:
+                factor *= 0.4      # 손으로 고른 주요 종목 — 오탐일 가능성 낮다
+            if has_alias:
+                factor *= 0.5      # 한글 통용명이 있으면 그 경로로도 잡힌다
+            if len(ticker) <= 2:
+                factor *= 1.3      # 두 글자는 약어와 거의 항상 겹친다
+            elif len(ticker) >= 4:
+                factor *= 0.8
+            if (r["channels"] or 0) >= 3:
+                factor *= 0.85
+            if distinct_ratio >= 0.5 and total >= 3:
+                factor *= 0.9
+            suspicion = round(min(1.0, base * factor), 2)
+            review = ("차단 검토" if suspicion >= 0.8
+                      else "표본 확인" if suspicion >= 0.5 else "정상 가능성")
+
+            out.append({
+                "market": "US",
+                "code": ticker,
+                "name": r["name"],
+                "name_only_hits": bare,          # = cashtag 없는 bare 매칭
+                "code_confirmed_hits": r["cashtag_confirmed"] or 0,
+                "code_absent_ratio": round(base, 2),
+                "signals": {
+                    "confirm_token": "cashtag($TICKER)",
+                    "ticker_length": len(ticker),
+                    "in_us_seed": in_seed,
+                    "has_korean_alias": has_alias,
+                    "distinct_channels": r["channels"] or 0,
+                    "distinct_text_ratio": distinct_ratio,
+                },
+                "suspicion": suspicion,
+                "review": review,
+                "samples": _fp_samples(
+                    conn, ticker, ticker, cut, confirm_token="$" + ticker
+                ),
+            })
+    out.sort(key=lambda x: (x["suspicion"], x["name_only_hits"]), reverse=True)
+    return out[:top]
+
+
+def queries_market_of(code: str) -> str:
+    """queries.market_of 를 늦게 가져온다(모듈 순환 회피)."""
+    from telegram_lens.queries import market_of
+
+    return market_of(code)
+
+
+def false_positive_candidates(
+    days: float = 7,
+    max_name_len: int = 0,
+    min_count: int = 3,
+    top: int = 40,
+    market: str = "all",
+) -> list[dict]:
+    """확인 표기 없이 이름·철자만으로 자주 잡힌 것 → 오탐 후보.
+
+    market='KR' 은 한국 종목명(확인 표기 = 6자리 코드), 'US' 는 미국 티커
+    (확인 표기 = cashtag)를 본다. 'all' 이면 둘을 합쳐 의심도 순으로 돌려준다.
+
+    의심도는 확인 표기 비율 하나로 정하지 않는다(TL-02 요구 3). 실측에서
     LG전자·에코프로비엠처럼 정상적인 이름 언급도 코드가 없다는 이유만으로
     1.0 이 됐다. 정식 상장명인지, 이름 길이, 채널 다양성, 같은 문장의 반복
     여부를 함께 본다 - 여러 채널에서 서로 다른 문장으로 불리는 이름은 은어
     충돌보다 실제 종목일 가능성이 높다.
+
+    max_name_len 은 0이면 자동 — 한국 3(짧은 이름이 충돌한다), 미국 5(티커 전체).
     """
+    market = (market or "all").upper()
+    if market == "US":
+        return _us_fp_candidates(days, max_name_len or 5, min_count, top)
+    if market == "ALL":
+        merged = (
+            false_positive_candidates(days, max_name_len, min_count, top, "KR")
+            + _us_fp_candidates(days, max_name_len or 5, min_count, top)
+        )
+        merged.sort(key=lambda x: (x["suspicion"], x["name_only_hits"]), reverse=True)
+        return merged[:top]
+
+    max_name_len = max_name_len or 3
     cut = _cutoff(days)
     ambiguous = load_ambiguous()
     official_names = load_stocks()
@@ -112,6 +240,8 @@ def false_positive_candidates(
         for r in rows:
             if r["code"] in ambiguous:
                 continue
+            if queries_market_of(r["code"]) != "KR":
+                continue        # 미국 티커는 cashtag 신호로 따로 본다
             if len(r["name"]) > max_name_len:
                 continue
             name_only = r["total"] - (r["code_confirmed"] or 0)
@@ -142,12 +272,14 @@ def false_positive_candidates(
                       else "표본 확인" if suspicion >= 0.5 else "정상 가능성")
 
             out.append({
+                "market": "KR",
                 "code": r["code"],
                 "name": r["name"],
                 "name_only_hits": name_only,
                 "code_confirmed_hits": r["code_confirmed"] or 0,
                 "code_absent_ratio": round(base, 2),
                 "signals": {
+                    "confirm_token": "6자리 코드",
                     "official_name": official,
                     "name_length": len(r["name"]),
                     "distinct_channels": r["channels"] or 0,
@@ -162,9 +294,19 @@ def false_positive_candidates(
     return out[:top]
 
 
+def confirm_token_for(code: str) -> str:
+    """차단·표본에서 '글쓴이가 종목임을 명시한 흔적'으로 볼 표기.
+
+    한국은 6자리 코드가 본문에 같이 있으면 종목이다. 미국은 cashtag($NVDA)가
+    같은 역할을 한다 — 티커 철자만으로는 약어와 구분되지 않기 때문이다.
+    """
+    return code if queries_market_of(code) == "KR" else "$" + code.upper()
+
+
 def block_preview(code: str, days: float = 30) -> dict:
     """차단하면 최근 집계에서 빠질 언급 수와 표본(요구 4). 아무것도 쓰지 않는다."""
     cut = _cutoff(days)
+    token = confirm_token_for(code)
     with db.connect() as conn:
         row = conn.execute(
             """
@@ -173,11 +315,13 @@ def block_preview(code: str, days: float = 30) -> dict:
             WHERE men.code = ? AND men.date >= ?
               AND m.text NOT LIKE '%' || ? || '%'
             """,
-            (code, cut, code),
+            (code, cut, token),
         ).fetchone()
         name = row["name"] or code
-        samples = _fp_samples(conn, code, name, cut)
+        search = code if queries_market_of(code) == "KR" else code
+        samples = _fp_samples(conn, code, search, cut, confirm_token=token)
     return {"code": code, "name": name, "days": days,
+            "market": queries_market_of(code), "confirm_token": token,
             "would_exclude": row["n"] or 0, "samples": samples}
 
 
@@ -189,6 +333,7 @@ def purge_name_only_mentions(code: str, days: float = 30) -> int:
     dry-run 과 실제 제외 건수가 일치한다(수용 3).
     """
     cut = _cutoff(days)
+    token = confirm_token_for(code)
     with db.connect() as conn:
         cur = conn.execute(
             """
@@ -199,7 +344,7 @@ def purge_name_only_mentions(code: str, days: float = 30) -> int:
                   AND m.text NOT LIKE '%' || ? || '%'
             )
             """,
-            (code, cut, code),
+            (code, cut, token),
         )
         conn.commit()
         return cur.rowcount

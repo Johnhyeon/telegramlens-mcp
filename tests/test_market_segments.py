@@ -151,5 +151,48 @@ class UsTickerGuardTests(unittest.TestCase):
         self.assertIn("NVDA", self._codes("엔비디아 NVDA 실적 서프라이즈"))
 
 
+class BlockListIsDataTests(unittest.TestCase):
+    """미국 차단 목록은 코드 상수가 아니라 데이터여야 한다 — 도구로 늘릴 수 있게."""
+
+    def test_us_block_list_loads_from_data_file(self):
+        from telegram_lens.stocks import load_us_blocked
+
+        blocked = load_us_blocked()
+        self.assertGreater(len(blocked), 50)
+        for t in ("AI", "IR", "HBM", "ASIC", "DAC"):
+            self.assertIn(t, blocked, t)
+
+    def test_confirm_token_differs_by_market(self):
+        from telegram_lens import discover
+
+        self.assertEqual(discover.confirm_token_for("005930"), "005930")
+        self.assertEqual(discover.confirm_token_for("NVDA"), "$NVDA")
+
+
+class KoreanAbbreviationAliasTests(unittest.TestCase):
+    """한국 회사 약어는 막을 게 아니라 국내 종목으로 돌려줘야 한다."""
+
+    def _codes(self, text):
+        return {c for c, _ in extract.extract_mentions(text)}
+
+    def test_kai_resolves_to_korea_aerospace(self):
+        self.assertIn("047810", self._codes("KAI 유무인 복합 전투기"))
+        self.assertNotIn("KAI", self._codes("KAI 유무인 복합 전투기"))
+
+    def test_kaist_is_not_a_mention(self):
+        self.assertEqual(self._codes("KAIST 연구진 발표"), set())
+
+    def test_longer_english_form_wins_over_short_alias(self):
+        # 사전은 '케이티앤지'로만 갖고 있어, 영문형을 별칭으로 넣어야 KT 가 물지 않는다
+        self.assertIn("033780", self._codes("KT&G 배당 확대"))
+        self.assertNotIn("030200", self._codes("KT&G 배당 확대"))
+        self.assertIn("344820", self._codes("KCC글라스 유리 흑자"))
+        self.assertNotIn("002380", self._codes("KCC글라스 유리 흑자"))
+
+    def test_short_alias_still_works_alone(self):
+        self.assertIn("030200", self._codes("KT 실적 개선"))
+        self.assertIn("002380", self._codes("KCC 실적 개선"))
+
+
 if __name__ == "__main__":
     unittest.main()

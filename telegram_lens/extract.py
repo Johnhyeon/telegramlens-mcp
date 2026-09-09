@@ -18,6 +18,7 @@ from telegram_lens.stocks import (
     load_aliases,
     load_ambiguous,
     load_firm_abbrs,
+    load_us_blocked,
     load_source_firms,
     load_stocks,
 )
@@ -194,6 +195,7 @@ def reset_index() -> None:
     _s._ambiguous_cache = None
     _s._source_firms_cache = None
     _s._firm_abbr_cache = None
+    _s._us_blocked_cache = None
     _name_index.cache_clear()
 
 
@@ -201,24 +203,11 @@ _CASHTAG_RE = re.compile(r"\$([A-Z]{1,5}(?:\.[AB])?)\b")
 _BARE_US_RE = re.compile(r"(?<![A-Za-z$])([A-Z]{2,5})(?![A-Za-z])")
 
 
-# 한국 증권 텍스트에서 '단어'로 쓰이는 약어. 미국 티커와 철자가 겹치지만
-# (AI→C3.ai, IR→Ingersoll Rand, HBM→Hudbay Minerals, HD→Home Depot,
-#  KB→KB Financial ADR, DB→Deutsche Bank) 한국 채널에서 이 철자가 종목을
-# 가리키는 일은 사실상 없다. cashtag($AI)로 명시할 때만 인정한다.
-_KR_CONTEXT_ABBRS = frozenset({
-    "AI", "IR", "IT", "HD", "KB", "DB", "CS", "PC", "TV", "PR", "PT", "PS",
-    "MS", "MA", "BW", "CB", "EV", "OS", "UX", "UI", "QC", "RD", "SI", "SW",
-    "HBM", "DDR", "CPI", "PPI", "GDP", "ETF", "ETN", "IPO", "ROE", "ROA",
-    "EPS", "PER", "PBR", "PSR", "OEM", "ODM", "ESS", "ESG", "SMR", "LNG",
-    "LPG", "RNA", "DNA", "CEO", "CFO", "CTO", "IPS", "PCB", "OLED", "LCD",
-    "AGI", "GPT", "LLM", "NPU", "GPU", "CPU", "SSD", "HDD", "API", "SOC",
-    "EUV", "DUV", "ASP", "TAM", "FDA", "CES", "IRA", "FTA", "M&A", "IPS",
-    # 실측(7일 수집분)에서 실제로 오탐을 낸 것들 — 지표·용어·기관명이다.
-    "WTI", "FCF", "ADP", "MSD", "GLP", "EPC", "CAPA", "CART", "ASIC", "DAC",
-    "PMI", "EMA", "PEG", "IDE", "GEN", "CAR", "COO", "ALT", "NXT", "III",
-    "TOP", "HIT", "HAS", "FOR", "KEY", "USA", "CIA", "NYT", "TAP", "OCC",
-    "ASC", "PAY", "FIX", "MOD", "MTA", "CPS", "ARR", "OIS",
-})
+# 한국 증권 텍스트에서 '단어'로 쓰이는 약어는 data/ambiguous_codes.json 의
+# us_bare_blocked 가 갖는다(AI→C3.ai, IR→Ingersoll Rand, HBM→Hudbay Minerals,
+# HD→Home Depot, KB→KB Financial ADR, DB→Deutsche Bank …). 데이터로 둬야
+# telegram_fp_candidates(market="US") → telegram_block_name 으로 늘릴 수 있다.
+# cashtag($AI)로 명시하면 여전히 인정한다.
 
 # 시장 문맥어를 티커 주변에서만 찾는 창(글자). 메시지 전체를 보면 증권 채널
 # 글은 어디엔가 '주가'·'실적'이 있어 가드가 사실상 꺼진다.
@@ -241,6 +230,7 @@ def _us_mentions(text: str) -> dict[str, str]:
 
     found: dict[str, str] = {}
     table = us_stocks.load_us_map()
+    blocked = load_us_blocked()
 
     for m in _CASHTAG_RE.finditer(text):
         ticker = m.group(1)
@@ -262,7 +252,7 @@ def _us_mentions(text: str) -> dict[str, str]:
         ):
             continue
         # G2: 한국 증권 문맥에서 단어로 쓰이는 약어는 cashtag 로만.
-        if ticker in _KR_CONTEXT_ABBRS:
+        if ticker in blocked:
             continue
         # G3: 두 글자 bare 는 시드(주요 종목)만 허용.
         if len(ticker) <= 2 and ticker not in us_stocks.US_SEED:

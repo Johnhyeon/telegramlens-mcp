@@ -209,6 +209,7 @@ _aliases_cache: dict[str, str] | None = None
 _ambiguous_cache: set[str] | None = None
 _source_firms_cache: set[str] | None = None
 _firm_abbr_cache: frozenset[str] | None = None
+_us_blocked_cache: dict[str, str] | None = None
 
 # 리포트 요약 채널에서 발행사를 짧게 줄여 쓰는 표기. 사전에서 자동 산출되지 않는
 # 것(비상장·자회사·독립리서치)만 손으로 적는다. 상장 증권사는 이름에서 접미사를
@@ -276,6 +277,42 @@ def load_source_firms() -> set[str]:
         result = {code for code, name in by_code.items() if name.endswith(sfx)}
     _source_firms_cache = result
     return _source_firms_cache
+
+
+def load_us_blocked() -> dict[str, str]:
+    """미국 bare 티커 차단 목록 {티커: 메모}. 패키지 기본 + 사용자 override 병합.
+
+    한국 증권 텍스트에서 AI·IR·HBM 같은 철자는 단어지 티커가 아니다. cashtag($AI)
+    로 쓰면 여전히 인정한다(extract 의 bare 경로에서만 막는다).
+    """
+    global _us_blocked_cache
+    if _us_blocked_cache is not None:
+        return _us_blocked_cache
+    raw = _load_json("ambiguous_codes.json")
+    blocked = raw.get("us_bare_blocked", {})
+    _us_blocked_cache = (
+        {str(t).upper(): str(n) for t, n in blocked.items()}
+        if isinstance(blocked, dict)
+        else {}
+    )
+    return _us_blocked_cache
+
+
+def add_us_blocked(ticker: str, note: str = "") -> dict:
+    """사용자 override(ambiguous_codes.json)에 미국 티커 차단 추가."""
+    ticker = str(ticker).upper()
+    data = _read_user_json("ambiguous_codes.json")
+    blocked = data.get("us_bare_blocked")
+    if not isinstance(blocked, dict):
+        blocked = {}
+    blocked[ticker] = note
+    data["us_bare_blocked"] = blocked
+    (data_dir() / "ambiguous_codes.json").write_text(
+        json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    global _us_blocked_cache
+    _us_blocked_cache = None
+    return {"ticker": ticker, "note": note}
 
 
 def load_firm_abbrs() -> frozenset[str]:

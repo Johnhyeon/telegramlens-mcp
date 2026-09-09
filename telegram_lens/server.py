@@ -35,6 +35,7 @@ from telegram_lens.extract import reset_index
 from telegram_lens.stocks import (
     add_alias,
     add_ambiguous,
+    add_us_blocked,
     load_etf_codes,
     load_stocks,
     resolve_code,
@@ -1630,22 +1631,33 @@ async def telegram_set_tier(
 @safe_tool
 @track_metrics("telegram_fp_candidates")
 async def telegram_fp_candidates(
-    days: float = 7, max_name_len: int = 3, min_count: int = 3, top: int = 40
+    days: float = 7,
+    max_name_len: int = 0,
+    min_count: int = 3,
+    top: int = 40,
+    market: str = "all",
 ) -> str:
-    """오탐(잘못 잡힌 종목명) 후보를 반환합니다.
+    """오탐(잘못 잡힌 종목) 후보를 반환합니다.
 
-    코드 없이 이름만으로 자주 잡힌 짧은 종목명 → 일반명사/은어 충돌 의심.
+    '확인 표기' 없이 이름·철자만으로 자주 잡힌 것 → 일반명사·약어 충돌 의심.
+    확인 표기는 **국내는 본문의 6자리 코드, 미국은 cashtag($NVDA)** 입니다.
+    글쓴이가 종목임을 명시한 흔적이라는 점에서 같은 역할을 합니다.
     검토 후 telegram_block_name 으로 차단 목록에 추가하세요.
 
     Args:
         days: 분석 기간(일). 기본 7.
-        max_name_len: 검사할 최대 이름 길이. 기본 3.
-        min_count: 최소 이름단독 매칭 수. 기본 3.
+        max_name_len: 검사할 최대 길이. 0이면 자동 — 국내 3(짧은 이름이 충돌),
+            미국 5(티커 전체).
+        min_count: 최소 '확인 표기 없는' 매칭 수. 기본 3.
         top: 상위 N개. 기본 40.
+        market: "KR"(국내 종목명)/"US"(미국 티커)/"all"(합쳐서 의심도 순). 기본 all.
+            미국 오탐은 AI(C3.ai)·IR(Ingersoll Rand)·HBM(Hudbay Minerals)처럼
+            한국 증권 글에서 단어로 쓰이는 철자가 티커와 겹쳐 생깁니다.
     """
     return _json(
         discover.false_positive_candidates(
-            days=days, max_name_len=max_name_len, min_count=min_count, top=top
+            days=days, max_name_len=max_name_len, min_count=min_count,
+            top=top, market=market,
         )
     )
 
@@ -1687,16 +1699,19 @@ async def telegram_add_alias(alias: str, code: str) -> str:
 @safe_tool
 @track_metrics("telegram_block_name")
 async def telegram_block_name(code: str, note: str = "", dry_run: bool = False) -> str:
-    """종목을 모호어 차단 목록에 추가합니다(이름 단독 매칭 차단, 코드 동반 시만 인정).
+    """종목을 차단 목록에 추가합니다(확인 표기가 있을 때만 인정하도록).
+
+    **국내 6자리 코드와 미국 티커를 모두 받습니다.** 국내는 이름 단독 매칭을
+    막고 본문에 코드가 있을 때만 인정하며, 미국은 bare 매칭을 막고
+    cashtag($NVDA)로 쓸 때만 인정합니다.
 
     dry_run=True 면 아무것도 바꾸지 않고, 최근 30일 집계에서 빠질 언급 수와
-    원문 표본을 보여줍니다. 실제 적용 시 같은 조건으로 이름 단독 언급을
-    집계에서 제거하므로 두 건수는 일치합니다. 적용 후에는
-    telegram_trending / telegram_fp_candidates 를 다시 돌려 순위 변화와
-    오탐 회귀를 확인하세요.
+    원문 표본을 보여줍니다. 실제 적용 시 같은 조건으로 제거하므로 두 건수는
+    일치합니다. 적용 후에는 telegram_trending / telegram_fp_candidates 를
+    다시 돌려 순위 변화와 오탐 회귀를 확인하세요.
 
     Args:
-        code: 6자리 종목코드 (예: 001680).
+        code: 6자리 종목코드(예: 001680) 또는 미국 티커(예: ASIC).
         note: 메모(예: '대상 = target/object 충돌').
         dry_run: True 면 미리보기만(기본 False).
     """
@@ -1705,7 +1720,10 @@ async def telegram_block_name(code: str, note: str = "", dry_run: bool = False) 
         return _json({"dry_run": True, **preview,
                       "note": "아무것도 변경되지 않았습니다. 표본을 확인한 뒤 "
                               "dry_run 없이 다시 호출하면 적용됩니다."})
-    result = add_ambiguous(code, note)
+    if preview["market"] == "US":
+        result = add_us_blocked(code, note)
+    else:
+        result = add_ambiguous(code, note)
     reset_index()
     purged = discover.purge_name_only_mentions(code)
     return _json({
