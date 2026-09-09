@@ -32,6 +32,7 @@
     "456040": "OCI (Oracle Cloud — standalone 토큰)",
     "346010": "타이드 (글루타이드 등 -tide — 3글자라 한글경계 미적용)",
     "451760": "컨텍 (컨텍스트 — 뒤한글이라 경계로 못 거름)",
-    "011810": "STX (BlueField STX 등 — standalone 영문토큰)"
+    "011810": "STX (BlueField STX 등 — standalone 영문토큰)",
+    "313760": "캐리 (엔 캐리 트레이드 — 앞뒤 공백이라 경계로 못 거름)"
   }
 }
