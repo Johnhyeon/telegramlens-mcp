@@ -77,6 +77,46 @@ MARKET_CONTEXT_WORDS = (
     "프리장", "애프터", "pre-market", "earnings",
 )
 
+# 미국 ETF 티커. SEC company_tickers 목록에는 ETF 표시가 없어(펀드도 회사로 들어온다)
+# 이름만으로는 은행·신탁회사와 구분이 안 된다. 한국 채널에 실제로 등장하는 것만 명시한다.
+# 국내 ETF(load_etf_codes, KRX 제공)와 달리 이쪽은 수동 관리다.
+US_ETF_TICKERS = frozenset({
+    # 광범위 지수
+    "SPY", "VOO", "IVV", "QQQ", "QQQM", "DIA", "IWM", "VTI", "VT", "RSP",
+    # 레버리지·인버스
+    "TQQQ", "SQQQ", "SPXL", "SPXS", "UPRO", "SOXL", "SOXS", "TNA", "TZA",
+    "LABU", "LABD", "NVDL", "TSLL", "FNGU", "BULZ", "UVXY", "VXX", "SVIX",
+    # 섹터·테마
+    "SOXX", "SMH", "XLK", "XLF", "XLE", "XLV", "XLI", "XLY", "XLP", "XLU",
+    "XLB", "XLRE", "XLC", "ARKK", "ARKG", "ARKW", "ARKQ", "IGV", "SKYY",
+    "BOTZ", "ROBO", "ICLN", "TAN", "LIT", "URA", "URNM", "ITA", "PPA",
+    "XBI", "IBB", "IYT", "KWEB", "FXI", "MCHI", "EWY", "EWJ", "EEM", "EFA",
+    # 채권·금리
+    "TLT", "IEF", "SHY", "BIL", "AGG", "BND", "LQD", "HYG", "JNK", "TIP",
+    # 원자재·통화
+    "GLD", "IAU", "SLV", "USO", "UNG", "DBA", "PDBC", "UUP",
+    # 배당·인컴·커버드콜
+    "SCHD", "VYM", "DVY", "JEPI", "JEPQ", "QYLD", "XYLD", "RYLD", "DIVO",
+    # 암호화폐 현물·선물
+    "BITO", "IBIT", "FBTC", "GBTC", "ARKB", "ETHE", "ETHA",
+})
+
+
+# 이름 표기로 ETF 를 알아볼 때 쓰는 패턴. 부분 문자열로 보면 Netflix 의 'etf' 가
+# 걸린다 — 반드시 낱말 경계를 요구한다.
+_ETF_WORD_RE = re.compile(r"\bETFs?\b", re.I)
+
+
+def is_us_etf(ticker: str, name: str | None = None) -> bool:
+    """미국 ETF 여부. 명시 목록이 1차, 이름 표기가 2차.
+
+    2차는 보수적으로 본다 — "Trust" 만으로는 은행·리츠와 구분이 안 되므로
+    이름에 'ETF' 가 낱말로 들어간 경우만 인정한다.
+    """
+    if ticker in US_ETF_TICKERS:
+        return True
+    return bool(name and _ETF_WORD_RE.search(name))
+
 _FOREIGN_SUFFIX_RE = re.compile(
     r"^[A-Z0-9]{1,6}\.(T|HK|SS|SZ|L|PA|DE|TO|AX|KS|KQ)$")
 

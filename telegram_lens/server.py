@@ -335,16 +335,34 @@ def _stocks_payload(stocks: list, *, hours: int | None = None) -> dict:
     get_flow_batch)로 한 번에 넘길 때, stocks 를 재파싱하지 않고 codes 를 그대로 배치 입력에
     쓰라고 노출한다. 순서는 결과 정렬(상위 버즈 먼저)을 유지한다.
 
-    각 종목에 is_etf 를 달고, ETF 코드만 모은 etf_codes 도 별도로 준다(주식/ETF 구분용).
+    각 종목에 market('KR'/'US')·is_etf·segment 를 달고, 세그먼트별 코드 배열도 같이 준다.
+    집계는 국내주식·미국주식·국내ETF·미국ETF 네 갈래로 나뉜다 — 언급 규모가 달라
+    한 랭킹에 섞으면 큰 쪽이 작은 쪽의 자리를 먹는다.
+
+    **codes 는 국내 코드만** 담는다. 이어달리기용으로 노출하는 배열인데, 받는 쪽
+    (StockLens get_multi_stocks / get_flow_batch)이 국내 6자리 코드만 받기 때문이다.
+    미국 티커는 us_codes 로 따로 준다(StockLens get_us_multi_price 등에 넘긴다).
     """
     etf = load_etf_codes()
     for s in stocks:
-        s["is_etf"] = s["code"] in etf
+        seg = queries.segment_of(s["code"], s.get("name"))
+        s["segment"] = seg
+        s["market"] = "KR" if seg.startswith("kr") else "US"
+        s["is_etf"] = seg.endswith("etf")
+    by_seg = {
+        seg: [s["code"] for s in stocks if s["segment"] == seg]
+        for seg in queries.SEGMENTS
+    }
     return {
         "_guidance": _WHY_GUIDANCE,
         "_meta": _tl_meta(hours=hours),
-        "codes": [s["code"] for s in stocks],
-        "etf_codes": [s["code"] for s in stocks if s["code"] in etf],
+        "codes": by_seg["kr_stock"] + by_seg["kr_etf"],
+        "etf_codes": by_seg["kr_etf"],
+        "us_codes": by_seg["us_stock"] + by_seg["us_etf"],
+        "us_etf_codes": by_seg["us_etf"],
+        "segments": {
+            queries.SEGMENT_LABELS[seg]: by_seg[seg] for seg in queries.SEGMENTS
+        },
         "stocks": stocks,
     }
 
@@ -761,7 +779,9 @@ async def telegram_sync(minutes: int = 60, per_channel_limit: int = 500) -> str:
 @safe_tool
 @warn_if_collecting
 @track_metrics("telegram_trending")
-async def telegram_trending(hours: float = 24, top: int = 20, kind: str = "all") -> str:
+async def telegram_trending(
+    hours: float = 24, top: int = 20, kind: str = "all", market: str = "all"
+) -> str:
     """기간 내 텔레그램 언급량 상위 종목을 반환합니다.
 
     종목코드 매칭 전용 — 거시·지정학·테마(예: "미국 이란", "금리") 질문은 telegram_search 사용.
@@ -770,6 +790,11 @@ async def telegram_trending(hours: float = 24, top: int = 20, kind: str = "all")
         hours: 집계 시간 범위(시간). 기본 24.
         top: 상위 N개. 기본 20.
         kind: 종목 종류 — "stock"(개별주만)/"etf"(ETF만)/"all"(전체). 기본 all.
+        market: 시장 — "KR"(국내만)/"US"(미국만)/"all"(전체). 기본 all.
+            kind 와 조합해 **국내주식·미국주식·국내ETF·미국ETF 네 갈래**로 나뉩니다.
+            둘 다 all 이면 네 세그먼트를 각각 top 개씩 뽑아 이어 돌려줍니다
+            (한 랭킹에 섞으면 언급이 많은 국내주식이 정원을 다 먹습니다).
+            결과의 `segments` 에 세그먼트별 코드 배열이, 종목마다 `market`·`segment` 가 붙습니다.
         sort_by: 정렬 기준. "buzz_score"(기본, 절대 버즈 크기) /
             **"baseline_ratio"(평소 대비 배율)**.
             ⚠️ buzz_score 는 절대 언급량이라 삼성전자·SK하이닉스 같은 대형주가
@@ -782,7 +807,12 @@ async def telegram_trending(hours: float = 24, top: int = 20, kind: str = "all")
             (7일에 1건 → 오늘 1건 = 7배), 이 바닥이 없으면 한두 건짜리 종목이
             상위를 채웁니다. buzz_score 정렬에는 영향을 주지 않습니다.
     """
-    return _json(_stocks_payload(queries.trending(hours=hours, top=top, kind=kind), hours=hours))
+    return _json(
+        _stocks_payload(
+            queries.trending(hours=hours, top=top, kind=kind, market=market),
+            hours=hours,
+        )
+    )
 
 
 @mcp.tool()
@@ -790,7 +820,11 @@ async def telegram_trending(hours: float = 24, top: int = 20, kind: str = "all")
 @warn_if_collecting
 @track_metrics("telegram_momentum")
 async def telegram_momentum(
-    hours: float = 6, baseline_hours: float = 72, top: int = 15, kind: str = "all"
+    hours: float = 6,
+    baseline_hours: float = 72,
+    top: int = 15,
+    kind: str = "all",
+    market: str = "all",
 ) -> str:
     """최근 언급이 기준 구간 대비 급증한 종목(새 내러티브)을 반환합니다.
 
@@ -799,13 +833,19 @@ async def telegram_momentum(
     Args:
         hours: 최근 구간(시간). 기본 6.
         baseline_hours: 비교 기준 구간(시간). 기본 72.
-        top: 상위 N개. 기본 15.
+        top: 상위 N개(세그먼트별). 기본 15.
         kind: 종목 종류 — "stock"(개별주만)/"etf"(ETF만)/"all"(전체). 기본 all.
+        market: 시장 — "KR"(국내만)/"US"(미국만)/"all"(전체). 기본 all.
+            kind 와 조합해 국내주식·미국주식·국내ETF·미국ETF 네 갈래로 나뉩니다.
     """
     return _json(
         _stocks_payload(
             queries.momentum(
-                hours=hours, baseline_hours=baseline_hours, top=top, kind=kind
+                hours=hours,
+                baseline_hours=baseline_hours,
+                top=top,
+                kind=kind,
+                market=market,
             ),
             hours=hours,
         )
@@ -1358,6 +1398,7 @@ async def telegram_buzz_score(
     sentiment: str | None = None,
     top: int = 20,
     kind: str = "all",
+    market: str = "all",
     sort_by: str = "buzz_score",
     min_independent: int = 0,
 ) -> str:
@@ -1370,8 +1411,10 @@ async def telegram_buzz_score(
         only_types: 포함할 메시지 유형(예: ["report"]). 생략 시 전체.
         exclude_gossip: only_types 미지정 시 gossip 제외. 기본 False.
         sentiment: positive/negative/neutral 중 하나만. 생략 시 전체.
-        top: 상위 N개. 기본 20.
+        top: 상위 N개(세그먼트별). 기본 20.
         kind: 종목 종류 — "stock"(개별주만)/"etf"(ETF만)/"all"(전체). 기본 all.
+        market: 시장 — "KR"(국내만)/"US"(미국만)/"all"(전체). 기본 all.
+            kind 와 조합해 국내주식·미국주식·국내ETF·미국ETF 네 갈래로 나뉩니다.
     """
     return _json(
         _stocks_payload(
@@ -1382,6 +1425,7 @@ async def telegram_buzz_score(
                 sentiment=sentiment,
                 top=top,
                 kind=kind,
+                market=market,
                 sort_by=sort_by,
                 min_independent=min_independent,
             ),

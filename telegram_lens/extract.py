@@ -211,6 +211,8 @@ _KR_CONTEXT_ABBRS = frozenset({
     "HBM", "DDR", "CPI", "PPI", "GDP", "ETF", "ETN", "IPO", "ROE", "ROA",
     "EPS", "PER", "PBR", "PSR", "OEM", "ODM", "ESS", "ESG", "SMR", "LNG",
     "LPG", "RNA", "DNA", "CEO", "CFO", "CTO", "IPS", "PCB", "OLED", "LCD",
+    "AGI", "GPT", "LLM", "NPU", "GPU", "CPU", "SSD", "HDD", "API", "SOC",
+    "EUV", "DUV", "ASP", "TAM", "FDA", "CES", "IRA", "FTA", "M&A", "IPS",
 })
 
 # 시장 문맥어를 티커 주변에서만 찾는 창(글자). 메시지 전체를 보면 증권 채널

@@ -18,19 +18,80 @@ from telegram_lens.stocks import load_etf_codes
 _KST = ZoneInfo("Asia/Seoul")
 
 
-def _kind_predicate(kind: str):
-    """종목 종류 필터. kind='stock'(개별주만)/'etf'(ETF만)/'all'(전체).
+# KRX 단축코드 — 6자리 숫자(전통) 또는 신형 영숫자(DDDDAD). 이 모양이면 국내,
+# 아니면 미국 티커다(extract 가 code 자리에 한국은 단축코드, 미국은 티커를 넣는다).
+_KRX_CODE_RE = re.compile(r"^\d{4}[0-9A-Z]\d$")
 
-    반환: code→통과여부 함수, 또는 필터 불필요(all·미지원값)면 None.
-    개별주와 ETF는 언급 성격이 달라(종목 재료 vs 섹터·테마·자금흐름) 분리 조회를 지원한다.
+# 집계 세그먼트 — 국내주식·미국주식·국내ETF·미국ETF 네 갈래.
+SEGMENTS = ("kr_stock", "us_stock", "kr_etf", "us_etf")
+SEGMENT_LABELS = {
+    "kr_stock": "국내주식",
+    "us_stock": "미국주식",
+    "kr_etf": "국내ETF",
+    "us_etf": "미국ETF",
+}
+
+
+def market_of(code: str) -> str:
+    """'KR' 또는 'US'. 코드 모양으로 가른다."""
+    return "KR" if _KRX_CODE_RE.match(code or "") else "US"
+
+
+def segment_of(code: str, name: str | None = None) -> str:
+    """네 세그먼트 중 하나. 국내 ETF 는 KRX 목록, 미국 ETF 는 us_stocks 목록으로 판정."""
+    if market_of(code) == "KR":
+        return "kr_etf" if code in load_etf_codes() else "kr_stock"
+    from telegram_lens import us_stocks
+
+    return "us_etf" if us_stocks.is_us_etf(code, name) else "us_stock"
+
+
+def _segment_predicate(kind: str, market: str):
+    """종류(kind)·시장(market) 필터를 합친 code→통과여부 함수. 둘 다 'all' 이면 None.
+
+    kind='stock'(개별주)/'etf'(ETF)/'all', market='KR'/'US'/'all'.
+    개별주와 ETF는 언급 성격이 다르고(종목 재료 vs 섹터·테마·자금흐름), 한국과 미국은
+    언급량 규모가 달라 한 랭킹에 섞으면 한쪽이 다른 쪽의 자리를 먹는다.
     """
-    if kind == "etf":
-        etf = load_etf_codes()
-        return lambda code: code in etf
-    if kind == "stock":
-        etf = load_etf_codes()
-        return lambda code: code not in etf
-    return None
+    kind = (kind or "all").lower()
+    market = (market or "all").upper()
+    if kind not in ("stock", "etf"):
+        kind = "all"
+    if market not in ("KR", "US"):
+        market = "ALL"
+    if kind == "all" and market == "ALL":
+        return None
+
+    def ok(code: str, name: str | None = None) -> bool:
+        seg = segment_of(code, name)
+        if market != "ALL" and not seg.startswith(market.lower()):
+            return False
+        if kind != "all" and not seg.endswith(kind):
+            return False
+        return True
+
+    return ok
+
+
+def _kind_predicate(kind: str):
+    """예전 이름 — kind 만 보는 필터. _segment_predicate 로 위임한다."""
+    return _segment_predicate(kind, "all")
+
+
+def _take_per_segment(rows, top: int, key=lambda r: r["code"], name_key=None):
+    """세그먼트별로 상위 top 개씩 뽑아 국내주식→미국주식→국내ETF→미국ETF 순으로 잇는다.
+
+    한 랭킹에서 top 개를 자르면 언급이 많은 쪽(보통 국내주식)이 정원을 다 먹어
+    미국 ETF 같은 작은 세그먼트가 통째로 사라진다. 세그먼트마다 따로 자른다.
+    입력 rows 는 이미 점수 내림차순이어야 한다.
+    """
+    buckets: dict[str, list] = {s: [] for s in SEGMENTS}
+    for r in rows:
+        nm = name_key(r) if name_key else None
+        seg = segment_of(key(r), nm)
+        if len(buckets[seg]) < top:
+            buckets[seg].append(r)
+    return [r for s in SEGMENTS for r in buckets[s]]
 
 # 본문 속 URL. 공백·닫는 괄호·따옴표에서 끊고, 흔한 꼬리 구두점은 제거.
 _URL_RE = re.compile(r"https?://[^\s)\]>\"'》」』]+")
@@ -145,14 +206,20 @@ def _recent_snippets(
 
 
 def trending(
-    hours: float = 24, top: int = 20, samples_per_stock: int = 1, kind: str = "all"
+    hours: float = 24,
+    top: int = 20,
+    samples_per_stock: int = 1,
+    kind: str = "all",
+    market: str = "all",
 ) -> list[dict]:
     """기간 내 언급량 상위 종목 (각 종목의 최근 원문 샘플 동봉).
 
-    kind='stock'/'etf'/'all' 로 개별주·ETF 를 분리 조회한다(언급 성격이 달라서).
+    kind='stock'/'etf'/'all', market='KR'/'US'/'all' 로 네 세그먼트
+    (국내주식·미국주식·국내ETF·미국ETF)를 갈라 조회한다. 둘 다 all 이면
+    세그먼트마다 top 개씩 뽑아 잇는다.
     """
     cut = _cutoff(hours)
-    pred = _kind_predicate(kind)
+    pred = _segment_predicate(kind, market)
     with db.connect() as conn:
         # 정렬은 SQL, 종류 필터·top 자르기는 Python(필터를 top 전에 적용해야 정원이 참).
         # 샘플 서브쿼리는 자른 뒤에만 돌려 비용을 top 개로 묶는다.
@@ -175,8 +242,10 @@ def trending(
             (cut,),
         ).fetchall()
         if pred:
-            rows = [r for r in rows if pred(r["code"])]
-        rows = rows[:top]
+            rows = [r for r in rows if pred(r["code"], r["name"])]
+        rows = _take_per_segment(
+            rows, top, key=lambda r: r["code"], name_key=lambda r: r["name"]
+        )
         out = []
         for r in rows:
             d = dict(r)
@@ -203,13 +272,15 @@ def momentum(
     top: int = 15,
     samples_per_stock: int = 2,
     kind: str = "all",
+    market: str = "all",
 ) -> list[dict]:
     """최근 구간 언급이 기준 구간 평균 대비 급증한 종목 (급증 구간 원문 샘플 동봉).
 
     spike = recent_rate / baseline_rate (시간당 언급 비율 비교)
-    kind='stock'/'etf'/'all' 로 개별주·ETF 를 분리 조회한다.
+    kind='stock'/'etf'/'all', market='KR'/'US'/'all' 로 네 세그먼트를 갈라 조회한다.
+    둘 다 all 이면 세그먼트마다 top 개씩 뽑아 잇는다.
     """
-    pred = _kind_predicate(kind)
+    pred = _segment_predicate(kind, market)
     now = datetime.now(timezone.utc)
     recent_cut = (now - timedelta(hours=hours)).isoformat()
     base_cut = (now - timedelta(hours=baseline_hours)).isoformat()
@@ -248,7 +319,7 @@ def momentum(
     out = []
     base_span = max(baseline_hours - hours, 1e-9)
     for code, r in recent.items():
-        if pred and not pred(code):
+        if pred and not pred(code, r["name"]):
             continue
         recent_rate = r["m"] / hours
         base_count = base.get(code, 0)
@@ -267,7 +338,9 @@ def momentum(
             }
         )
     out.sort(key=lambda x: (x["spike"], x["recent_mentions"]), reverse=True)
-    out = out[:top]
+    out = _take_per_segment(
+        out, top, key=lambda r: r["code"], name_key=lambda r: r["name"]
+    )
     # 상위 종목에만 급증 구간 원문 샘플을 붙인다(전체에 붙이면 낭비).
     if samples_per_stock > 0 and out:
         with db.connect() as conn:
@@ -450,6 +523,7 @@ def buzz_score(
     top: int = 20,
     samples_per_stock: int = 1,
     kind: str = "all",
+    market: str = "all",
     sort_by: str = "buzz_score",
     min_independent: int = 0,
 ) -> list[dict]:
@@ -475,7 +549,7 @@ def buzz_score(
     now_ts = now.timestamp()
     cut = (now - timedelta(hours=window_hours)).isoformat()
     bucket_sec = bucket_minutes * 60
-    pred = _kind_predicate(kind)
+    pred = _segment_predicate(kind, market)
 
     where = ["men.date >= ?"]
     params: list = [cut]
@@ -534,7 +608,7 @@ def buzz_score(
 
         out = []
         for c, e in agg.items():
-            if pred and not pred(c):
+            if pred and not pred(c, e.get("name")):
                 continue
             independent = len(e["clusters"])
             raw_messages = len(e["messages"])
@@ -587,7 +661,9 @@ def buzz_score(
             out = ranked
         else:
             out.sort(key=lambda x: x["buzz_score"], reverse=True)
-        out = out[:top]
+        out = _take_per_segment(
+            out, top, key=lambda r: r["code"], name_key=lambda r: r.get("name")
+        )
         for d in out:
             # 샘플도 동일 필터를 적용 — report 필터 결과엔 report 원문만 보이게(신뢰도).
             d["samples"] = _recent_snippets(
@@ -867,11 +943,16 @@ def search_messages(
                 "media": _media_field(r["media_type"], r["file_name"]),
             }
         )
+    # 이어달리기용 코드 배열은 시장별로 나눈다 — 받는 쪽 도구가 다르다
+    # (국내 6자리는 StockLens get_multi_stocks, 미국 티커는 get_us_multi_price).
+    kr = [c for c in codes if market_of(c) == "KR"]
+    us = [c for c in codes if market_of(c) == "US"]
     return {
         "query": query,
         "match_mode": "fts" if use_fts else "like",
         "matched": len(out),
-        "codes": codes,  # 검색결과 종목들 → 외부 시세·수급 배치 입력용
+        "codes": kr,  # 국내 종목코드 → StockLens 국내 배치 입력용
+        "us_codes": us,  # 미국 티커 → StockLens 미국 배치 입력용
         "results": out,
     }
 
