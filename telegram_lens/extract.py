@@ -213,6 +213,11 @@ _KR_CONTEXT_ABBRS = frozenset({
     "LPG", "RNA", "DNA", "CEO", "CFO", "CTO", "IPS", "PCB", "OLED", "LCD",
     "AGI", "GPT", "LLM", "NPU", "GPU", "CPU", "SSD", "HDD", "API", "SOC",
     "EUV", "DUV", "ASP", "TAM", "FDA", "CES", "IRA", "FTA", "M&A", "IPS",
+    # 실측(7일 수집분)에서 실제로 오탐을 낸 것들 — 지표·용어·기관명이다.
+    "WTI", "FCF", "ADP", "MSD", "GLP", "EPC", "CAPA", "CART", "ASIC", "DAC",
+    "PMI", "EMA", "PEG", "IDE", "GEN", "CAR", "COO", "ALT", "NXT", "III",
+    "TOP", "HIT", "HAS", "FOR", "KEY", "USA", "CIA", "NYT", "TAP", "OCC",
+    "ASC", "PAY", "FIX", "MOD", "MTA", "CPS", "ARR", "OIS",
 })
 
 # 시장 문맥어를 티커 주변에서만 찾는 창(글자). 메시지 전체를 보면 증권 채널
