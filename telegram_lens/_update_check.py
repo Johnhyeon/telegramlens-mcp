@@ -144,7 +144,7 @@ def _format_notice(latest: str, current: str, notes: str) -> str:
         f"\n\n---\n"
         f"ℹ️ TelegramLens 업데이트 정보\n"
         f"새 버전: v{latest} (현재 v{current})\n"
-        f"업데이트: LeetKit Manager를 열고 [지금 업데이트]를 눌러주세요.\n\n"
+        f"업데이트: LeetKit Manager를 열고 TelegramLens 카드의 [업데이트]를 눌러주세요.\n\n"
         f"주요 변경:\n{notes_text}"
     )
 
