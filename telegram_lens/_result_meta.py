@@ -22,6 +22,22 @@
     filing           공시 접수 기준
     aggregate        수집 구간 집계 (버즈 등)
 
+## price_session - 숫자가 어느 거래 세션의 체결인가 (v4)
+
+    regular            정규장 체결만 (KRX 09:00~15:30)
+    pre_market         프리마켓 체결
+    after_market       애프터마켓 체결 (KRX 16:00~20:00, 2026-09-14~)
+    regular_and_after  정규장과 애프터마켓이 한 값에 합쳐졌다
+    unknown            원천이 세션을 밝히지 않는다
+
+`session`은 **조회 시점의 장 상태**이고 `price_session`은 **그 숫자가 만들어진
+세션**이다. 17시에 조회한 정규장 종가는 session=after_hours, price_session=regular 다.
+한 필드로 두면 17시에 받은 가격이 애프터마켓 체결인지 정규장 종가인지 가를 수 없다.
+
+KRX 는 2026-09-14 부터 16:00~20:00 애프터마켓을 연다. 그 날 네이버 일봉은 종가 자리에
+20:00 애프터마켓 마지막 체결가를 실었다(정규장 종가는 다음 날 기준가와 같다). 그런
+값은 regular_and_after 로 적고, 애프터마켓이 섞인 값에는 경고가 자동으로 붙는다.
+
 ## coverage - 요청한 범위와 실제로 돌려준 범위 (v3)
 
     requested  사용자가 요청한 범위      {"unit": "day", "value": 60}
@@ -52,7 +68,7 @@ import json
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-META_VERSION = 3
+META_VERSION = 4
 
 KST = ZoneInfo("Asia/Seoul")
 
@@ -73,6 +89,27 @@ _VALID_BASIS = {
     BASIS_FILING,
     BASIS_AGGREGATE,
 }
+
+# price_session (v4)
+PRICE_SESSION_REGULAR = "regular"
+PRICE_SESSION_PRE_MARKET = "pre_market"
+PRICE_SESSION_AFTER_MARKET = "after_market"
+PRICE_SESSION_REGULAR_AND_AFTER = "regular_and_after"
+PRICE_SESSION_UNKNOWN = "unknown"
+
+_VALID_PRICE_SESSIONS = {
+    PRICE_SESSION_REGULAR,
+    PRICE_SESSION_PRE_MARKET,
+    PRICE_SESSION_AFTER_MARKET,
+    PRICE_SESSION_REGULAR_AND_AFTER,
+    PRICE_SESSION_UNKNOWN,
+}
+
+# 정규장 밖 체결이 들어간 값을 정규장 종가·등락률로 읽지 않도록 붙이는 경고.
+EXTENDED_SESSION_WARNING = (
+    "정규장 밖(애프터마켓·프리마켓) 체결이 들어간 값입니다. "
+    "정규장 종가·정규장 등락률과 섞어 말하지 마세요."
+)
 
 # data_completeness
 COMPLETE = "complete"
@@ -192,6 +229,7 @@ def build_meta(
     data_period: str | None = None,
     market: str = "KR",
     session: str | None = None,
+    price_session: str | None = None,
     is_delayed: bool = False,
     data_completeness: str = COMPLETE,
     coverage: dict | None = None,
@@ -208,11 +246,19 @@ def build_meta(
         raise ValueError(f"data_basis 미정의 값: {data_basis!r} (허용: {sorted(_VALID_BASIS)})")
     if data_completeness not in _VALID_COMPLETENESS:
         raise ValueError(f"data_completeness 미정의 값: {data_completeness!r}")
+    if price_session is not None and price_session not in _VALID_PRICE_SESSIONS:
+        raise ValueError(
+            f"price_session 미정의 값: {price_session!r} (허용: {sorted(_VALID_PRICE_SESSIONS)})"
+        )
     coverage_out = validate_coverage(coverage, data_completeness)
 
     warns = list(warnings or [])
     if data_basis == BASIS_IN_PROGRESS_BAR and IN_PROGRESS_WARNING not in warns:
         warns.insert(0, IN_PROGRESS_WARNING)
+    if price_session in (
+        PRICE_SESSION_PRE_MARKET, PRICE_SESSION_AFTER_MARKET, PRICE_SESSION_REGULAR_AND_AFTER,
+    ) and EXTENDED_SESSION_WARNING not in warns:
+        warns.insert(0, EXTENDED_SESSION_WARNING)
 
     meta = {
         "meta_v": META_VERSION,
@@ -238,6 +284,9 @@ def build_meta(
         meta["viewer_tz"] = viewer
     if session:
         meta["session"] = session
+    # 조회 시점 장 상태(session)와 별개로, 숫자가 속한 세션 (v4).
+    if price_session:
+        meta["price_session"] = price_session
     if entity_info:
         meta["entity"] = entity_info
     return meta

@@ -17,14 +17,47 @@ class SessionHours:
     regular_open: time
     regular_close: time
     after_close: time | None
+    # 세션 사이 틈. KRX 는 정규장 15:30 마감 뒤 애프터마켓이 16:00 에 열린다.
+    pre_close: time | None = None
+    after_open: time | None = None
 
 
+# StockLens market_clock 과 같은 규칙이다(두 패키지는 서로 import 하지 않는다).
+# KRX 애프터마켓(16:00~20:00)은 2026-09-14 시행. 프리마켓은 시행 전이라 None.
+KRX_AFTER_MARKET_START = date(2026, 9, 14)
+KRX_PRE_MARKET_START: date | None = None
+
+# 08:30~09:00 은 동시호가 접수 시간이라 체결이 없다. 프리마켓과 이름이 겹치지 않게
+# 세션으로 두지 않는다.
 KRX_HOURS = SessionHours(
-    pre_open=time(8, 30),
+    pre_open=None,
     regular_open=time(9, 0),
     regular_close=time(15, 30),
     after_close=None,
 )
+
+SESSION_PRE_MARKET = "pre_market"
+SESSION_REGULAR = "regular"
+SESSION_AFTER_MARKET = "after_market"
+SESSION_LABELS = {
+    SESSION_PRE_MARKET: "프리마켓",
+    SESSION_REGULAR: "정규장",
+    SESSION_AFTER_MARKET: "애프터마켓",
+}
+
+
+def krx_hours(day: date) -> SessionHours:
+    """그 날짜의 KRX 세션 시각. 애프터마켓·프리마켓은 시행일부터만 붙는다."""
+    has_after = day >= KRX_AFTER_MARKET_START
+    has_pre = KRX_PRE_MARKET_START is not None and day >= KRX_PRE_MARKET_START
+    return SessionHours(
+        pre_open=time(7, 0) if has_pre else None,
+        regular_open=KRX_HOURS.regular_open,
+        regular_close=KRX_HOURS.regular_close,
+        after_close=time(20, 0) if has_after else None,
+        pre_close=time(7, 50) if has_pre else None,
+        after_open=time(16, 0) if has_after else None,
+    )
 US_HOURS = SessionHours(
     pre_open=time(4, 0),
     regular_open=time(9, 30),
@@ -80,7 +113,7 @@ def get_market_clock(now: datetime | None = None) -> dict:
         market="KRX",
         timezone="Asia/Seoul",
         now_local=now_kst,
-        hours=KRX_HOURS,
+        hours=krx_hours(now_kst.date()),
         holiday_name_func=_krx_holiday_name,
     )
     us = _build_market_state(
@@ -109,7 +142,11 @@ def format_market_clock(clock: dict) -> str:
     lines = [
         "시장 캘린더",
         f"- 기준: {clock['now_kst']} KST / {clock['now_et']} ET",
-        f"- 한국장: {_status_label(krx['status'])} ({krx['reason']})",
+        f"- 한국장: {_status_label(krx['status'], 'krx')} ({krx['reason']})",
+        "  세션: " + " · ".join(
+            [f"{SESSION_LABELS[s['name']]} {s['open']}~{s['close']}" for s in krx["sessions"]]
+            + ([] if any(s["name"] == SESSION_PRE_MARKET for s in krx["sessions"]) else ["프리마켓 미시행"])
+        ),
         f"  최근 거래일: {krx['last_trading_day']} / 다음 개장일: {krx['next_trading_day']}",
         f"- 미국장: {_status_label(us['status'])} ({us['reason']})",
         f"  최근 거래일: {us['last_trading_day']} / 다음 개장일: {us['next_trading_day']}",
@@ -134,6 +171,7 @@ def _build_market_state(
     is_weekend = current_date.weekday() >= 5
     is_trading_day = not is_weekend and holiday_name is None
     status, reason = _session_status(now_local.time(), hours, is_weekend, holiday_name)
+    current = _current_session(now_local.time(), hours) if is_trading_day else None
     if is_trading_day and now_local.time() >= hours.regular_open:
         last_trading_day = current_date
     else:
@@ -155,7 +193,35 @@ def _build_market_state(
         "next_trading_day": next_trading_day.isoformat(),
         "regular_open": hours.regular_open.strftime("%H:%M"),
         "regular_close": hours.regular_close.strftime("%H:%M"),
+        # is_open 은 정규장만. 체결이 일어나는 세션은 아래 필드로.
+        "sessions": _session_list(hours),
+        "current_session": current,
+        "extended_session_open": current in (SESSION_PRE_MARKET, SESSION_AFTER_MARKET),
     }
+
+
+def _session_list(hours: SessionHours) -> list[dict]:
+    out = []
+    if hours.pre_open:
+        out.append({"name": SESSION_PRE_MARKET, "open": hours.pre_open.strftime("%H:%M"),
+                    "close": (hours.pre_close or hours.regular_open).strftime("%H:%M")})
+    out.append({"name": SESSION_REGULAR, "open": hours.regular_open.strftime("%H:%M"),
+                "close": hours.regular_close.strftime("%H:%M")})
+    if hours.after_close:
+        out.append({"name": SESSION_AFTER_MARKET,
+                    "open": (hours.after_open or hours.regular_close).strftime("%H:%M"),
+                    "close": hours.after_close.strftime("%H:%M")})
+    return out
+
+
+def _current_session(local_time: time, hours: SessionHours) -> str | None:
+    if hours.pre_open and hours.pre_open <= local_time < (hours.pre_close or hours.regular_open):
+        return SESSION_PRE_MARKET
+    if hours.regular_open <= local_time < hours.regular_close:
+        return SESSION_REGULAR
+    if hours.after_close and (hours.after_open or hours.regular_close) <= local_time < hours.after_close:
+        return SESSION_AFTER_MARKET
+    return None
 
 
 def _session_status(local_time: time, hours: SessionHours, is_weekend: bool, holiday_name: str | None) -> tuple[str, str]:
@@ -163,14 +229,23 @@ def _session_status(local_time: time, hours: SessionHours, is_weekend: bool, hol
         return "closed_weekend", "Weekend"
     if holiday_name:
         return "closed_holiday", holiday_name
-    if hours.pre_open and hours.pre_open <= local_time < hours.regular_open:
+    session = _current_session(local_time, hours)
+    if session == SESSION_PRE_MARKET:
         return "pre_market", "Before regular session"
-    if local_time < hours.regular_open:
-        return "closed_before_open", "Before pre-market or opening session"
-    if hours.regular_open <= local_time < hours.regular_close:
+    if session == SESSION_REGULAR:
         return "regular", "Regular session"
-    if hours.after_close and hours.regular_close <= local_time < hours.after_close:
+    if session == SESSION_AFTER_MARKET:
         return "after_hours", "After-hours session"
+    if local_time < hours.regular_open:
+        if hours.pre_open and local_time >= hours.pre_open:
+            return "closed_before_open", "Pre-market ended, before regular session"
+        if hours.pre_open:
+            return "closed_before_open", "Before pre-market or opening session"
+        return "closed_before_open", "Before regular session"
+    if hours.after_close and local_time < (hours.after_open or hours.regular_close):
+        return "closed_after_hours", "Regular session ended, after-hours session opens later"
+    if hours.after_close:
+        return "closed_after_hours", "Regular and after-hours sessions ended"
     return "closed_after_hours", "Regular session ended"
 
 
@@ -288,7 +363,9 @@ def _good_friday(year: int) -> date:
     return date(year, month, day) - timedelta(days=2)
 
 
-def _status_label(status: str) -> str:
+def _status_label(status: str, market: str | None = None) -> str:
+    if market == "krx" and status in ("pre_market", "after_hours"):
+        return SESSION_LABELS[SESSION_PRE_MARKET if status == "pre_market" else SESSION_AFTER_MARKET]
     return {
         "closed_weekend": "주말 휴장",
         "closed_holiday": "휴장",
