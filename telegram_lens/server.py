@@ -22,7 +22,7 @@ from telegram_lens import _tls as _tls_bootstrap
 
 _tls_bootstrap.apply()
 
-from mcp.server.fastmcp import FastMCP  # noqa: E402
+from telegram_lens._tool_schema import LensFastMCP  # noqa: E402
 
 from telegram_lens import db, discover, market_clock, queries
 from telegram_lens.classify import run_classification
@@ -412,7 +412,7 @@ def warn_if_collecting(func):
     return wrapper
 
 
-mcp = FastMCP(
+mcp = LensFastMCP(
     "TelegramLens",
     lifespan=_lifespan,
     instructions="""TelegramLens — 텔레그램 채널의 종목 내러티브를 구조화해 제공합니다.
