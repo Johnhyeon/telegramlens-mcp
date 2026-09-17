@@ -318,6 +318,15 @@ def test_search_finds_keyword_that_lives_only_in_link_body(home):
     assert res3["matched"] == 0
 
 
+def test_link_by_url_view_hides_internal_fields(home):
+    with db.connect() as conn:
+        rid = _msg(conn, "https://news.example.com/a")
+        _filled(conn, rid)
+        view = links.public_view(links.link_by_url(conn, "https://news.example.com/a"), links.BODY_MAX)
+    assert not {"channel_id", "msg_date", "id", "message_id", "source", "fetched_at"} & set(view)
+    assert view["excerpt"].startswith("발췌 본문")
+
+
 def test_prune_blanks_link_content_but_keeps_row(home):
     with db.connect() as conn:
         rid = _msg(conn, "https://news.example.com/a", when=_now() - timedelta(days=100))

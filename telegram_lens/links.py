@@ -579,8 +579,8 @@ def public_view(row, body_chars: int) -> dict:
     body = d.pop("body") or None
     d.pop("id", None)
     d.pop("message_id", None)
-    d.pop("source", None)
-    d.pop("fetched_at", None)
+    for k in ("source", "fetched_at", "channel_id", "msg_date"):  # 내부 필드는 응답에 안 싣는다
+        d.pop(k, None)
     if d.get("final_url") == d.get("url"):
         d["final_url"] = None
     if body_chars > 0 and body:
