@@ -120,6 +120,8 @@ async def fetch_recent(
     new_limit: int | None = None,
     on_progress=None,
     oldest_by_channel: dict[int, datetime] | None = None,
+    catchup_by_channel: dict[int, tuple[datetime, int, bool]] | None = None,
+    max_catchup_channels: int | None = None,
 ) -> tuple[list[dict], list[dict], dict]:
     """since 이후 메시지를 채널별로 수집.
 
@@ -141,10 +143,25 @@ async def fetch_recent(
     backfill 진행률을 채널 단위로 갱신한다 — 그래야 doctor의 "5분간 진행 없음" 정체
     판정이 실제로 정체된 경우에만 뜬다). 콜백 실패는 수집을 막지 않는다.
 
+    catchup_by_channel: 선택. {channel_id: (시작 시각, 채널당 상한, reverse)}. 마지막 성공
+    수집이 이번 창(since)보다 오래된 채널만 담긴다(지난 사이클에 타임아웃·FloodWait 로
+    못 받은 채널). 조금 뒤처졌으면(reverse=False) 평소처럼 최신부터 그 시각까지 읽는다.
+    한참 뒤처졌으면(reverse=True) 그 시각 이후를 **오래된 것부터** 읽는다 — 상한이나
+    타임아웃에 걸려도 읽은 지점까지는 '받았다'고 기록되므로 매 사이클 조금씩 앞으로
+    나아가고, 같은 구간을 되풀이해 요청하지 않는다(추가 재시도 루프 없음).
+
+    max_catchup_channels: 선택. 한 번에 오래된 것부터 따라잡을 채널 수 상한. 넘친 채널은
+    이번엔 평소 창만 읽고 수집 시각을 올리지 않는다(다음 사이클에 차례가 온다). 따라잡기가
+    몰려 사이클 전체 타임아웃에 걸리면 아무것도 저장되지 않기 때문이다.
+
     반환: (messages, channels, stats)
       messages : [{channel_id, title, username, subscribers, msg_id, date, text}, ...]
-      channels : 이번에 훑은 모든 대상 채널 메타 [{id, title, username, subscribers}, ...]
-                 — 메시지가 0건이어도 포함(= '봤다'고 기록해 재백필을 막는다).
+                 — 타임아웃·실패한 채널도 그 전까지 읽은 메시지는 포함한다.
+      channels : 이번에 훑은 모든 대상 채널 메타
+                 [{id, title, username, subscribers, synced_through}, ...]
+                 synced_through = 이 채널을 빈틈 없이 어디까지 받았는지(ISO UTC).
+                 실패했거나 최근 끝을 덮지 않는 수집(백필 이어받기)이면 None — 호출자는
+                 None 인 채널의 마지막 수집 시각을 올리면 안 된다.
       stats    : {total, processed, succeeded, failed} — daemon_status.json 노출용.
     """
     if since.tzinfo is None:
@@ -168,13 +185,16 @@ async def fetch_recent(
     channels: list[dict] = []
     stats = {"total": len(targets), "processed": 0, "succeeded": 0, "failed": 0}
     consecutive_timeouts = 0
+    reverse_used = 0
     for ent in targets:
         title = getattr(ent, "title", None)
         username = getattr(ent, "username", None)
         subs = getattr(ent, "participants_count", None)
-        channels.append(
-            {"id": ent.id, "title": title, "username": username, "subscribers": subs}
-        )
+        meta = {
+            "id": ent.id, "title": title, "username": username, "subscribers": subs,
+            "synced_through": None,
+        }
+        channels.append(meta)
         # 처음 보는 채널이면 더 과거(new_since)까지 깊게 1회 백필.
         is_new = (
             known_ids is not None
@@ -184,23 +204,56 @@ async def fetch_recent(
         eff_since = new_since if is_new else since
         eff_limit = (new_limit or per_channel_limit) if is_new else per_channel_limit
         offset_date = oldest_by_channel.get(ent.id) if oldest_by_channel else None
+        # 지난 사이클에 못 받은 채널은 자기 마지막 성공 지점부터 다시 읽는다.
+        # 백필 이어받기(offset_date)는 과거 쪽을 채우는 수집이라 여기에 섞지 않는다.
+        catchup = (
+            catchup_by_channel.get(ent.id)
+            if catchup_by_channel and not is_new and offset_date is None
+            else None
+        )
+        reverse = False
+        hold = False  # True 면 이번엔 읽기만 하고 수집 시각은 올리지 않는다.
+        if catchup is not None:
+            c_since, c_limit, c_reverse = catchup
+            if c_since.tzinfo is None:
+                c_since = c_since.replace(tzinfo=timezone.utc)
+            if c_reverse and max_catchup_channels is not None and reverse_used >= max_catchup_channels:
+                hold = True
+            else:
+                eff_since, eff_limit, reverse = c_since, c_limit, c_reverse
+                reverse_used += 1 if reverse else 0
         stats["processed"] += 1
+        started_at = datetime.now(timezone.utc)
+        sink: list[dict] = []
+        progress: dict = {"seen": 0, "newest": None}
         # 채널별 격리: 한 채널이 실패(권한 상실·FloodWait·구조 변경·응답 없음)해도 그 채널만
         # 건너뛰고, 이미 수집한 정상 채널 결과는 보존한 채 다음 채널로 계속한다(P0: 내결함성).
         # asyncio.wait_for 로 감싸 '예외 없이 그냥 안 끝나는' 채널(죽은 소켓 등)도 상한을 둔다.
         try:
-            msgs = await asyncio.wait_for(
+            await asyncio.wait_for(
                 _collect_one_channel(
                     client, ent, title, username, subs, eff_since, eff_limit, offset_date,
+                    sink=sink, progress=progress, reverse=reverse,
                 ),
                 timeout=_CHANNEL_TIMEOUT_SEC,
             )
-            results.extend(msgs)
+            results.extend(sink)
             stats["succeeded"] += 1
             consecutive_timeouts = 0
+            if offset_date is None and not hold:
+                if reverse and progress["seen"] >= eff_limit and progress["newest"]:
+                    # 상한에 걸렸다 - 읽은 마지막 글까지만 받았다.
+                    meta["synced_through"] = progress["newest"].isoformat()
+                else:
+                    meta["synced_through"] = started_at.isoformat()
         except asyncio.TimeoutError:
             stats["failed"] += 1
-            consecutive_timeouts += 1
+            results.extend(sink)  # 멎기 전까지 읽은 글도 진짜 글이다 - 버리지 않는다.
+            # 한 건도 못 읽고 멎었을 때만 '연속 먹통'으로 센다. 읽다가 시간이 모자란 건
+            # client 오염이 아니다.
+            consecutive_timeouts = 0 if progress["seen"] else consecutive_timeouts + 1
+            if reverse and progress["newest"]:
+                meta["synced_through"] = progress["newest"].isoformat()
             _LOG.warning(
                 "채널 %s 수집 타임아웃(%d초) — 스킵",
                 getattr(ent, "id", "?"), _CHANNEL_TIMEOUT_SEC,
@@ -215,15 +268,21 @@ async def fetch_recent(
             continue
         except FloodWaitError as e:
             stats["failed"] += 1
+            results.extend(sink)
             consecutive_timeouts = 0
+            if reverse and progress["newest"]:
+                meta["synced_through"] = progress["newest"].isoformat()
             _LOG.warning(
-                "채널 %s FloodWait %s초 — 이 사이클 스킵(다음 사이클 재시도)",
+                "채널 %s FloodWait %s초 — 이 사이클 스킵(다음 사이클에 이 채널의 마지막 수집 지점부터)",
                 getattr(ent, "id", "?"), getattr(e, "seconds", "?"),
             )
             continue
         except Exception as e:  # noqa: BLE001 — 한 채널 실패가 전체 사이클을 막으면 안 됨
             stats["failed"] += 1
+            results.extend(sink)
             consecutive_timeouts = 0
+            if reverse and progress["newest"]:
+                meta["synced_through"] = progress["newest"].isoformat()
             _LOG.warning(
                 "채널 %s 수집 실패 — 스킵: %s: %s",
                 getattr(ent, "id", "?"), type(e).__name__, e,
@@ -250,17 +309,35 @@ async def _collect_one_channel(
     since: datetime,
     limit: int,
     offset_date: datetime | None = None,
+    *,
+    sink: list[dict] | None = None,
+    progress: dict | None = None,
+    reverse: bool = False,
 ) -> list[dict]:
     """단일 채널의 메시지를 모아 반환. fetch_recent 가 asyncio.wait_for 로 감싸 채널별
     타임아웃을 건다 — 이 함수 자체는 시간제한을 모른다(취소되면 그냥 중간에 멈출 뿐).
 
     offset_date 가 있으면 그 시각보다 오래된 메시지부터 반환한다(Telethon 표준 동작) —
     이미 그 지점까지 받아둔 채널을 재시작 후 이어받을 때 쓴다(fetch_recent 참고).
+
+    reverse=True 면 since 이후를 오래된 것부터 읽는다(따라잡기). 읽는 대로 sink 에 쌓고
+    progress 에 읽은 건수·마지막 글 시각을 적어, 도중에 취소돼도 호출자가 어디까지
+    받았는지 안다.
     """
-    out: list[dict] = []
-    async for msg in client.iter_messages(ent, limit=limit, offset_date=offset_date):
-        if msg.date and msg.date < since:
+    out: list[dict] = sink if sink is not None else []
+    prog = progress if progress is not None else {}
+    prog.setdefault("seen", 0)
+    prog.setdefault("newest", None)
+    if reverse:
+        it = client.iter_messages(ent, limit=limit, offset_date=since, reverse=True)
+    else:
+        it = client.iter_messages(ent, limit=limit, offset_date=offset_date)
+    async for msg in it:
+        if not reverse and msg.date and msg.date < since:
             break
+        prog["seen"] += 1
+        if reverse and msg.date:
+            prog["newest"] = msg.date.astimezone(timezone.utc)
         text = msg.message or ""
         if not text.strip():
             continue

@@ -598,6 +598,7 @@ async def _run_cycle(status: dict, interval_min: int, min_window: int, max_windo
                 on_client_ready=_attach_command_listener,
                 on_progress=_backfill_progress,
                 oldest_by_channel=oldest_by_channel,
+                max_catchup_minutes=max_window,
             ),
             timeout=cycle_timeout,
         )

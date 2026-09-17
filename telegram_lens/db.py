@@ -327,13 +327,25 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
 
 
+_NOW = object()
+
+
 def upsert_channel(
     conn: sqlite3.Connection,
     channel_id: int,
     title: str | None,
     username: str | None,
     subscribers: int | None,
+    synced_at=_NOW,
 ) -> None:
+    """채널 메타 저장. last_synced = 이 채널을 빈틈 없이 어디까지 받았는지(ISO UTC).
+
+    synced_at 을 생략하면 지금 시각, None 이면 기존 last_synced 를 그대로 둔다.
+    수집에 실패한 채널까지 '방금 받았다'고 찍으면, 다음 사이클이 그 채널의 빈 구간을
+    다시 받지 않아 구멍이 영구히 남고 channels 목록의 수집 시각도 거짓이 된다.
+    """
+    if synced_at is _NOW:
+        synced_at = datetime.now(timezone.utc).isoformat()
     conn.execute(
         """
         INSERT INTO channels (id, title, username, subscribers, last_synced)
@@ -342,16 +354,24 @@ def upsert_channel(
             title=excluded.title,
             username=excluded.username,
             subscribers=COALESCE(excluded.subscribers, channels.subscribers),
-            last_synced=excluded.last_synced
+            last_synced=COALESCE(excluded.last_synced, channels.last_synced)
         """,
-        (
-            channel_id,
-            title,
-            username,
-            subscribers,
-            datetime.now(timezone.utc).isoformat(),
-        ),
+        (channel_id, title, username, subscribers, synced_at),
     )
+
+
+def last_synced_by_channel(conn: sqlite3.Connection) -> dict[int, str]:
+    """채널별 마지막 성공 수집 시각(ISO UTC). 한 번도 성공 못 한 채널은 빠진다."""
+    rows = conn.execute(
+        "SELECT id, last_synced FROM channels WHERE last_synced IS NOT NULL"
+    ).fetchall()
+    return {r["id"]: r["last_synced"] for r in rows}
+
+
+def last_collection_at(conn: sqlite3.Connection) -> str | None:
+    """가장 최근에 어느 채널이든 성공적으로 수집된 시각(ISO UTC). 없으면 None."""
+    row = conn.execute("SELECT MAX(last_synced) AS t FROM channels").fetchone()
+    return row["t"] if row else None
 
 
 def insert_message(

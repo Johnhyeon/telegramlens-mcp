@@ -90,6 +90,15 @@ def check_hang_does_not_poison_next_channel() -> None:
     _assert(ids == {1, 3}, f"멎은 채널(2) 제외, 정상 채널(1,3) 결과 포함, got {ids}")
     _assert(len(rows) == 4, f"채널당 2건씩 총 4건, got {len(rows)}")
     _assert(len(channels) == 3, "메타는 훑은 채널 전부(멎은 채널 포함) 기록됨")
+    synced = {c["id"]: c["synced_through"] for c in channels}
+    _assert(
+        synced[1] is not None and synced[3] is not None,
+        "받은 채널(1,3)은 수집 시각을 올린다",
+    )
+    _assert(
+        synced[2] is None,
+        "멎은 채널(2)은 수집 시각을 올리지 않는다 - 다음 사이클에 자기 지점부터 다시 읽게",
+    )
 
 
 def check_consecutive_timeouts_abort_cycle() -> None:

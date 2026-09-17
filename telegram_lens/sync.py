@@ -49,6 +49,63 @@ _MERGE_WINDOW_HOURS = 6
 # 업그레이드 이전 메시지 text_sig 1회 백필 깊이(일).
 _SIG_BACKFILL_DAYS = 30
 
+# ── 채널별 따라잡기 ────────────────────────────────────────────────
+# 수집 창은 DB 전체의 최신 메시지로 정한다(daemon._catchup_window). 그러면 지난 사이클에
+# 한 채널만 타임아웃·FloodWait 로 빠졌을 때, 다른 채널이 최신을 끌어올려 다음 창이
+# 짧아지고 그 채널의 빈 구간은 영영 안 채워졌다. 그래서 채널마다 자기 마지막 성공
+# 수집(channels.last_synced) 지점부터 다시 읽게 한다.
+_CATCHUP_MARGIN_MIN = 5            # 마지막 성공 지점 앞으로 겹쳐 읽는 여유(중복은 무시됨)
+_CATCHUP_REVERSE_AFTER_MIN = 15    # 이보다 더 뒤처진 채널만 오래된 것부터 따라잡는다
+_CATCHUP_MAX_MINUTES = 7 * 1440    # daemon --max-window 기본값과 같은 상한
+_CATCHUP_MAX_CHANNELS = 5          # 한 사이클에 오래된 것부터 따라잡을 채널 수
+_CATCHUP_PER_HOUR = 80             # 따라잡기 창 1시간당 채널 상한(daemon._catchup_limit 과 같은 비율)
+_CATCHUP_LIMIT_CAP = 2000          # 한 사이클 채널당 상한 - 남으면 다음 사이클에 이어서
+
+
+def _parse_utc(iso: str | None) -> datetime | None:
+    if not iso:
+        return None
+    try:
+        dt = datetime.fromisoformat(iso)
+    except ValueError:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def plan_channel_catchup(
+    last_synced: dict[int, str],
+    since: datetime,
+    now: datetime,
+    per_channel_limit: int,
+    max_minutes: int = _CATCHUP_MAX_MINUTES,
+) -> dict[int, tuple[datetime, int, bool]]:
+    """마지막 성공 수집이 이번 창(since)보다 오래된 채널의 읽기 계획.
+
+    반환: {channel_id: (시작 시각, 채널당 상한, reverse)} — client.fetch_recent 의
+    catchup_by_channel. 조금 뒤처진 채널은 평소처럼 최신부터 그 시각까지(reverse=False),
+    한참 뒤처진 채널은 그 시각부터 오래된 것부터(reverse=True) 읽는다. 상한(max_minutes)
+    보다 오래된 구간은 전체 다운타임 정책과 같이 포기한다.
+    """
+    floor = now - timedelta(minutes=max_minutes)
+    plan: dict[int, tuple[datetime, int, bool]] = {}
+    for cid, iso in last_synced.items():
+        ts = _parse_utc(iso)
+        if ts is None:
+            continue
+        own_since = max(ts - timedelta(minutes=_CATCHUP_MARGIN_MIN), floor)
+        if own_since >= since:
+            continue
+        if since - own_since <= timedelta(minutes=_CATCHUP_REVERSE_AFTER_MIN):
+            plan[cid] = (own_since, per_channel_limit, False)
+            continue
+        window_min = (now - own_since).total_seconds() / 60
+        limit = max(
+            per_channel_limit,
+            min(int(window_min / 60 * _CATCHUP_PER_HOUR), _CATCHUP_LIMIT_CAP),
+        )
+        plan[cid] = (own_since, limit, True)
+    return plan
+
 
 async def run_sync(
     minutes: int = 60,
@@ -57,6 +114,7 @@ async def run_sync(
     on_client_ready=None,
     on_progress=None,
     oldest_by_channel=None,
+    max_catchup_minutes: int = _CATCHUP_MAX_MINUTES,
 ) -> dict:
     """최근 N분 메시지를 수집·저장. 요약 통계 반환.
 
@@ -79,6 +137,11 @@ async def run_sync(
 
     oldest_by_channel: 선택. {channel_id: 이미 저장된 가장 오래된 메시지 시각} — 큰 백필이
     끊겨 재시작해도 이미 받은 구간을 다시 훑지 않고 이어받는다(client.fetch_recent 참고).
+
+    max_catchup_minutes: 채널별 따라잡기(plan_channel_catchup)가 거슬러 올라갈 상한(분).
+
+    channels.last_synced 는 이번에 **실제로 받은** 채널만 올린다. 실패한 채널은 그대로 두어
+    다음 사이클에 자기 마지막 성공 지점부터 다시 읽게 한다.
     """
     db.init_db()
     now = datetime.now(timezone.utc)
@@ -88,9 +151,14 @@ async def run_sync(
     # 신규 채널은 더 깊게 긁으므로 채널당 상한도 넉넉히(날짜 경계가 먼저 멈춤).
     new_limit = max(per_channel_limit, 2000)
 
-    # 이미 한 번이라도 수집해 본 채널 = '처음 보는' 채널 판별 기준.
+    # 한 번이라도 수집에 성공한 채널 = '처음 보는' 채널 판별 기준. 첫 수집에 실패한 채널은
+    # last_synced 가 비어 있어 다음 사이클에도 신규 채널 백필을 받는다.
     with db.connect() as conn:
-        known_ids = {r["id"] for r in conn.execute("SELECT id FROM channels")}
+        last_synced = db.last_synced_by_channel(conn)
+    known_ids = set(last_synced)
+    catchup = plan_channel_catchup(
+        last_synced, since, now, per_channel_limit, max_minutes=max_catchup_minutes
+    )
 
     client = make_client()
     try:
@@ -120,6 +188,8 @@ async def run_sync(
             new_limit=new_limit,
             on_progress=on_progress,
             oldest_by_channel=oldest_by_channel,
+            catchup_by_channel=catchup,
+            max_catchup_channels=_CATCHUP_MAX_CHANNELS,
         )
 
         # 정상 사이클(짧은 창)에서만 조회수 시계열 snapshot 갱신(큰 창은 FloodWait 위험).
@@ -140,10 +210,12 @@ async def run_sync(
     new_channels = [c for c in channels_meta if c["id"] not in known_ids]
 
     with db.connect() as conn:
-        # 훑은 모든 채널 메타 갱신(메시지 0건이어도 — '봤다'고 기록해 재백필 방지).
+        # 훑은 모든 채널 메타 갱신(메시지 0건이어도). 수집 시각은 실제로 받은 채널만
+        # 올린다 — synced_through 가 None(실패·이번엔 보류)이면 예전 값을 그대로 둔다.
         for c in channels_meta:
             db.upsert_channel(
-                conn, c["id"], c.get("title"), c.get("username"), c.get("subscribers")
+                conn, c["id"], c.get("title"), c.get("username"), c.get("subscribers"),
+                synced_at=c.get("synced_through"),
             )
         # tier 행이 없는 채널을 휴리스틱 시드(수동 분류·기존 heuristic 행은 보존). 태깅이
         # tier 를 쓰므로 매 사이클 호출하되 only_missing 으로 신규 채널만 분류(저렴).
@@ -233,6 +305,8 @@ async def run_sync(
         "channels": len(channels_meta),
         "channel_stats": channel_stats,
         "new_channels": len(new_channels),
+        # 지난 사이클에 못 받아 이번에 자기 마지막 수집 지점부터 다시 읽은 채널 수.
+        "channels_catching_up": sum(1 for _s, _l, rev in catchup.values() if rev),
         "new_channels_backfilled_days": round(new_channel_minutes / 1440, 1)
         if new_channels
         else 0,
