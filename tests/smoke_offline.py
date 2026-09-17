@@ -477,8 +477,12 @@ def check_timeline() -> None:
     _assert(tl["summary"]["independent"] == 3, f"독립 언급 3, got {tl['summary']['independent']}")
     _assert(tl["summary"]["spreading_channels"] == 2, "확산 채널 2")
     _assert("baseline_ratio" in tl["summary"], "summary 에 baseline_ratio")
-    # 최근(10분 이내) 버킷에 언급이 잡혀야 함.
-    _assert(tl["timeline"][-1]["independent"] >= 1, "최근 버킷 independent>=1")
+    # 최근(10분 이내) 언급이 마지막 두 칸 안에 잡혀야 함. 정시 직후(분 < 10)에 돌리면
+    # 그 언급은 직전 칸에 들어가므로 마지막 한 칸만 보면 시각에 따라 깨진다.
+    _assert(
+        sum(b["independent"] or 0 for b in tl["timeline"][-2:]) >= 1,
+        "최근 두 칸 independent>=1",
+    )
 
 
 def check_http_endpoint() -> None:
