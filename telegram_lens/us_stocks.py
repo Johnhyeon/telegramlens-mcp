@@ -183,6 +183,21 @@ def is_unsupported_market(query: str) -> bool:
     return bool(_FOREIGN_SUFFIX_RE.match((query or "").strip().upper()))
 
 
+def resolve_us_alias(query: str) -> dict | None:
+    """한글 통용명 정확 일치만 본다(엔비디아 -> NVDA). 못 찾으면 None.
+
+    통용명은 시드에만 있으므로 SEC 목록을 불러오지 않는다. 한국 종목명 부분
+    일치보다 먼저 봐야 하는 단계라 따로 둔다(stocks.resolve_entity).
+    """
+    low = (query or "").strip().lower()
+    if not low:
+        return None
+    for ticker, (name, aliases) in US_SEED.items():
+        if any(low == a.lower() for a in aliases):
+            return {"ticker": ticker, "name": name, "matched_by": "alias"}
+    return None
+
+
 def resolve_us(query: str) -> dict | None:
     """질의 -> 미국 종목. 못 찾으면 None(조회 실패가 아니라 사전에 없음)."""
     q = (query or "").strip()

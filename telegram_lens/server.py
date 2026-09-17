@@ -38,7 +38,7 @@ from telegram_lens.stocks import (
     add_us_blocked,
     load_etf_codes,
     load_stocks,
-    resolve_code,
+    resolve_entity,
 )
 from telegram_lens.sync import run_sync
 
@@ -1255,40 +1255,15 @@ async def telegram_briefing(hours: float = 12) -> str:
     )
 
 
-def _resolve_code(query: str) -> tuple[str | None, str]:
-    """종목명/코드 입력을 (code, name) 으로 해석. 못 찾으면 (None, query). (stocks 공용)"""
-    return resolve_code(query)
-
-
 def _entity_status(query: str) -> dict:
     """질의를 시장·상태로 해석한다(TL-03 요구 2).
 
     0건이 "실제 무언급"인지 "사전에 없음"인지 "미지원 시장"인지는 서로 다른
     상태다. 같은 '결과 없음'으로 뭉개면 읽는 쪽이 구분할 수 없다.
+    해석 순서는 stocks.resolve_entity 한 곳에 있다 - 도구마다 따로 두면
+    같은 질의가 도구별로 다른 종목이 된다.
     """
-    from telegram_lens import us_stocks
-
-    by_code = load_stocks()
-    if query in by_code:
-        return {"market": "KR", "code": query, "name": by_code[query],
-                "entity_status": "supported"}
-    for c, n in by_code.items():
-        if n == query:
-            return {"market": "KR", "code": c, "name": n,
-                    "entity_status": "supported"}
-    for c, n in by_code.items():
-        if query in n:
-            return {"market": "KR", "code": c, "name": n,
-                    "entity_status": "supported"}
-    if us_stocks.is_unsupported_market(query):
-        return {"market": "OTHER", "code": None, "name": query,
-                "entity_status": "unsupported_market"}
-    us = us_stocks.resolve_us(query)
-    if us:
-        return {"market": "US", "code": us["ticker"], "name": us["name"],
-                "entity_status": "supported"}
-    return {"market": None, "code": None, "name": query,
-            "entity_status": "entity_not_found"}
+    return resolve_entity(query, by_code=load_stocks())
 
 
 @mcp.tool()
@@ -1348,9 +1323,12 @@ async def telegram_velocity(
     """
     code = None
     if query:
-        code, _ = _resolve_code(query)
-        if code is None:
+        # stock_buzz·timeline 과 같은 해석 경로 - 예전엔 국내 사전만 봐서 NVDA(버즈 48건)에
+        # '사전에서 찾지 못했습니다'라고 답했다.
+        ent = _entity_status(query)
+        if ent["entity_status"] != "supported":
             return f"⚠️ '{query}' 종목을 사전에서 찾지 못했습니다."
+        code = ent["code"]
     return _json(
         _stocks_payload(
             queries.buzz_velocity(
@@ -1384,20 +1362,16 @@ async def telegram_timeline(
         hours: 윈도우(시간). 기본 72.
         bucket_minutes: 시간 버킷 크기(분). 기본 60.
     """
-    code, name = _resolve_code(query)
-    ent = None
-    if code is None:
-        ent = _entity_status(query)
-        if ent["entity_status"] == "supported":
-            code, name = ent["code"], ent["name"]
-        else:
-            return _json({**ent, "status_note":
-                          "사전에서 특정하지 못했습니다 - 무언급과 다른 상태입니다."})
+    ent = _entity_status(query)
+    if ent["entity_status"] != "supported":
+        return _json({**ent, "status_note":
+                      "사전에서 특정하지 못했습니다 - 무언급과 다른 상태입니다."})
+    code, name = ent["code"], ent["name"]
     return _json(
         {
             "_guidance": _WHY_GUIDANCE,
             "is_etf": code in load_etf_codes(),
-            "market": (ent or {}).get("market", "KR"),
+            "market": ent["market"],
             "timeline": queries.stock_timeline(
                 code=code, name=name, hours=hours, bucket_minutes=bucket_minutes
             ),

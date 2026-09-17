@@ -383,21 +383,60 @@ def add_ambiguous(code: str, note: str = "") -> dict:
     return {"code": code, "name": by_code.get(code), "note": note}
 
 
-def resolve_code(query: str) -> tuple[str | None, str]:
-    """종목명/6자리 코드 입력을 (code, name) 으로 해석. 못 찾으면 (None, query).
+def resolve_entity(query: str, by_code: dict[str, str] | None = None) -> dict:
+    """질의 → {market, code, name, entity_status}. 모든 종목 해석의 단일 경로.
 
-    코드 정확일치 → 종목명 정확일치 → 종목명 부분일치 순. server·api 공용.
+    순서: 국내 코드 정확 → 국내 종목명 정확 → 미지원 시장 표기 → 미국 한글 통용명
+    정확 → 국내 종목명 부분 → 미국 티커·회사명.
+
+    통용명 정확 일치가 국내 부분 일치보다 먼저인 이유(실측 2026-09-17): 부분 일치를
+    먼저 보면 '엔비디아'가 'ACE 엔비디아밸류체인액티브', '메타'가 '노브메타파마',
+    '인텔'이 '인텔리안테크'로 풀려 통용명 41개 중 13개가 엉뚱한 국내 종목이 됐다.
+    엔비디아는 NVDA 48건인데 ETF 0건을 세어 '무언급'이라고 답했다.
+    영문 티커 입력은 예전처럼 국내 부분 일치 뒤에 본다(HD·KB 같은 약어가 미국으로 가지 않게).
+
+    by_code: 이미 불러온 국내 사전(생략 시 load_stocks()).
     """
-    by_code = load_stocks()
+    from telegram_lens import us_stocks
+
+    if by_code is None:
+        by_code = load_stocks()
     if query in by_code:
-        return query, by_code[query]
+        return {"market": "KR", "code": query, "name": by_code[query],
+                "entity_status": "supported"}
     for c, n in by_code.items():
         if n == query:
-            return c, n
+            return {"market": "KR", "code": c, "name": n,
+                    "entity_status": "supported"}
+    if us_stocks.is_unsupported_market(query):
+        return {"market": "OTHER", "code": None, "name": query,
+                "entity_status": "unsupported_market"}
+    us = us_stocks.resolve_us_alias(query)
+    if us:
+        return {"market": "US", "code": us["ticker"], "name": us["name"],
+                "entity_status": "supported"}
     for c, n in by_code.items():
         if query in n:
-            return c, n
-    return None, query
+            return {"market": "KR", "code": c, "name": n,
+                    "entity_status": "supported"}
+    us = us_stocks.resolve_us(query)
+    if us:
+        return {"market": "US", "code": us["ticker"], "name": us["name"],
+                "entity_status": "supported"}
+    return {"market": None, "code": None, "name": query,
+            "entity_status": "entity_not_found"}
+
+
+def resolve_code(query: str) -> tuple[str | None, str]:
+    """종목명/코드/티커 입력을 (code, name) 으로 해석. 못 찾으면 (None, query).
+
+    resolve_entity 와 같은 순서다. 미국 종목이면 code 자리에 티커가 온다
+    (mentions 도 티커로 저장된다). 봇 명령·내 종목·HTTP API 공용.
+    """
+    ent = resolve_entity(query)
+    if ent["code"] is None:
+        return None, query
+    return ent["code"], ent["name"]
 
 
 def _cli_refresh() -> None:

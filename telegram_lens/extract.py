@@ -270,6 +270,46 @@ def _us_mentions(text: str) -> dict[str, str]:
     return found
 
 
+# 미국 한글 통용명 뒤경계를 볼 길이 상한. 두 글자 통용명(애플·구글·메타·인텔)은 더 긴
+# 낱말의 앞부분인 경우가 대부분이다(30일 실측: 애플 457회 중 애플리케이션 94, 인텔
+# 251회 중 인텔리전스·인텔리안 약 70). 세 글자 이상(엔비디아향·엔비디아발·테슬라칩·
+# 아마존웹서비스)은 뒤에 한글이 붙어도 거의 다 그 종목이라 보지 않는다.
+_US_ALIAS_TAIL_MAXLEN = 2
+# 두 글자 통용명 뒤에 붙어도 그 종목인 말 — 한국 종목명 조사·접미 + 향·용·등(애플향 공급, 퀄컴용 칩, 구글,메타등).
+_US_ALIAS_TAIL_OK = tuple(sorted(set(_TAIL_OK + ("향", "용", "등")), key=len, reverse=True))
+
+
+def _us_alias_hit(text: str, alias: str, consumed: list[bool]) -> bool:
+    """미국 한글 통용명이 '그 종목'으로 쓰인 자리가 하나라도 있나.
+
+    예전엔 부분 문자열이면 다 잡아서 메타버스→META, 애플리케이션→AAPL,
+    하나마이크론→MU 가 미국 종목 건수에 섞였다. 한국 종목명과 같은 원칙으로 거른다:
+      - 한국 종목명이 이미 차지한 자리(하나마이크론·ACE 엔비디아밸류체인액티브)는 건너뛴다.
+      - 바로 앞이 한글이면 합성어다(유니마이크론·퀀텀인텔리전스·덱사메타손).
+      - 두 글자 통용명 뒤에 조사·접미가 아닌 한글이 오면 다른 낱말이다(메타버스·구글링).
+    """
+    n = len(alias)
+    start = 0
+    while True:
+        idx = text.find(alias, start)
+        if idx == -1:
+            return False
+        start = idx + 1
+        end = idx + n
+        if any(consumed[idx:end]):
+            continue
+        before = text[idx - 1] if idx > 0 else ""
+        after = text[end] if end < len(text) else ""
+        if _is_hangul(before):
+            continue
+        if alias[:1].isascii() and alias[:1].isalnum() and _is_wordchar(before):
+            continue   # JP모건 앞에 영문이 붙은 경우
+        if (n <= _US_ALIAS_TAIL_MAXLEN and _is_hangul(after)
+                and not text[end:].startswith(_US_ALIAS_TAIL_OK)):
+            continue
+        return True
+
+
 def extract_mentions(text: str) -> list[tuple[str, str]]:
     """텍스트에서 (code, name) 언급 목록을 중복 제거해 반환.
 
@@ -335,7 +375,7 @@ def extract_mentions(text: str) -> list[tuple[str, str]]:
         from telegram_lens import us_stocks as _us
 
         for alias, ticker in _us.alias_terms():
-            if alias in text and ticker not in found:
+            if ticker not in found and _us_alias_hit(text, alias, consumed):
                 found[ticker] = _us.load_us_map().get(
                     ticker, {}).get("name") or ticker
         for ticker, name in _us_mentions(text).items():
