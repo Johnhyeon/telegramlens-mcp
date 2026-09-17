@@ -146,6 +146,43 @@ def _to_kst(iso: str | None) -> str | None:
         return iso
 
 
+# 베이스라인이 이보다 짧은 기간으로 계산됐으면 배율을 내지 않는다. 하루 이틀치 평균은
+# '평소'라고 부르기 어렵고, 배율이 크게 흔들린다.
+BASELINE_MIN_DAYS = 3
+
+
+def _baseline_fields(b, independent: int, hours: float) -> dict:
+    """베이스라인 관련 필드 묶음. b 는 stock_baseline 행(dict/Row) 또는 None.
+
+    baseline_avg_7d      : 최근 7일(수집된 기간만) 하루 평균 독립 언급 수
+    baseline_days_covered: 그 평균을 실제로 나눈 일수(최대 7)
+    baseline_computed_at : 베이스라인 계산 시각(KST)
+    baseline_ratio       : 지금 창의 하루 평균 독립 언급 / baseline_avg_7d.
+                           계산 기간이 BASELINE_MIN_DAYS 일 미만이거나 옛 방식 값이면 None.
+    """
+    avg = b["avg_7d"] if b is not None else None
+    covered = b["covered_days"] if b is not None else None
+    computed = b["computed_at"] if b is not None else None
+    ratio = None
+    if avg and avg > 0 and covered is not None and covered >= BASELINE_MIN_DAYS and hours > 0:
+        ratio = round((independent / (hours / 24)) / avg, 2)
+    return {
+        "baseline_avg_7d": round(avg, 2) if avg else None,
+        "baseline_days_covered": round(covered, 1) if covered is not None else None,
+        "baseline_computed_at": _to_kst(computed),
+        "baseline_ratio": ratio,
+    }
+
+
+def _baseline_rows(conn) -> dict:
+    return {
+        r["code"]: r
+        for r in conn.execute(
+            "SELECT code, avg_7d, covered_days, computed_at FROM stock_baseline"
+        )
+    }
+
+
 def _recent_snippets(
     conn, code: str, cut: str, n: int,
     only_types: list[str] | None = None, exclude_gossip: bool = False,
@@ -231,7 +268,9 @@ def trending(
                    COUNT(DISTINCT men.channel_id) AS channels,
                    COALESCE(SUM(m.forwards), 0)  AS total_forwards,
                    MAX(men.date)                 AS last_seen,
-                   b.avg_7d                      AS baseline_avg_7d
+                   b.avg_7d                      AS avg_7d,
+                   b.covered_days                AS covered_days,
+                   b.computed_at                 AS computed_at
             FROM mentions men
             JOIN messages m ON m.id = men.message_id
             LEFT JOIN stock_baseline b ON b.code = men.code
@@ -252,15 +291,9 @@ def trending(
             d["last_seen"] = _to_kst(d["last_seen"])
             # 확산 강도: 독립 클러스터 외에 복사/포워드로 더 퍼진 양.
             d["spread_copies"] = d["raw_messages"] - d["independent"]
-            # 이상 신호 배율: 현재 구간 독립 언급 일평균 / 7일 일평균. baseline 없으면 None.
-            avg = d.pop("baseline_avg_7d", None)
-            if avg and avg > 0:
-                current_daily = d["independent"] / (hours / 24)
-                d["baseline_avg_7d"] = round(avg, 2)
-                d["baseline_ratio"] = round(current_daily / avg, 2)
-            else:
-                d["baseline_avg_7d"] = round(avg, 2) if avg else None
-                d["baseline_ratio"] = None
+            # 이상 신호 배율: 현재 구간 독립 언급 일평균 / 최근 7일 독립 언급 일평균.
+            base = {k: d.pop(k) for k in ("avg_7d", "covered_days", "computed_at")}
+            d.update(_baseline_fields(base, d["independent"], hours))
             d["samples"] = _recent_snippets(conn, d["code"], cut, samples_per_stock)
             out.append(d)
     return out
@@ -276,9 +309,16 @@ def momentum(
 ) -> list[dict]:
     """최근 구간 언급이 기준 구간 평균 대비 급증한 종목 (급증 구간 원문 샘플 동봉).
 
-    spike = recent_rate / baseline_rate (시간당 언급 비율 비교)
+    spike = recent_rate / baseline_rate (시간당 독립 언급 비율 비교). 배율이라 기준 구간에
+    언급이 없으면 낼 수 없다 - 그때 spike 는 None 이고 is_new 로 가른다.
+    is_new = True  : 기준 구간을 DB 가 다 덮는데 그동안 언급이 0건(처음 떠오름)
+             False : 기준 구간에 언급이 있었다
+             None  : 기준 구간 일부를 DB 가 못 덮는데 그 안에서 0건 - 새로 떴는지 알 수 없다
+    baseline_hours_covered = 기준 구간 중 DB 에 실제로 있는 시간(배율 분모).
+
     kind='stock'/'etf'/'all', market='KR'/'US'/'all' 로 네 세그먼트를 갈라 조회한다.
-    둘 다 all 이면 세그먼트마다 top 개씩 뽑아 잇는다.
+    둘 다 all 이면 세그먼트마다 top 개씩 뽑아 잇는다. 정렬 순서는 예전과 같다(배율,
+    배율이 없으면 최근 언급 수).
     """
     pred = _segment_predicate(kind, market)
     now = datetime.now(timezone.utc)
@@ -315,17 +355,31 @@ def momentum(
                 (base_cut, recent_cut),
             ).fetchall()
         }
+        first_row = conn.execute("SELECT MIN(date) AS d FROM messages").fetchone()
+
+    # 기준 구간 중 DB 가 실제로 덮는 시간. 설치 직후·새로 붙인 기간이면 기준 구간보다 짧다.
+    # 예전엔 늘 (baseline_hours - hours) 로 나눠, 이틀치밖에 없어도 사흘 평균처럼 계산했다.
+    first_ts = _parse_ts(first_row["d"]) if first_row and first_row["d"] else None
+    recent_ts = now.timestamp() - hours * 3600
+    base_ts = now.timestamp() - baseline_hours * 3600
+    covered_start = max(base_ts, first_ts) if first_ts is not None else recent_ts
+    base_span = max(0.0, (recent_ts - covered_start) / 3600)
+    # 한 시간 안쪽 차이는 덮었다고 본다(수집 창 여유).
+    fully_covered = first_ts is not None and first_ts <= base_ts + 3600
 
     out = []
-    base_span = max(baseline_hours - hours, 1e-9)
     for code, r in recent.items():
         if pred and not pred(code, r["name"]):
             continue
         recent_rate = r["m"] / hours
         base_count = base.get(code, 0)
-        base_rate = base_count / base_span
-        # 기준이 0이면 신규 등장 — 큰 spike로 취급(상한 둠)
-        spike = recent_rate / base_rate if base_rate > 0 else float(r["m"]) * 1.0
+        if base_count > 0 and base_span > 0:
+            spike = round(recent_rate / (base_count / base_span), 2)
+            is_new = False
+        else:
+            # 배율을 만들 분모가 없다. 언급 수를 배율 자리에 넣지 않는다.
+            spike = None
+            is_new = True if fully_covered else None
         out.append(
             {
                 "code": code,
@@ -333,11 +387,19 @@ def momentum(
                 "recent_mentions": r["m"],
                 "recent_channels": r["ch"],
                 "baseline_mentions": base_count,
-                "spike": round(spike, 2),
-                "is_new": base_rate == 0,
+                "baseline_hours_covered": round(base_span, 1),
+                "spike": spike,
+                "is_new": is_new,
             }
         )
-    out.sort(key=lambda x: (x["spike"], x["recent_mentions"]), reverse=True)
+    # 순서는 예전과 같다 - 배율이 없는 종목은 최근 언급 수로 줄을 선다.
+    out.sort(
+        key=lambda x: (
+            x["spike"] if x["spike"] is not None else float(x["recent_mentions"]),
+            x["recent_mentions"],
+        ),
+        reverse=True,
+    )
     out = _take_per_segment(
         out, top, key=lambda r: r["code"], name_key=lambda r: r["name"]
     )
@@ -456,12 +518,16 @@ def buzz_velocity(
             sql += " AND men.code = ?"
             params.append(code)
         rows = conn.execute(sql, params).fetchall()
-        baselines = {
-            r["code"]: r["avg_7d"]
-            for r in conn.execute("SELECT code, avg_7d FROM stock_baseline")
-        }
+        baselines = _baseline_rows(conn)
+        last_collected = db.last_collection_at(conn)
 
-    # code → {name, buckets: {idx: set(cluster_id)}}. 버킷별 '독립' 카운트는 set 크기.
+    # 마지막 수집 이후에 시작한 버킷은 '0건'이 아니라 '아직 안 모은 구간'이다(None).
+    last_collected_ts = _parse_ts(last_collected) if last_collected else None
+
+    def _uncollected(i: int) -> bool:
+        return last_collected_ts is not None and now_ts - (i + 1) * bucket_sec >= last_collected_ts
+
+    # code → {name, buckets: {idx: set(cluster_id)}, clusters}. 버킷별 '독립' 카운트는 set 크기.
     per: dict[str, dict] = {}
     for r in rows:
         ts = _parse_ts(r["date"])
@@ -470,37 +536,40 @@ def buzz_velocity(
         idx = int((now_ts - ts) // bucket_sec)
         if idx < 0:
             idx = 0
-        e = per.setdefault(r["code"], {"name": r["name"], "buckets": {}})
+        e = per.setdefault(r["code"], {"name": r["name"], "buckets": {}, "clusters": set()})
         e["buckets"].setdefault(idx, set()).add(r["cluster_id"])
+        e["clusters"].add(r["cluster_id"])
 
     out = []
     for c, e in per.items():
         counts = {i: len(s) for i, s in e["buckets"].items()}
-        last = counts.get(0, 0)
-        prev = counts.get(1, 0)
-        growth = round(last / max(prev, 1), 2)
-        total = sum(counts.values())
-        avg = baselines.get(c)
-        if avg and avg > 0:
-            baseline_ratio = round((total / (window_hours / 24)) / avg, 2)
-        else:
-            baseline_ratio = None
+        last = None if _uncollected(0) else counts.get(0, 0)
+        prev = None if _uncollected(1) else counts.get(1, 0)
+        growth = round(last / max(prev, 1), 2) if last is not None and prev is not None else None
+        # 창 전체 독립 언급 = 창 안의 서로 다른 클러스터 수. 버킷별 수를 더하면 경계에
+        # 걸친 복사본이 두 번 세진다.
+        total = len(e["clusters"])
         out.append(
             {
                 "code": c,
                 "name": e["name"],
                 "bucket_minutes": bucket_minutes,
                 "window_hours": window_hours,
-                # 오래된→최신 순 시계열(독립 언급 수).
-                "series": [counts.get(i, 0) for i in range(nbuckets - 1, -1, -1)],
+                # 오래된→최신 순 시계열(독립 언급 수). 마지막 수집 이후 구간은 None.
+                "series": [
+                    None if _uncollected(i) else counts.get(i, 0)
+                    for i in range(nbuckets - 1, -1, -1)
+                ],
                 "last_bucket": last,
                 "prev_bucket": prev,
-                "delta": last - prev,
+                "delta": last - prev if last is not None and prev is not None else None,
                 "growth": growth,
-                "spike": last >= spike_min or growth >= growth_threshold,
+                "spike": bool(
+                    last is not None
+                    and (last >= spike_min or (growth is not None and growth >= growth_threshold))
+                ),
                 "window_independent": total,
-                "baseline_avg_7d": round(avg, 2) if avg else None,
-                "baseline_ratio": baseline_ratio,
+                **_baseline_fields(baselines.get(c), total, window_hours),
             }
         )
     # 급등 우선, 그다음 최근 버킷·증가율 순.
@@ -577,10 +646,7 @@ def buzz_score(
             cid: (t.get("weight") if t.get("weight") is not None else 0.5)
             for cid, t in db.channel_tiers(conn).items()
         }
-        baselines = {
-            r["code"]: r["avg_7d"]
-            for r in conn.execute("SELECT code, avg_7d FROM stock_baseline")
-        }
+        baselines = _baseline_rows(conn)
 
         agg: dict[str, dict] = {}
         for r in rows:
@@ -624,12 +690,7 @@ def buzz_score(
             growth = last / max(prev, 1)
             velocity_mult = _clamp(growth, 1.0, 3.0)
             score = independent * tier_factor * spread_factor * velocity_mult
-            avg = baselines.get(c)
-            baseline_ratio = (
-                round((independent / (window_hours / 24)) / avg, 2)
-                if avg and avg > 0
-                else None
-            )
+            base = _baseline_fields(baselines.get(c), independent, window_hours)
             out.append(
                 {
                     "code": c,
@@ -642,7 +703,7 @@ def buzz_score(
                     "tier_factor": round(tier_factor, 2),
                     "spread_factor": round(spread_factor, 2),
                     "velocity_mult": round(velocity_mult, 2),
-                    "baseline_ratio": baseline_ratio,
+                    **base,
                 }
             )
         if sort_by == "baseline_ratio":
@@ -720,9 +781,11 @@ def stock_timeline(
             (code, cut),
         ).fetchone()
         brow = conn.execute(
-            "SELECT avg_7d FROM stock_baseline WHERE code = ?", (code,)
+            "SELECT avg_7d, covered_days, computed_at FROM stock_baseline WHERE code = ?",
+            (code,),
         ).fetchone()
         sample_list = _recent_snippets(conn, code, cut, samples)
+        last_collected = db.last_collection_at(conn)
 
     # 벽시계 정렬 버킷: 버킷 키 = floor(epoch / bucket_sec). now-상대가 아니라 절대 경계
     # (예: 60분 버킷 → 매시 정각, 30분 → :00/:30)라 first_mention 시각과 버킷이 어긋나지
@@ -745,43 +808,82 @@ def stock_timeline(
         all_messages[r["message_id"]] = r["forwards"] or 0
 
     # 윈도우 첫 버킷~현재 버킷을 절대 경계로 순회(오래된→최신).
-    first_bk = int((now_ts - hours * 3600) // bucket_sec)
+    #
+    # 버킷마다 '실제로 모은 구간'을 따진다. 첫 버킷은 창 시작(cut)에서, 마지막 버킷은
+    # 지금(또는 마지막 수집 시각)에서 잘리므로 한 칸을 다 채우지 못한다. 그런 칸에
+    # partial·coverage 를 달고 delta 를 비운다 - 13:05 에 본 13시 칸의 1건을 직전 칸
+    # 8건과 비교해 '-7'이라고 쓰면 감소로 읽힌다. 마지막 수집 이후에 시작한 칸은
+    # 0건이 아니라 아직 안 모은 구간이라 값을 None 으로 둔다.
+    cut_ts = now_ts - hours * 3600
+    collected_end = now_ts
+    last_collected_ts = _parse_ts(last_collected) if last_collected else None
+    if last_collected_ts is not None:
+        collected_end = min(now_ts, last_collected_ts)
+    first_bk = int(cut_ts // bucket_sec)
     last_bk = int(now_ts // bucket_sec)
     timeline = []
-    prev_independent = 0
+    prev_independent = None
     for bk in range(first_bk, last_bk + 1):
         b = buckets.get(bk)
+        b_start = bk * bucket_sec
+        cov_start = max(b_start, cut_ts)
+        cov_end = min(b_start + bucket_sec, collected_end)
+        coverage = max(0.0, (cov_end - cov_start) / bucket_sec)
+        entry = {
+            "bucket_start": _to_kst(
+                datetime.fromtimestamp(cov_start, tz=timezone.utc).isoformat()
+            ),
+        }
+        if coverage <= 0:
+            entry.update({"independent": None, "raw": None, "channels": None, "delta": None})
+            entry["partial"] = True
+            entry["coverage"] = 0.0
+            prev_independent = None
+            timeline.append(entry)
+            continue
         independent = len(b["clusters"]) if b else 0
-        bucket_start = datetime.fromtimestamp(bk * bucket_sec, tz=timezone.utc)
-        timeline.append(
+        whole = coverage >= 0.999
+        entry.update(
             {
-                "bucket_start": _to_kst(bucket_start.isoformat()),
                 "independent": independent,                  # 주축: 그 구간 독립 언급 수
                 "raw": len(b["messages"]) if b else 0,       # 포워드/복붙 포함 원시 건수
                 "channels": len(b["channels"]) if b else 0,
-                "delta": independent - prev_independent,     # 보조: 직전 버킷 대비 증감(±)
+                # 보조: 직전 칸 대비 증감(±). 두 칸이 모두 온전할 때만.
+                "delta": (
+                    independent - prev_independent
+                    if whole and prev_independent is not None
+                    else None
+                ),
             }
         )
-        prev_independent = independent
+        if not whole:
+            entry["partial"] = True
+            entry["coverage"] = round(coverage, 2)
+        timeline.append(entry)
+        prev_independent = independent if whole else None
 
     independent_total = len(all_clusters)
     raw_total = len(all_messages)
-    avg = brow["avg_7d"] if brow else None
-    baseline_ratio = (
-        round((independent_total / (hours / 24)) / avg, 2) if avg and avg > 0 else None
-    )
+    # 배율 분자는 실제로 모은 시간으로 나눈다(마지막 수집이 창 끝보다 이르면 그만큼 짧다).
+    covered_hours = max(0.0, (collected_end - cut_ts) / 3600)
 
     return {
         "code": code,
         "name": name or code,
         "window_hours": hours,
         "bucket_minutes": bucket_minutes,
+        "collected_until": _to_kst(last_collected),
         # 차트/해석 가이드 — 주축은 independent(언급 '수'). delta 는 보조(증감).
         "_fields": {
             "independent": "그 구간 독립 언급 수(포워드/복붙 1건). ★차트 주축",
             "raw": "포워드/복붙 포함 원시 건수(raw≥independent, 차이=확산 복사본)",
             "channels": "그 구간 언급 채널 수(확산 폭)",
-            "delta": "직전 버킷 대비 independent 증감(±, 보조지표 — 음수=감소이지 '하락'이 아님)",
+            "delta": "직전 버킷 대비 independent 증감(±, 보조지표 — 음수=감소이지 '하락'이 아님). "
+            "두 칸 중 하나라도 덜 찬 칸이면 null",
+            "partial": "true 면 한 칸을 다 채우지 못한 칸(창 시작·지금·마지막 수집에서 잘림). "
+            "coverage 는 채운 비율(0~1). 이 칸의 수를 다른 칸과 그대로 비교하지 마세요",
+            "null": "independent 가 null 인 칸은 0건이 아니라 마지막 수집(collected_until) 뒤라 "
+            "아직 모으지 않은 구간",
         },
         "first_mention": (
             {
@@ -799,8 +901,7 @@ def stock_timeline(
             "spread_copies": raw_total - independent_total,
             "total_forwards": sum(all_messages.values()),
             "spreading_channels": len(all_channels),
-            "baseline_avg_7d": round(avg, 2) if avg else None,
-            "baseline_ratio": baseline_ratio,
+            **_baseline_fields(brow, independent_total, covered_hours),
         },
         "timeline": timeline,
         "samples": sample_list,

@@ -466,8 +466,14 @@ def check_timeline() -> None:
     _assert(tl["first_mention"]["channel"] == "최초채널", "최초 언급 채널 정확")
     # 벽시계 정렬이라 경계 위치에 따라 72~73개(now 가 시간 중간이면 +1).
     _assert(72 <= len(tl["timeline"]) <= 73, f"버킷 72~73개(72h/60m), got {len(tl['timeline'])}")
-    # 버킷 시작이 벽시계 정렬(60분 → 분 '00')인지 확인
-    _assert(tl["timeline"][0]["bucket_start"].endswith(":00 KST"), "버킷 경계 정시 정렬")
+    # 버킷 시작이 벽시계 정렬(60분 → 분 '00')인지 확인. 첫 칸은 창 시작(cut)에서
+    # 잘리므로 두 번째 칸으로 본다.
+    _assert(tl["timeline"][1]["bucket_start"].endswith(":00 KST"), "버킷 경계 정시 정렬")
+    # 첫 칸은 창 시작에서, 마지막 칸은 지금에서 잘린다 - 덜 찬 칸으로 표시돼야 한다.
+    cut_label = queries._to_kst((now - timedelta(hours=72)).isoformat())
+    _assert(tl["timeline"][0]["bucket_start"][:13] == cut_label[:13], "첫 칸은 창 시작 시각에서 시작")
+    _assert(tl["timeline"][-1].get("partial") is True, "진행 중인 마지막 칸은 partial")
+    _assert(tl["timeline"][-1]["delta"] is None, "덜 찬 칸은 delta 를 비운다")
     _assert(tl["summary"]["independent"] == 3, f"독립 언급 3, got {tl['summary']['independent']}")
     _assert(tl["summary"]["spreading_channels"] == 2, "확산 채널 2")
     _assert("baseline_ratio" in tl["summary"], "summary 에 baseline_ratio")

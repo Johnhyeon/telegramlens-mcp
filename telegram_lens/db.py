@@ -101,13 +101,15 @@ CREATE TABLE IF NOT EXISTS channel_tier (
     classified_at TEXT
 );
 
--- 종목별 7일 평균 '일별' 언급 메시지 수. 현재 언급/avg_7d = 이상 신호 배율.
+-- 종목별 최근 7일(수집된 기간만) 하루 평균 '독립 언급'(클러스터) 수.
+-- 현재 독립 언급 일평균 / avg_7d = 이상 신호 배율. covered_days = 실제로 나눈 일수.
 CREATE TABLE IF NOT EXISTS stock_baseline (
-    code        TEXT PRIMARY KEY,
-    name        TEXT,
-    avg_7d      REAL,
-    window_days INTEGER,
-    computed_at TEXT
+    code         TEXT PRIMARY KEY,
+    name         TEXT,
+    avg_7d       REAL,
+    window_days  INTEGER,
+    computed_at  TEXT,
+    covered_days REAL
 );
 
 -- 게시 후 horizon(collect/1h/6h/24h) 시점의 조회수·확산 snapshot 이력.
@@ -285,6 +287,12 @@ def _migrate(conn: sqlite3.Connection) -> None:
     chan_cols = {r["name"] for r in conn.execute("PRAGMA table_info(channels)")}
     if "about" not in chan_cols:
         conn.execute("ALTER TABLE channels ADD COLUMN about TEXT")
+
+    # stock_baseline.covered_days: 베이스라인을 실제로 나눈 일수. 옛 행은 NULL 로 남아
+    # '단위가 다른 옛 값'으로 취급되고(배율 None), 다음 수집 때 다시 계산된다.
+    base_cols = {r["name"] for r in conn.execute("PRAGMA table_info(stock_baseline)")}
+    if "covered_days" not in base_cols:
+        conn.execute("ALTER TABLE stock_baseline ADD COLUMN covered_days REAL")
 
     # v3: cluster_id/text_sig 컬럼이 확보됐으니 인덱스 생성(idempotent). _SCHEMA 가 아니라
     # 여기 두는 이유는 v2 DB executescript 시점엔 컬럼이 아직 없어 인덱스가 깨지기 때문.
@@ -604,35 +612,68 @@ def upsert_channel_tier(
 # ── 종목 베이스라인(7일 평균 언급수) ────────────────────────────────
 
 def compute_baselines(conn: sqlite3.Connection, days: int = 7) -> int:
-    """code별 최근 days일 distinct-message 언급수 / days → stock_baseline upsert.
+    """code별 최근 days일 '독립 언급'(클러스터) 수 / 실제로 수집된 일수 → stock_baseline.
 
-    반환: 갱신된 종목 수. avg_7d 는 '하루 평균 언급 메시지 수'. 현재 언급/avg_7d 가
-    이상 신호 배율(queries.trending 에서 노출)이 된다.
+    반환: 계산된 종목 수. avg_7d 는 '하루 평균 독립 언급 수'다.
+
+    두 가지를 맞춘다.
+    - 단위: 배율의 분자(trending·buzz_score·timeline·velocity)는 포워드·복붙을 한 건으로
+      묶은 독립 언급이다. 예전엔 분모만 원시 메시지 수라, 많이 퍼지는 종목은 평소와
+      같은 날에도 배율이 1보다 한참 낮게 나왔다.
+    - 기간: DB 에 2~3일치만 있어도 7로 나눠 평균이 낮아지고 배율이 부풀었다. 가장 오래된
+      메시지부터 지금까지(최대 days일)를 실제 기간으로 삼아 covered_days 에 남긴다.
+
+    이번 기간에 언급이 없는 종목의 옛 행은 지운다 - 몇 주 전 값이 평소로 남으면 안 된다.
     """
-    cut = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
-    now_iso = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(timezone.utc)
+    cut_dt = now - timedelta(days=days)
+    cut = cut_dt.isoformat()
+    now_iso = now.isoformat()
+    row = conn.execute("SELECT MIN(date) AS d FROM messages").fetchone()
+    first = None
+    if row and row["d"]:
+        try:
+            first = datetime.fromisoformat(row["d"])
+            if first.tzinfo is None:
+                first = first.replace(tzinfo=timezone.utc)
+        except ValueError:
+            first = None
+    conn.execute("DELETE FROM stock_baseline")
+    if first is None:
+        return 0
+    covered_days = (now - max(first, cut_dt)).total_seconds() / 86400
+    if covered_days <= 0:
+        return 0
     rows = conn.execute(
         """
-        SELECT code, name, COUNT(DISTINCT message_id) AS msgs
-        FROM mentions WHERE date >= ?
-        GROUP BY code
+        SELECT men.code, MAX(men.name) AS name, COUNT(DISTINCT m.cluster_id) AS n
+        FROM mentions men
+        JOIN messages m ON m.id = men.message_id
+        WHERE men.date >= ?
+        GROUP BY men.code
         """,
         (cut,),
     ).fetchall()
     payload = [
-        (r["code"], r["name"], r["msgs"] / days, days, now_iso) for r in rows
+        (r["code"], r["name"], r["n"] / covered_days, days, now_iso, round(covered_days, 2))
+        for r in rows
     ]
     conn.executemany(
         """
-        INSERT INTO stock_baseline (code, name, avg_7d, window_days, computed_at)
-        VALUES (?, ?, ?, ?, ?)
-        ON CONFLICT(code) DO UPDATE SET
-            name=excluded.name, avg_7d=excluded.avg_7d,
-            window_days=excluded.window_days, computed_at=excluded.computed_at
+        INSERT INTO stock_baseline (code, name, avg_7d, window_days, computed_at, covered_days)
+        VALUES (?, ?, ?, ?, ?, ?)
         """,
         payload,
     )
     return len(payload)
+
+
+def baselines_outdated(conn: sqlite3.Connection) -> bool:
+    """옛 방식(원시 메시지 수 / 7)으로 계산된 행이 남아 있는가 - 있으면 다시 계산한다."""
+    row = conn.execute(
+        "SELECT 1 FROM stock_baseline WHERE covered_days IS NULL LIMIT 1"
+    ).fetchone()
+    return row is not None
 
 
 def baselines_age_minutes(conn: sqlite3.Connection) -> float | None:

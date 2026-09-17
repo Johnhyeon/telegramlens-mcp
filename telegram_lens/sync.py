@@ -293,9 +293,10 @@ async def run_sync(
             )
 
         # 베이스라인이 없거나 오래됐으면(>6h) 재계산. 사이클당 가벼운 집계 1회.
+        # 옛 방식으로 계산된 행이 남아 있어도(업데이트 직후) 바로 다시 계산한다.
         baselines_computed = 0
         age = db.baselines_age_minutes(conn)
-        if age is None or age > _BASELINE_REFRESH_MIN:
+        if age is None or age > _BASELINE_REFRESH_MIN or db.baselines_outdated(conn):
             baselines_computed = db.compute_baselines(conn, days=7)
 
     return {
