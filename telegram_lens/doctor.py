@@ -303,18 +303,21 @@ def check_package() -> Check:
         vr = version_report(telegram_lens.__version__, dist_version())
         c.info(f"Version:    {vr['code_version']} (실행 코드 기준)")
         if vr["version_mismatch"]:
+            # 요약·할 일은 Manager 화면에 뜬다. 원인 원문(dist-info 등)은 지원용 줄에만.
+            c.info(f"실행 코드 {vr['code_version']} / 설치 기록 {vr['dist_version']} (옛 dist-info 가 남았을 수 있음)")
             c.warn(
-                f"version_mismatch: 실행 코드 {vr['code_version']} vs 설치 메타 "
-                f"{vr['dist_version']} - 업그레이드가 덜 끝났거나 옛 dist-info 가 "
-                "남아 있습니다. 재설치를 권합니다."
+                "설치 기록의 버전이 실제로 실행되는 버전과 달라요.",
+                action="지금 잘 되면 그대로 두셔도 돼요. 문제가 있으면 상단 [지원 문의]를 눌러주세요.",
             )
         scan = scan_dist_metadata(PACKAGE_NAME)
         if scan["broken"]:
+            c.info(
+                f"깨진 배포 메타 {len(scan['broken'])}개(~ 로 시작하는 pip 임시 리네임 잔재): "
+                + ", ".join(Path(b).name for b in scan["broken"][:3])
+            )
             c.warn(
-                f"깨진 배포 메타 {len(scan['broken'])}개 발견(~ 로 시작하는 pip "
-                "임시 리네임 잔재): " + ", ".join(
-                    Path(b).name for b in scan["broken"][:3])
-                + " - 삭제해도 안전합니다."
+                "지난 설치에서 남은 임시 파일이 있어요.",
+                action="지금 잘 되면 그대로 두셔도 돼요. 문제가 있으면 상단 [지원 문의]를 눌러주세요.",
             )
         if scan["duplicated"]:
             vers = ", ".join(v["version"] for v in scan["valid"])
