@@ -106,14 +106,14 @@ def compute_health(status: dict | None, lock_held: bool, interval_min: int | Non
                 "problem_code": None,
                 "message": (
                     f"데몬이 지금 꺼져 있어요. 마지막 실행에서 수집이 연속 {consecutive}번 "
-                    f"실패했어요. Claude를 열어 다시 확인해 보세요. {catchup}"
+                    f"실패했어요. AI 앱(Claude·ChatGPT)을 열어 다시 확인해 보세요. {catchup}"
                 ),
             }
         return {
             "health": "healthy",
             "problem_code": None,
             "message": (
-                "데몬이 지금 실행 중이 아니에요(Claude Desktop을 열어야 동작해요. 정상이에요). "
+                "데몬이 지금 실행 중이 아니에요(AI 앱(Claude·ChatGPT)을 열어야 동작해요. 정상이에요). "
                 + catchup
             ),
         }

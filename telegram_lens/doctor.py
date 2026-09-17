@@ -826,7 +826,7 @@ def check_data() -> Check:
         # 첫 설치 직후엔 당연히 없다 — 수집은 Claude Desktop을 열어야 시작된다.
         # 이걸 경고로 잡으면 갓 설치한 사용자에게 "문제 1건"으로 보여서, 잘못한 게
         # 없는데도 뭔가 고장 난 줄 알게 된다(데몬 미가동 판정과 같은 부류의 오해).
-        c.ok("아직 수집된 데이터가 없습니다 — Claude Desktop을 열면 텔레그램 채널 메시지 수집이 시작됩니다.")
+        c.ok("아직 수집된 데이터가 없습니다 — AI 앱(Claude·ChatGPT)을 열면 텔레그램 채널 메시지 수집이 시작됩니다.")
         return c
     c.info(f"Path:       {path}")
 
@@ -887,7 +887,7 @@ def check_backfill() -> Check:
         c.warn(
             "이전에 지난 기록을 가져오다가 멈춘 채로 남아 있어요.",
             fix="telegram_collect_history(days=...) 로 다시 요청하세요.",
-            action="Claude에게 지난 텔레그램 기록을 다시 가져와 달라고 말해주세요.",
+            action="AI 앱에서 지난 텔레그램 기록을 다시 가져와 달라고 말해주세요.",
         )
         return c
 
@@ -1090,7 +1090,7 @@ def run_repair(scope: str, assume_yes: bool) -> dict:
                     lock.release()  # 다음 정상 데몬이 새로 락을 잡을 수 있게 반납
                     actions.append({
                         "action": "daemon_zombie_kill", "status": "done",
-                        "detail": "멎은 데몬을 종료했습니다. Claude 를 재시작하면 새 데몬이 뜹니다.",
+                        "detail": "멎은 데몬을 종료했습니다. AI 앱(Claude·ChatGPT)을 재시작하면 새 데몬이 뜹니다.",
                     })
                 else:
                     actions.append({

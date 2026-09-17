@@ -210,7 +210,7 @@ async def _run_stepper() -> None:
         # 죽는다(실제로 재현해서 확인함) — 그 cryptic한 에러 대신 바로 원인을 알려준다.
         _emit({
             "status": "error", "code": "DAEMON_ACTIVE",
-            "message": "Claude Desktop이 열려 있어 세션 파일을 사용 중입니다. Claude Desktop을 완전히 종료한 뒤 다시 시도하세요.",
+            "message": "AI 앱(Claude·ChatGPT)이 열려 있어 세션 파일을 사용 중입니다. 앱을 완전히 종료한 뒤 다시 시도하세요.",
         })
         return
 
@@ -344,9 +344,9 @@ def main() -> None:
     print("종목 사전 받는 중(KRX)...")
     stocks = refresh_stocks()
     print(f"종목 {len(stocks)}개 준비 완료.")
-    print("\n준비 끝. 이제 `telegramlens-setup` 으로 MCP 서버를 Claude에 등록하세요.")
-    print("등록 후 Claude를 켜면 백그라운드 수집이 자동으로 시작됩니다.")
-    print("(수집 상태는 Claude에서 telegram_status 로 확인할 수 있습니다.)")
+    print("\n준비 끝. 이제 LeetKit Manager의 [MCP 등록]으로 AI 앱(Claude·ChatGPT)에 등록하세요.")
+    print("등록 후 앱을 켜면 백그라운드 수집이 자동으로 시작됩니다.")
+    print("(수집 상태는 앱에서 telegram_status 로 확인할 수 있습니다.)")
 
 
 if __name__ == "__main__":

@@ -110,7 +110,7 @@ def _help() -> str:
         "    추가/삭제: !보유 추가 엔비디아 · !보유 삭제 엔비디아\n"
         "    전체 비우기: !보유 비우기\n"
         "· !명령어 — 이 목록 다시 보기\n"
-        "더 깊은 분석·판단은 데스크탑 Claude 에서."
+        "더 깊은 분석·판단은 데스크탑 AI 앱(Claude·ChatGPT)에서."
     )
 
 
@@ -127,7 +127,7 @@ def _fmt_watchlist_buzz() -> str:
         samp = r.get("samples") or []
         if samp:
             lines.append("   " + " ".join((samp[0].get("text") or "").split())[:70])
-    lines.append("\n종가·심화는 데스크탑 Claude 에서.")
+    lines.append("\n종가·심화는 데스크탑 AI 앱(Claude·ChatGPT)에서.")
     return "\n".join(lines)
 
 

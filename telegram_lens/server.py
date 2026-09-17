@@ -697,7 +697,7 @@ async def telegram_status() -> str:
         elif last_result:
             collector["last_result"] = last_result
     if not lock_held:
-        collector["note"] = "수집 데몬 미가동 — Claude 재시작 시 자동 기동(로그인 상태일 때)."
+        collector["note"] = "수집 데몬 미가동 — AI 앱(Claude·ChatGPT) 재시작 시 자동 기동(로그인 상태일 때)."
     elif daemon_status is None:
         collector["note"] = "데몬은 가동 중이나 상태 파일을 아직 못 읽었습니다(막 기동됨)."
     s["collector"] = collector
@@ -823,7 +823,7 @@ async def telegram_send_me(messages: list[str]) -> str:
     if not is_alive():
         return (
             "⚠️ 수집 데몬이 가동 중이 아닙니다 — 전송은 데몬을 통해 이뤄집니다. "
-            "Claude 와 PC가 켜져 있는지 확인하세요(잠시 후 watchdog 이 데몬을 다시 띄웁니다)."
+            "AI 앱(Claude·ChatGPT)과 PC가 켜져 있는지 확인하세요(잠시 후 watchdog 이 데몬을 다시 띄웁니다)."
         )
 
     import uuid
