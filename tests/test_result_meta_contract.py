@@ -39,21 +39,57 @@ class ContractVersionTests(unittest.TestCase):
 
 
 class StaleCollectionTests(unittest.TestCase):
-    def _meta(self, newest_iso, hours):
-        with patch.object(tserver.db, "newest_message_date", return_value=newest_iso):
+    """신선도는 마지막 '실제 수집' 시각으로 본다(마지막 글 시각이 아니라).
+
+    마지막 글 시각은 조용한 밤에 자연히 오래되고, 창보다 오래됐을 때만 partial 로
+    보면 24시간 창 중 20시간이 비어도 complete 였다.
+    """
+
+    def _meta(self, newest_iso, hours, *, last_collection=None, first_iso=None, interval=10):
+        times = {
+            "newest_message": newest_iso,
+            "first_message": first_iso or (_iso_hours_ago(24 * 7) if newest_iso else None),
+            "last_collection": last_collection,
+            "interval_minutes": interval,
+        }
+        with patch.object(tserver, "_collection_times", return_value=times):
             return tserver._tl_meta(hours=hours)
 
     def test_fresh_collection_is_complete(self):
-        m = self._meta(_iso_hours_ago(1), 24)
+        m = self._meta(_iso_hours_ago(1), 24, last_collection=_iso_hours_ago(0.1))
         self.assertEqual(m["data_completeness"], "complete")
         self.assertEqual(m["warnings"], [])
 
     def test_collection_older_than_window_is_partial_with_warning(self):
         """마지막 수집이 창보다 오래됐다 = 이 결과는 '지금'이 아니다."""
-        m = self._meta(_iso_hours_ago(72), 24)
+        m = self._meta(_iso_hours_ago(72), 24, last_collection=_iso_hours_ago(72))
         self.assertEqual(m["data_completeness"], "partial")
         self.assertTrue(any("telegram_sync" in w for w in m["warnings"]))
         self.assertTrue(any("지금" in w for w in m["warnings"]))
+
+    def test_gap_shorter_than_window_but_past_two_intervals_is_partial(self):
+        """24시간 창인데 마지막 수집이 20시간 전 - 창의 대부분이 비어 있다."""
+        m = self._meta(_iso_hours_ago(20), 24, last_collection=_iso_hours_ago(20))
+        self.assertEqual(m["data_completeness"], "partial")
+        self.assertTrue(any("마지막 수집이 약 20시간 전" in w for w in m["warnings"]))
+
+    def test_quiet_period_with_recent_collection_is_complete(self):
+        """새 글이 5시간 없어도 5분 전에 수집했으면 '수집이 오래됐다'고 말하지 않는다."""
+        m = self._meta(_iso_hours_ago(5), 6, last_collection=_iso_hours_ago(5 / 60))
+        self.assertEqual(m["data_completeness"], "complete")
+        self.assertEqual(m["warnings"], [])
+
+    def test_history_shorter_than_window_is_partial(self):
+        m = self._meta(
+            _iso_hours_ago(0.1), 72,
+            last_collection=_iso_hours_ago(0.05), first_iso=_iso_hours_ago(20),
+        )
+        self.assertEqual(m["data_completeness"], "partial")
+        self.assertTrue(any("72시간을 다 덮지 못합니다" in w for w in m["warnings"]))
+
+    def test_float_hours_label_has_no_decimal(self):
+        m = self._meta(_iso_hours_ago(1), 24.0, last_collection=_iso_hours_ago(0.1))
+        self.assertEqual(m["data_period"], "최근 24시간")
 
     def test_empty_db_reports_none_not_zero_buzz(self):
         """수집이 없는 것과 언급이 0인 것은 다르다."""

@@ -281,51 +281,148 @@ def _json(data) -> str:
     return json.dumps(data, ensure_ascii=False, indent=2)
 
 
-def _tl_meta(*, hours: int | None = None, codes: list[str] | None = None) -> dict:
-    """TelegramLens 조회 도구 메타. 기준일은 **DB의 마지막 메시지 시각**이다.
+# 새 수집이 이만큼(수집 주기 × 2 + 여유) 없으면 결과를 '지금' 기준으로 보지 않는다.
+_STALE_INTERVALS = 2
+_STALE_SLACK_MIN = 10
+_DEFAULT_INTERVAL_MIN = 10
 
-    버즈 결과의 함정은 '집계 창'과 '마지막 수집 시각'이 다르다는 점이다.
-    telegram_trending(hours=24)는 "최근 24시간"이라고 말하지만, 마지막 수집이
-    사흘 전이면 실제로는 사흘 전 시점의 24시간 창이다. 읽는 쪽은 "지금 뜨는
-    종목"으로 오해한다. 그래서 data_as_of(마지막 메시지)와 data_period(요청 창)를
-    나란히 싣고, 창보다 수집이 더 오래됐으면 경고를 붙인다.
+
+def _parse_utc(iso: str | None) -> datetime | None:
+    if not iso:
+        return None
+    try:
+        dt = datetime.fromisoformat(iso)
+    except (TypeError, ValueError):
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def _hours_label(hours: float) -> str:
+    """12.0 → '12', 1.5 → '1.5'."""
+    return f"{float(hours):g}"
+
+
+def _ago_text(minutes: float) -> str:
+    if minutes < 120:
+        return f"{max(1, round(minutes))}분"
+    if minutes < 48 * 60:
+        return f"{round(minutes / 60)}시간"
+    return f"{round(minutes / 1440)}일"
+
+
+def _collection_times() -> dict:
+    """신선도 판정 재료.
+
+    newest_message   DB 에 들어온 마지막 글 시각(= data_as_of 의 근거)
+    first_message    DB 에서 가장 오래된 글 시각(요청 창을 덮는지 볼 때)
+    last_collection  마지막 실제 수집 시각 - channels.last_synced(채널이 실제로 받아진 시각)와
+                     데몬 상태의 last_success_at 중 늦은 쪽
+    interval_minutes 데몬 수집 주기(상태 파일이 없으면 기본 10분)
+
+    마지막 글 시각은 조용한 밤·주말에 자연히 오래되므로 수집 신선도로 쓰지 않는다.
     """
-    with db.connect() as conn:
-        newest = db.newest_message_date(conn)
-    newest_kst = queries._to_kst(newest) if newest else None
+    import sqlite3
 
-    warnings: list[str] = []
+    try:
+        with db.connect() as conn:
+            newest = db.newest_message_date(conn)
+            last_synced = db.last_collection_at(conn)
+            first = conn.execute("SELECT MIN(date) AS d FROM messages").fetchone()
+    except sqlite3.OperationalError:
+        # 신규 설치라 스키마가 아직 없다 - '수집 전'이지 오류가 아니다.
+        newest = last_synced = first = None
+    status: dict = {}
+    try:
+        from telegram_lens import procstate
+        from telegram_lens.daemon import status_path
+
+        status = procstate.read_json(status_path()) or {}
+    except Exception:  # noqa: BLE001 — 상태 파일을 못 읽어도 DB 기록으로 판정한다
+        status = {}
+    seen = [t for t in (_parse_utc(last_synced), _parse_utc(status.get("last_success_at"))) if t]
+    return {
+        "newest_message": newest,
+        "first_message": first["d"] if first else None,
+        "last_collection": max(seen).isoformat() if seen else None,
+        "interval_minutes": status.get("interval_minutes") or _DEFAULT_INTERVAL_MIN,
+    }
+
+
+def _freshness(hours: float | None = None) -> dict:
+    """결과가 '지금' 기준인지. 반환: completeness·warnings·short(브리핑 한 줄)·times."""
+    t = _collection_times()
+    now = datetime.now(timezone.utc)
+    if t["newest_message"] is None:
+        msg = "수집된 메시지가 없습니다."
+        return {"completeness": rmeta.NONE, "warnings": [msg], "short": msg, "times": t}
+
     completeness = rmeta.COMPLETE
-    if newest_kst is None:
-        completeness = rmeta.NONE
-        warnings.append("수집된 메시지가 없습니다.")
-    elif hours:
-        try:
-            gap_h = (
-                datetime.now(timezone.utc) - datetime.fromisoformat(newest).replace(tzinfo=timezone.utc)
-            ).total_seconds() / 3600
-        except (TypeError, ValueError):
-            gap_h = 0
-        if gap_h > hours:
+    warnings: list[str] = []
+    short = None
+    stale_after = t["interval_minutes"] * _STALE_INTERVALS + _STALE_SLACK_MIN
+    last = _parse_utc(t["last_collection"])
+    if last is not None:
+        age = (now - last).total_seconds() / 60
+        if age > stale_after:
             completeness = rmeta.PARTIAL
             warnings.append(
-                f"마지막 수집이 약 {gap_h:.0f}시간 전이라 요청한 {hours}시간 창보다 오래됐습니다. "
-                "이 결과는 '지금'이 아니라 그 시점 기준입니다 — telegram_sync 후 다시 조회하세요."
+                f"마지막 수집이 약 {_ago_text(age)} 전({queries._to_kst(last.isoformat())})입니다. "
+                "그 뒤에 올라온 글은 빠져 있어 이 결과는 '지금' 기준이 아닙니다 — "
+                "telegram_sync 후 다시 조회하세요."
             )
+            short = f"마지막 수집이 약 {_ago_text(age)} 전이라 그 뒤 글은 빠져 있습니다."
+    else:
+        newest = _parse_utc(t["newest_message"])
+        age = (now - newest).total_seconds() / 60 if newest else 0
+        if age > stale_after:
+            completeness = rmeta.PARTIAL
+            warnings.append(
+                f"수집 시각 기록이 없고, 마지막으로 받은 글이 약 {_ago_text(age)} 전입니다. "
+                "'지금' 기준이 아닐 수 있습니다 — telegram_sync 후 다시 조회하세요."
+            )
+            short = f"마지막으로 받은 글이 약 {_ago_text(age)} 전입니다."
 
+    first = _parse_utc(t["first_message"])
+    if hours and first is not None:
+        have_h = (now - first).total_seconds() / 3600
+        if have_h < hours - max(1.0, hours * 0.05):
+            completeness = rmeta.PARTIAL
+            warnings.append(
+                f"수집된 기록이 약 {_ago_text(have_h * 60)}치뿐이라 요청한 "
+                f"{_hours_label(hours)}시간을 다 덮지 못합니다."
+            )
+    return {"completeness": completeness, "warnings": warnings, "short": short, "times": t}
+
+
+def _tl_meta(
+    *, hours: float | None = None, codes: list[str] | None = None, fresh: dict | None = None
+) -> dict:
+    """TelegramLens 조회 도구 메타.
+
+    data_as_of 는 DB 의 마지막 메시지 날짜, data_period 는 요청 창이다. 신선도는
+    마지막 **실제 수집** 시각으로 본다(_freshness): 수집 주기 두 번 넘게 새 수집이
+    없거나, 모인 기록이 요청 창보다 짧으면 partial 과 경고를 붙인다. 예전엔 마지막
+    글이 창보다 오래됐을 때만 partial 이라, 24시간 창 중 20시간이 비어도 complete 였고
+    조용한 밤에는 '마지막 수집이 N시간 전'이라는 틀린 말이 나갔다.
+    """
+    f = fresh or _freshness(hours)
+    newest = f["times"]["newest_message"]
+    newest_kst = queries._to_kst(newest) if newest else None
     return rmeta.build_meta(
         lens="telegramlens",
         data_basis=rmeta.BASIS_AGGREGATE,
         data_as_of=(newest_kst or "")[:10] or None,
-        data_period=f"최근 {hours}시간" if hours else None,
+        data_period=f"최근 {_hours_label(hours)}시간" if hours else None,
         market="KR",
-        data_completeness=completeness,
+        data_completeness=f["completeness"],
         entity_info=rmeta.entity(stock_code=codes[0]) if codes and len(codes) == 1 else None,
-        warnings=warnings,
+        warnings=list(f["warnings"]),
     )
 
 
-def _stocks_payload(stocks: list, *, hours: int | None = None) -> dict:
+def _stocks_payload(
+    stocks: list, *, hours: float | None = None, codes: list[str] | None = None
+) -> dict:
     """리스트형 결과 공통 포장 — 종목코드 배열(codes)을 맨 위에 같이 준다.
 
     텔레그램 버즈 결과의 종목들을 외부 시세·수급 도구(예: StockLens get_multi_stocks /
@@ -352,7 +449,7 @@ def _stocks_payload(stocks: list, *, hours: int | None = None) -> dict:
     }
     return {
         "_guidance": _WHY_GUIDANCE,
-        "_meta": _tl_meta(hours=hours),
+        "_meta": _tl_meta(hours=hours, codes=codes),
         "codes": by_seg["kr_stock"] + by_seg["kr_etf"],
         "etf_codes": by_seg["kr_etf"],
         "us_codes": by_seg["us_stock"] + by_seg["us_etf"],
@@ -438,7 +535,10 @@ mcp = LensFastMCP(
 - telegram_link: 그 메시지의 텔레그램 딥링크(t.me/...) — 원문·첨부를 바로 열어볼 수 있음
 - media: 첨부 인지 {type: photo|document|webpage, file_name}. 리포트 PDF·차트 이미지가 있으면
   표시되니, 본문에 안 담긴 내용은 telegram_link 로 안내하라(다운로드·본문읽기는 안 함)
-- trending 의 baseline_ratio: 현재 일평균 언급 / 7일 일평균(1 초과면 평소보다 활발).
+- baseline_ratio: 지금 창의 하루 평균 독립 언급 / 최근 7일 하루 평균 독립 언급(1 초과면 평소보다
+  활발). 7일 평균은 실제로 수집된 날수(baseline_days_covered)로 나눈다. 3일 미만이면 null.
+- momentum 의 spike 는 배율이라 기준 구간에 언급이 없으면 null 이다. is_new=true 는 기준 구간을
+  다 수집했는데 0건일 때만, null 이면 기록이 모자라 새로 떴는지 알 수 없다는 뜻.
 - 채널 tier·weight: 같은 언급도 analyst > gossip 로 신뢰도가 다름(가중 근거).
 - 중복제거: independent(독립 언급=클러스터 수)가 헤드라인. raw_messages 는 포워드/복붙
   포함 원시 건수, spread_copies·total_forwards 는 확산 강도. 순위는 independent 기준.
@@ -472,9 +572,12 @@ trending·momentum·buzz_score 는 **세그먼트마다 top 개씩** 뽑아 국�
 
 - `data_period` = 요청한 집계 창(예: `최근 24시간`).
   `data_as_of` = **DB에 들어온 마지막 메시지 날짜**. 둘은 다릅니다.
-- 마지막 수집이 집계 창보다 오래됐으면 `data_completeness`가 `partial`이 되고
-  `warnings`에 그 사실이 적힙니다. 그때 이 결과는 **'지금'이 아니라 그 시점 기준**
-  입니다. "현재 급등 중"처럼 쓰지 말고, 먼저 `telegram_sync`를 권하세요.
+- 마지막 실제 수집이 수집 주기 두 번(기본 약 30분)보다 오래됐거나, 모인 기록이 요청 창보다
+  짧으면 `data_completeness`가 `partial`이 되고 `warnings`에 그 사실이 적힙니다. 그때 이
+  결과는 **'지금'이 아니라 그 시점 기준**입니다. "현재 급등 중"처럼 쓰지 말고, 먼저
+  `telegram_sync`를 권하세요. partial 일 때의 0건은 '무언급'이라고 단정하지 마세요.
+- timeline 의 칸 중 `partial: true` 는 한 칸을 다 못 채운 칸(창 시작·지금·마지막 수집에서
+  잘림)이고, `independent: null` 은 0건이 아니라 아직 안 모은 구간입니다.
 - `data_basis`는 항상 `aggregate`입니다 — 시세가 아니라 언급 집계라는 뜻입니다.
 - 메타 블록은 내부용입니다. 사용자에게 JSON을 그대로 보여주지 마세요.
 
@@ -1080,6 +1183,10 @@ def _format_briefing_ready(
     watchlist: list[dict],
     reading: list[dict],
     change: dict[str, float] | None = None,
+    *,
+    hours: float | None = None,
+    now_kst: datetime | None = None,
+    stale_note: str | None = None,
 ) -> str:
     """버즈·내 종목·읽을거리를 '바로 보낼 수 있는 plain text'로 서버에서 완성한다.
 
@@ -1087,6 +1194,11 @@ def _format_briefing_ready(
     데이터는 여기서 DB 텍스트 그대로 포맷한다(commands.py 의 '!명령'이 안 깨지는 이유와 같다).
     급증 노이즈(listy_noise)·전문용어는 여기서 이미 거른다.
     change: {code: 등락률%} — 장 종료 후에만 채워져 종목 옆에 붙는다(없으면 생략).
+    hours: 집계 창. 머리말과 급증 줄에 '최근 N시간'으로 적는다(예전엔 '오늘'이라 적어,
+      아침 7시의 12시간 창이 전날 저녁까지 덮는데도 오늘 일로 읽혔다).
+    now_kst: 머리말 날짜의 기준(KST). 생략하면 지금 KST. PC 현지 시각을 쓰면 해외에서
+      날짜가 하루 어긋난다.
+    stale_note: 수집이 오래됐을 때 머리말 아래 붙일 한 줄.
     """
     change = change or {}
 
@@ -1094,8 +1206,10 @@ def _format_briefing_ready(
         v = change.get(code or "")
         return f"[{v:+.1f}%]" if v is not None else ""
 
-    now = datetime.now()
-    lines = [f"📊 텔레그램 버즈 · {now.month}월 {now.day}일", ""]
+    now = now_kst or datetime.now(market_clock.KST)
+    window = f"최근 {_hours_label(hours)}시간" if hours else None
+    head = f"📊 텔레그램 버즈 · {now.month}월 {now.day}일" + (f" ({window})" if window else "")
+    lines = [head, f"⚠️ {stale_note}", ""] if stale_note else [head, ""]
 
     top = trending[:8]
     if top:
@@ -1109,10 +1223,13 @@ def _format_briefing_ready(
             )
         lines.append("")
 
+    # '갑자기 늘어난'은 평소보다 실제로 늘었을 때만 붙인다(rising). 배율이 1 이하이거나,
+    # 기준 구간 기록이 모자라 비교할 수 없는 종목(is_new=None)은 이 제목 아래 두지 않는다.
     surge = [
         s
         for s in momentum
         if not s.get("listy_noise")
+        and s.get("rising") is not False
         and (s.get("recent_channels") or 0) >= _SURGE_MIN_CHANNELS
     ]
     surge.sort(  # 가장 많은 채널이 동시에 본 것 우선(=신호 강함)
@@ -1124,11 +1241,12 @@ def _format_briefing_ready(
         lines.append("🚀 갑자기 늘어난 종목")
         for s in surge:
             tag = " (ETF)" if s.get("is_etf") else ""
-            how = "평소 거의 없다가" if s.get("is_new") else "최근 부쩍 늘어"
+            how = "평소 거의 없다가" if s.get("is_new") is True else "평소보다 늘어"
             ch = s.get("recent_channels", 0)
+            where = f"{window} {ch}개 채널에서 거론" if window else f"{ch}개 채널에서 거론"
             lines.append(
                 f" · {_chg(s.get('code'))}{s.get('name', '?')}{tag}"
-                f" — {how} 오늘 {ch}개 채널에서 거론"
+                f" — {how} {where}"
             )
             pick = _pick_sample(s.get("samples") or [])
             txt = " ".join((pick.get("text") or "").split())[:70] if pick else ""
@@ -1221,15 +1339,22 @@ async def telegram_briefing(hours: float = 12) -> str:
     for s in momentum:
         avg = dens.get(s.get("code"))
         d = {k: s[k] for k in keep if k in s}
+        # 평소보다 실제로 늘었나: 기준 구간을 다 덮고 0건이었거나(is_new), 배율이 1 초과.
+        d["rising"] = s.get("is_new") is True or (s.get("spike") or 0) > 1
         d["is_etf"] = s.get("code") in etf
         d["stocks_per_msg_avg"] = round(avg, 1) if avg else None
         d["listy_noise"] = bool(avg and avg >= 8)
         slim_momentum.append(d)
     watchlist = _watchlist_buzz(hours)
     reading = _reading_list(hours)
-    # 등락률은 장 종료 후(16시 이후)에만 — 장중/장전(7시 브리핑)엔 의미가 약하고 전일치 혼동.
+    clock = market_clock.get_market_clock()  # SL 과 동일한 시각/세션 로직(KST·KRX 휴일)
+    krx = clock["krx"]
+    fresh = _freshness(hours)
+    # 등락률은 거래일 정규장 마감 뒤(KST)에만 — 장중/장전(7시 브리핑)엔 의미가 약하고, 주말·
+    # 휴일엔 직전 거래일 값이라 오늘 날짜 머리말 아래 붙이면 날짜가 틀린다. 예전엔 PC 현지
+    # 시각 16시로 갈라, 해외에서는 한국 장중 등락률이 붙었다.
     change: dict[str, float] = {}
-    if datetime.now().hour >= 16:
+    if krx.get("is_trading_day") and krx.get("status") in ("after_hours", "closed_after_hours"):
         from telegram_lens import prices
 
         codes = [
@@ -1240,15 +1365,18 @@ async def telegram_briefing(hours: float = 12) -> str:
         change = prices.daily_change(codes)
     # 버즈/내종목/읽을거리는 _ready 텍스트가 이미 '완성'이라 raw 를 안 보냄(토큰 75% 절감).
     # Claude 가 작문하는 건 시황뿐 — 거기 필요한 macro 만 남긴다. 깊은 분석은 !종목·velocity 로.
-    clock = market_clock.get_market_clock()  # SL 과 동일한 시각/세션 로직(KST·KRX 휴일)
     return _json(
         {
             "_playbook": _BRIEFING_PLAYBOOK,
+            "_meta": _tl_meta(hours=hours, fresh=fresh),
             "window_hours": hours,
             "기준시각_kst": clock["now_kst"],
-            "_시황_관점": _briefing_session(clock["krx"]),
+            "_시황_관점": _briefing_session(krx),
             "_ready_버즈_그대로전송": _format_briefing_ready(
-                trending, slim_momentum, watchlist, reading, change
+                trending, slim_momentum, watchlist, reading, change,
+                hours=hours,
+                now_kst=datetime.fromisoformat(clock["now_kst"]),
+                stale_note=fresh["short"],
             ),
             "macro_거시버즈": _macro_buzz(hours),
         }
@@ -1289,6 +1417,7 @@ async def telegram_watchlist(hours: float = 24) -> str:
         )
     return _json(
         {
+            "_meta": _tl_meta(hours=hours),
             "window_hours": hours,
             "watchlist_내종목": items,
             "_지침": "종목별 samples 원문을 근거로 '텔레그램에서 무슨 말이 도는지(여론·이슈·근거 "
@@ -1339,6 +1468,7 @@ async def telegram_velocity(
                 top=top,
             ),
             hours=window_hours,
+            codes=[code] if code and queries.market_of(code) == "KR" else None,
         )
     )
 
@@ -1375,6 +1505,7 @@ async def telegram_timeline(
             "timeline": queries.stock_timeline(
                 code=code, name=name, hours=hours, bucket_minutes=bucket_minutes
             ),
+            "_meta": _tl_meta(hours=hours, codes=[code] if queries.market_of(code) == "KR" else None),
         }
     )
 
@@ -1457,14 +1588,24 @@ async def telegram_stock_buzz(query: str, hours: float = 24, samples: int = 8) -
         # 언급이 수십 건인 종목도 '무언급'으로 나갔다.
         summary = result.get("summary") or {}
         zero = not (summary.get("independent") or summary.get("raw_messages"))
+        fresh = _freshness(hours)
+        result["_meta"] = _tl_meta(
+            hours=hours, codes=[code] if ent["market"] == "KR" else None, fresh=fresh
+        )
         if zero:
             # 지원 종목의 0건은 무언급이지 미지원이 아니다(수용 2).
             result["entity_status"] = "supported_but_zero_mentions"
-            result["status_note"] = (
-                "사전에 있는 종목이고 조회는 정상입니다 - 이 기간 수집분에 "
-                "무언급일 뿐입니다."
-                + (" 미국 종목 언급 수집은 이 기능 도입 이후 메시지부터 "
-                   "쌓이므로 과거 데이터에는 없습니다." if ent["market"] == "US" else ""))
+            if fresh["completeness"] == rmeta.COMPLETE:
+                note = "사전에 있는 종목이고 조회는 정상입니다 - 이 기간 수집분에 무언급일 뿐입니다."
+            else:
+                # 수집이 오래됐거나 기록이 창보다 짧다 - 0건이 '무언급'인지 '안 모음'인지 모른다.
+                note = (
+                    "사전에 있는 종목이지만 이 기간 수집이 다 되지 않았습니다"
+                    f"({' '.join(fresh['warnings'])}) 무언급이라고 단정할 수 없습니다."
+                )
+            result["status_note"] = note + (
+                " 미국 종목 언급 수집은 이 기능 도입 이후 메시지부터 "
+                "쌓이므로 과거 데이터에는 없습니다." if ent["market"] == "US" else "")
         else:
             result["entity_status"] = "supported"
     return _json(result)
@@ -1505,9 +1646,9 @@ async def telegram_search(
         limit: 최대 결과 수. 기본 30.
         channel: 특정 채널 username(@ 제외)으로 한정. 생략 시 전체.
     """
-    return _json(
-        queries.search_messages(query=query, hours=hours, limit=limit, channel=channel)
-    )
+    result = queries.search_messages(query=query, hours=hours, limit=limit, channel=channel)
+    result["_meta"] = _tl_meta(hours=hours)
+    return _json(result)
 
 
 @mcp.tool()
