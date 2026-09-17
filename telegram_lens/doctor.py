@@ -50,6 +50,7 @@ from telegram_lens._error_class import (  # noqa: E402
     action_for,
     classify_error,
     classify_exception,
+    still_failing,
 )
 
 # Manager 공통 계약(LeetKit Manager Program Requirements 3.1) 최상위 필드 상수.
@@ -971,9 +972,9 @@ def check_recent_tool_failures(records: list[dict] | None = None, now=None) -> C
     for rec in records:  # 시간순
         tool = str(rec.get("tool") or "unknown")
         err = rec.get("error")
-        slot = per_tool.setdefault(tool, {"fails": 0, "cancelled": 0, "last": None, "last_ok": None})
+        slot = per_tool.setdefault(tool, {"fails": 0, "cancelled": 0, "last": None, "trailing": []})
         if not err:
-            slot["last_ok"] = True
+            slot["trailing"] = []
             continue
         category = classify_error(err, rec.get("error_detail"))
         if category == "cancelled":
@@ -984,9 +985,10 @@ def check_recent_tool_failures(records: list[dict] | None = None, now=None) -> C
         failures += 1
         slot["fails"] += 1
         slot["last"] = (rec, category)
-        slot["last_ok"] = False
+        slot["trailing"].append(category)
 
-    unresolved = {t: s for t, s in per_tool.items() if s["last_ok"] is False}
+    # 끝에 남은 실패가 아직 실패인지는 세 Lens 공통 규칙(_error_class.still_failing)이 정한다.
+    unresolved = {t: s for t, s in per_tool.items() if still_failing(s["trailing"])}
 
     # 지원용 줄: 아직 막힌 도구 먼저, 그 안에서는 최근 실패 먼저. 최대 8줄.
     rows = []
@@ -1010,7 +1012,7 @@ def check_recent_tool_failures(records: list[dict] | None = None, now=None) -> C
         c.ok(f"최근 이틀 동안 조회 {total}번이 모두 정상이었어요.")
         return c
     if not unresolved:
-        c.ok(f"최근 이틀 동안 조회 {total}번 중 {failures}번이 실패했지만, 그 뒤에는 정상이었어요.")
+        c.ok(f"최근 이틀 동안 조회 {total}번 중 {failures}번이 실패했지만, 계속 실패하고 있지는 않아요.")
         return c
 
     # 대표 분류: 아직 막혀 있는 도구들의 마지막 실패 분류 중 가장 많은 것(같으면 판정 순서 앞쪽).

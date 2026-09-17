@@ -544,9 +544,11 @@ def test_data_locked(sim):
 def test_recent_failures_warn_rows(sim, error, detail, category):
     sim["register"]()
     now = datetime.now()
+    # 원인 불명·시간 초과·연결 실패는 되풀이돼야 '주의'다 — 모든 분류의 주의 문구를 보려고 두 번씩.
     sim["records"] = [
-        {"timestamp": (now - timedelta(minutes=5)).isoformat(timespec="seconds"), "tool": "telegram_trending",
-         "error": error, "error_detail": detail, "_ts": now - timedelta(minutes=5)},
+        {"timestamp": (now - timedelta(minutes=m)).isoformat(timespec="seconds"), "tool": "telegram_trending",
+         "error": error, "error_detail": detail, "_ts": now - timedelta(minutes=m)}
+        for m in (6, 5)
     ]
     payload = sim["run"]()
     chk = _by_id(payload)["RECENT_TOOL_FAILURES"]

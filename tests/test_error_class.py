@@ -152,3 +152,53 @@ def test_telegramlens_actions_point_to_its_card():
     assert EC.action_for("auth", "TelegramLens") == "TelegramLens 카드의 [텔레그램 로그인]을 다시 눌러주세요."
     assert "TelegramLens 카드의 [업데이트]" in EC.action_for("schema", "TelegramLens")
     assert "TelegramLens 카드의 [업데이트]" in EC.action_for("other", "TelegramLens")
+
+
+# ── 세 Lens 공통: 끝에 남은 실패를 아직 실패로 볼지, 예외 사슬에서 무엇을 고를지 ──
+
+
+@pytest.mark.parametrize(
+    ("trailing", "expected"),
+    [
+        ([], False),
+        (["other"], False),  # AI 앱이 인자를 한 번 잘못 넣은 경우
+        (["timeout"], False),  # 한 번 삐끗한 타임아웃
+        (["connect"], False),
+        (["other", "other"], True),  # 다시 불러도 또 실패 — 진짜 결함
+        (["timeout", "connect"], True),
+        (["tls"], True),  # 원인이 분명하고 저절로 안 풀림 — 한 번이면 충분
+        (["dns"], True),
+        (["blocked"], True),
+        (["auth"], True),
+        (["schema"], True),
+    ],
+)
+def test_still_failing(trailing, expected):
+    from telegram_lens._error_class import still_failing
+
+    assert still_failing(trailing) is expected
+
+
+def test_classify_exception_prefers_tls_anywhere_then_outer_first():
+    import ssl
+
+    from telegram_lens._error_class import classify_exception
+
+    class ProviderUnavailable(Exception):
+        pass
+
+    try:
+        try:
+            raise ssl.SSLCertVerificationError("certificate verify failed")
+        except ssl.SSLError as inner:
+            raise ProviderUnavailable("provider_unavailable") from inner
+    except ProviderUnavailable as wrapped:
+        assert classify_exception(wrapped) == "tls"
+
+    try:
+        try:
+            raise TimeoutError("timed out")
+        except TimeoutError:
+            raise ProviderUnavailable("credential_invalid") from None
+    except ProviderUnavailable as wrapped:
+        assert classify_exception(wrapped) == "auth"

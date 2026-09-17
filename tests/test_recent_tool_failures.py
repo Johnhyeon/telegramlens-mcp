@@ -75,7 +75,7 @@ def test_failure_then_same_tool_success_is_resolved(logs):
     ])
     c, d = _check()
     assert d["status"] == "ok"
-    assert d["summary"] == "최근 이틀 동안 조회 3번 중 1번이 실패했지만, 그 뒤에는 정상이었어요."
+    assert d["summary"] == "최근 이틀 동안 조회 3번 중 1번이 실패했지만, 계속 실패하고 있지는 않아요."
     # 지원용 줄에는 남는다.
     assert any("telegram_trending: 실패 1번" in line and "분류 tls" in line for line in d["details"]["lines"])
 
@@ -84,7 +84,9 @@ def test_last_call_failed_is_warn(logs):
     logs([
         _rec(90, "telegram_trending"),
         _rec(30, "telegram_trending", "ReadTimeout", "The read operation timed out"),
+        _rec(25, "telegram_trending", "ReadTimeout", "The read operation timed out"),
         _rec(20, "telegram_search", "FloodWaitError", "A wait of 300 seconds is required"),
+        _rec(15, "telegram_messages", "ReadTimeout", ""),
         _rec(10, "telegram_messages", "ReadTimeout", ""),
     ])
     c, d = _check()
@@ -95,8 +97,21 @@ def test_last_call_failed_is_warn(logs):
     assert d["action"].startswith("연결이 느려서")
     assert d["critical"] is False
     lines = d["details"]["lines"]
-    assert any(line.startswith("telegram_trending: 실패 1번, 마지막 14:30, 분류 timeout, ReadTimeout:") for line in lines)
+    assert any(line.startswith("telegram_trending: 실패 2번, 마지막 14:35, 분류 timeout, ReadTimeout:") for line in lines)
     assert len(lines) <= 8
+
+
+def test_single_unclear_failure_is_not_warn_but_repeat_is(logs):
+    """AI 앱이 인자를 한 번 잘못 넣은 호출로 카드가 이틀 내내 '주의'가 되면 안 된다.
+    다시 불러도 또 실패하면 그때는 진짜 결함으로 본다."""
+    logs([_rec(30, "telegram_timeline", "ValueError", "코드 999999 는 종목 사전에 없습니다.")])
+    c, d = _check()
+    assert d["status"] == "ok"
+
+    logs([_rec(20, "telegram_timeline", "ValueError", "코드 999999 는 종목 사전에 없습니다.")])
+    c, d = _check()
+    assert d["status"] == "warn"
+    assert d["details"]["error_code"] == "RECENT_TOOL_FAILURES_OTHER"
 
 
 def test_cancelled_only_is_not_a_failure(logs):
@@ -125,7 +140,8 @@ def test_records_older_than_48h_are_ignored(logs):
 
 def test_detail_lines_are_capped_and_masked(logs):
     secret = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
-    logs([_rec(100 - i, f"tool_{i}", "RuntimeError", f"bad token {secret}") for i in range(12)])
+    # 원인 불명 실패는 되풀이돼야 '주의'다 — 도구마다 두 번씩 실패시킨다.
+    logs([_rec(100 - i * 2 - j, f"tool_{i}", "RuntimeError", f"bad token {secret}") for i in range(12) for j in range(2)])
     c, d = _check()
     lines = d["details"]["lines"]
     tool_lines = [line for line in lines if ": 실패 " in line]
