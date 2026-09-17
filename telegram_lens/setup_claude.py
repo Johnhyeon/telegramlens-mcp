@@ -195,6 +195,12 @@ def _configure_toml_target(config_path: Path, label: str, *, command: str, quiet
     server_table["command"] = entry["command"]
     if "args" in entry:
         server_table["args"] = entry["args"]
+    # Codex CLI·ChatGPT 앱은 MCP 도구를 부르기 전에 승인을 묻는다. 기본값이면 첫 호출이
+    # 승인 대기에 걸리고, 비대화 실행에서는 "user cancelled MCP tool call" 로 곧바로
+    # 실패한다(2026-09-17 실측). 우리 도구는 사용자 본인 텔레그램 수집·조회가 전부라
+    # 자동 승인으로 둔다. 값은 auto / prompt / writes / approve 중 하나
+    # (learn.chatgpt.com/docs/extend/mcp). 서버도 도구마다 readOnlyHint 를 붙인다.
+    server_table["default_tools_approval_mode"] = "auto"
     doc["mcp_servers"][SERVER_KEY] = server_table
 
     config_path.write_text(tomlkit.dumps(doc), encoding="utf-8")

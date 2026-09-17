@@ -103,13 +103,56 @@ def coerce_integer_strings(schema: Any, arguments: dict) -> dict:
     return arguments if fixed is None else fixed
 
 
+# ## 도구 주석(annotations) — Codex·ChatGPT 앱의 승인 프롬프트 (2026-09-17 실측)
+#
+# Codex CLI 0.147 / ChatGPT 앱은 같은 `~/.codex/config.toml` 을 읽고, MCP 도구를
+# 부르기 전에 승인을 묻는다(`default_tools_approval_mode`). "writes" 모드는 **읽기
+# 전용으로 표시되지 않은** 도구만 묻는데, 우리 도구는 주석이 하나도 없어 전부
+# "쓰기일지도 모르는 도구"로 보였다. 그래서 첫 호출이 승인 대기에 걸리고, 비대화
+# 실행(codex exec)에서는 곧바로 "user cancelled MCP tool call" 로 실패했다
+# (search_stock·search·stocklens_status 네 번 연속). 고객이 말한 "GPT 에선 한 번은
+# 꼭 실패"의 모양이 이것이다.
+#
+# 서버가 할 수 있는 몫: 읽기 도구에 readOnlyHint=True 를 붙인다. 쓰기 도구(파일
+# 저장·관심종목 편집·수집)는 각 Lens 가 `write_tools` 로 넘긴다. 설치기는 별도로
+# `default_tools_approval_mode` 를 config 에 적는다(setup_claude.py).
+# openWorldHint=True 는 "외부(인터넷)와 통신한다"는 뜻이고 사실이다.
+
+_READ_ONLY_ANNOTATIONS = {"readOnlyHint": True, "destructiveHint": False,
+                          "idempotentHint": True, "openWorldHint": True}
+_WRITE_ANNOTATIONS = {"readOnlyHint": False, "destructiveHint": False,
+                      "idempotentHint": False, "openWorldHint": True}
+
+
 class LensFastMCP(FastMCP):
-    """목록 스키마와 호출 인자에만 위 규칙을 적용한 FastMCP."""
+    """목록 스키마와 호출 인자에 위 규칙을 적용하고, 도구마다 읽기/쓰기 주석을 붙인 FastMCP.
+
+    write_tools: 파일을 만들거나 사용자 상태를 바꾸는 도구 이름들. 나머지는 읽기 전용으로
+    표시한다. 이름이 등록된 도구에 없으면 등록 시점에 바로 실패한다 — 오타로 쓰기 도구가
+    조용히 읽기 전용이 되면 안 된다(`check_write_tools`).
+    """
+
+    def __init__(self, *args, write_tools=(), **kwargs):
+        super().__init__(*args, **kwargs)
+        self._lens_write_tools = frozenset(write_tools)
+
+    def check_write_tools(self) -> None:
+        """등록이 끝난 뒤(모든 @tool 다음) 한 번 부른다."""
+        registered = {t.name for t in self._tool_manager.list_tools()}
+        unknown = sorted(self._lens_write_tools - registered)
+        if unknown:
+            raise RuntimeError(f"write_tools 에 없는 도구 이름: {unknown}")
 
     async def list_tools(self):
+        from mcp.types import ToolAnnotations
+
         tools = await super().list_tools()
         for tool in tools:
             tool.inputSchema = client_safe_input_schema(tool.inputSchema)
+            if tool.annotations is None:
+                hints = (_WRITE_ANNOTATIONS if tool.name in self._lens_write_tools
+                         else _READ_ONLY_ANNOTATIONS)
+                tool.annotations = ToolAnnotations(**hints)
         return tools
 
     async def call_tool(self, name, arguments, *args, **kwargs):

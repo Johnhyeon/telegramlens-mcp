@@ -506,6 +506,13 @@ def warn_if_collecting(func):
 mcp = LensFastMCP(
     "TelegramLens",
     lifespan=_lifespan,
+    # 수집·전송·분류·관심종목처럼 상태를 바꾸는 도구. 나머지는 읽기 전용(readOnlyHint)으로
+    # 표시돼 Codex·ChatGPT 앱이 승인 없이 부른다(_tool_schema.py 참고).
+    write_tools=(
+        "telegram_collect_history", "telegram_dismiss_backfill", "telegram_send_me",
+        "telegram_sync", "telegram_watchlist", "telegram_classify_channels",
+        "telegram_set_tier", "telegram_add_alias", "telegram_block_name",
+    ),
     instructions="""TelegramLens — 텔레그램 채널의 종목 내러티브를 구조화해 제공합니다.
 
 먼저 `telegram_sync` 로 최근 메시지를 수집한 뒤 조회 도구를 쓰세요.
@@ -1857,6 +1864,7 @@ async def telegram_block_name(code: str, note: str = "", dry_run: bool = False) 
 
 
 def main() -> None:
+    mcp.check_write_tools()  # write_tools 오타를 서버 기동 시점에 잡는다
     # 수집은 _lifespan 이 띄우는 별도 자식 데몬이 담당(자동시작 레지스트리 없음).
     #
     # DB 준비에 실패해도 서버는 뜬다. 예전엔 여기서 예외가 그대로 올라가 프로세스가
