@@ -21,7 +21,7 @@ from telethon.tl.functions.channels import GetFullChannelRequest
 from telethon.tl.types import Channel
 
 from telegram_lens import db
-from telegram_lens.client import make_client
+from telegram_lens.client import LOGIN_REQUIRED_MESSAGE, make_client
 
 
 def _clean(about: str | None, max_len: int) -> str:
@@ -53,7 +53,7 @@ async def _collect(max_len: int, only_missing: bool, delay: float) -> dict:
     await client.connect()
     try:
         if not await client.is_user_authorized():
-            return {"error": "로그인이 필요합니다. 먼저 `telegramlens-login` 을 실행하세요."}
+            return {"error": LOGIN_REQUIRED_MESSAGE}
 
         async for dialog in client.iter_dialogs():
             ent = dialog.entity

@@ -18,6 +18,7 @@
 import asyncio
 import json
 import os
+import re
 import shutil
 import sys
 import sysconfig
@@ -43,6 +44,13 @@ except ImportError:
         _uv_tool_bin_dirs,
         _find_store_config_path,
     )
+
+from telegram_lens._error_class import (  # noqa: E402
+    CATEGORIES,
+    action_for,
+    classify_error,
+    classify_exception,
+)
 
 # Manager 공통 계약(LeetKit Manager Program Requirements 3.1) 최상위 필드 상수.
 # StockLens/DartLens와 이름을 반드시 맞출 것 — 여기서 임의로 새 이름을 만들면
@@ -70,7 +78,17 @@ _CHECK_IDS = {
     "daemon": "DAEMON_COLLECTOR",
     "data": "DATA_SQLITE",
     "backfill": "BACKFILL",
+    "recent_failures": "RECENT_TOOL_FAILURES",
 }
+
+# ── Manager 화면에 뜨는 고객 문구(checks[].action / summary) ──────────────
+# 세 Lens 공통 사양(2026-09-17): 터미널 명령 0개, Manager 버튼 이름은 화면 글자 그대로,
+# 상황 → 할 일 하나 → 그래도 같으면 [지원 문의], 해요체. Manager 화면 안이라 앞말은
+# "TelegramLens 카드의 [버튼]", "상단 [지원 문의]". 명령어는 fix(터미널 출력)에만 남긴다.
+LENS = "TelegramLens"
+_ACT_REGISTER = "TelegramLens 카드의 [MCP 등록]을 눌러주세요."
+_ACT_LOGIN = "TelegramLens 카드의 [텔레그램 로그인]을 눌러주세요."
+_ACT_REPAIR = "TelegramLens 카드의 [복구]를 눌러주세요."
 
 
 def _registered_targets(desktop_check: "Check", code_check: "Check", codex_check: "Check") -> list[str]:
@@ -90,7 +108,15 @@ class Check:
         self.name = name
         self.status = None  # "ok" / "active" / "warn" / "fail"
         self.lines: list[str] = []
+        # fix 와 action 을 나눈 이유: fix 는 터미널에서 doctor 를 직접 돌린 사람에게 보이는
+        # 명령어이고, action 은 --json 으로 Manager 화면에 뜨는 고객 문구다. 예전엔 fix 하나를
+        # 둘 다에 썼더니 Manager 카드에 `telegramlens-activate <라이선스-키>` 가 그대로 떴다.
+        # JSON action 은 action 만 쓴다 — fix 로 되돌아가면 명령어가 다시 새어 나간다.
         self.fix: str | None = None
+        self.action: str | None = None
+        # False 면 이 항목 하나로 카드가 "사용 불가"가 되면 안 된다(StockLens 계약과 같은 뜻).
+        self.critical: bool = True
+        self.error_code: str | None = None
         # ok/warn/fail 중 실제로 상태를 확정한 호출의 메시지만 담는다(.info()는 제외) —
         # Manager 계약 checks[].summary는 이 한 줄이고, 나머지 info 라인은 details.lines로 간다.
         self.summary: str = ""
@@ -111,21 +137,25 @@ class Check:
         self.lines.append(msg)
         return self
 
-    def warn(self, msg: str, fix: str | None = None):
+    def warn(self, msg: str, fix: str | None = None, action: str | None = None):
         if self.status != "fail":
             self.status = "warn"
             self.summary = msg
         self.lines.append(msg)
         if fix:
             self.fix = fix
+        if action:
+            self.action = action
         return self
 
-    def fail(self, msg: str, fix: str | None = None):
+    def fail(self, msg: str, fix: str | None = None, action: str | None = None):
         self.status = "fail"
         self.summary = msg
         self.lines.append(msg)
         if fix:
             self.fix = fix
+        if action:
+            self.action = action
         return self
 
     def info(self, msg: str):
@@ -150,6 +180,8 @@ class Check:
         # 바뀌어도 깨지는 방식이라 아예 구조화된 값을 준다.
         if self.progress is not None:
             details["progress"] = self.progress
+        if self.error_code:
+            details["error_code"] = self.error_code
         return {
             "id": check_id,
             "status": self.status,
@@ -157,7 +189,8 @@ class Check:
             "details": details,
             "repairable": repairable,
             "repair_id": repair_id,
-            "action": self.fix,
+            "action": self.action,
+            "critical": self.critical,
         }
 
 
@@ -192,12 +225,13 @@ def check_uv() -> Check:
         c.info(f"Path:       {uv}")
     else:
         c.warn(
-            "uv not found",
+            "실행 환경(uv)을 찾지 못했어요.",
             fix=(
                 "Install uv (recommended):\n"
                 "  Windows: irm https://astral.sh/uv/install.ps1 | iex\n"
                 "  macOS/Linux: curl -LsSf https://astral.sh/uv/install.sh | sh"
             ),
+            action=action_for("other", LENS),
         )
     return c
 
@@ -292,8 +326,9 @@ def check_package() -> Check:
         c.info(f"Executable: {sys.executable}")
     except ImportError:
         c.fail(
-            "telegramlens-mcp NOT importable in current interpreter",
+            "TelegramLens 설치가 깨져 있어요.",
             fix="uv tool install --force telegramlens-mcp",
+            action=action_for("other", LENS),
         )
     return c
 
@@ -327,6 +362,7 @@ def check_telegramlens_command() -> Check:
                 c.warn(
                     "'telegramlens' exists in sysconfig scripts but not on PATH",
                     fix=f'Add to PATH: "{scripts_dir}"',
+                    action=action_for("other", LENS),
                 )
                 c.info(f"Path:       {candidate}")
                 return c
@@ -334,8 +370,9 @@ def check_telegramlens_command() -> Check:
         pass
 
     c.fail(
-        "'telegramlens' command NOT found anywhere",
+        "TelegramLens 실행 파일을 찾지 못했어요.",
         fix="uv tool install --force telegramlens-mcp",
+        action=action_for("other", LENS),
     )
     return c
 
@@ -353,22 +390,28 @@ def _check_config_file(label: str, config_path: Path, *, required: bool) -> Chec
     # 생겼을 때 원인 후보가 하나 더 붙는 환경이라, 진단에서는 눈에 띄게 알린다.
     # info 로 찍으면 화면을 스쳐 지나가서, 정작 막힌 사람이 이 줄을 못 보고 넘어갔다.
     if "Packages" in str(config_path) and "LocalCache" in str(config_path):
+        store_fix = (
+            "문제가 있다면 일반 설치판을 권합니다: "
+            "① 설정 > 설치된 앱에서 Claude 제거 "
+            "② %LOCALAPPDATA%\\Packages 에서 Claude_* 폴더 삭제 "
+            "③ https://claude.ai/download 에서 설치 파일로 재설치 "
+            "(스토어 페이지 말고 이 주소에서 받으세요)"
+        )
         c.warn(
             "Microsoft Store 버전 Claude Desktop 을 쓰고 계십니다 (격리된 경로). "
             "지금 잘 되신다면 그대로 쓰셔도 됩니다.",
-            fix=(
-                "문제가 있다면 일반 설치판을 권합니다: "
-                "① 설정 > 설치된 앱에서 Claude 제거 "
-                "② %LOCALAPPDATA%\\Packages 에서 Claude_* 폴더 삭제 "
-                "③ https://claude.ai/download 에서 설치 파일로 재설치 "
-                "(스토어 페이지 말고 이 주소에서 받으세요)"
-            ),
+            fix=store_fix,
+            action=store_fix,  # 터미널 명령이 아니라 설정 화면 안내라 Manager 에도 그대로 둔다
         )
     c.info(f"Path:       {config_path}")
 
     if not config_path.exists():
         if required:
-            c.fail("Config file does not exist", fix="telegramlens-setup")
+            c.fail(
+                f"{LENS}가 아직 AI 앱에 등록되지 않았어요.",
+                fix="telegramlens-setup",
+                action=_ACT_REGISTER,
+            )
         else:
             c.info("Config file does not exist (target not in use — OK)")
             c.status = "info-skip"
@@ -379,7 +422,13 @@ def _check_config_file(label: str, config_path: Path, *, required: bool) -> Chec
         with open(config_path, "r", encoding="utf-8") as f:
             cfg = json.load(f)
     except json.JSONDecodeError as e:
-        c.fail(f"Config is not valid JSON: {e}", fix="Back up and re-run telegramlens-setup")
+        # 등록([MCP 등록])이 깨진 파일을 새로 만들어 쓴다(setup_claude 참고) — 그래서 할 일은 등록.
+        c.info(f"Config is not valid JSON: {e}")
+        c.fail(
+            "AI 앱 설정 파일이 깨져 있어요.",
+            fix="Back up and re-run telegramlens-setup",
+            action=_ACT_REGISTER,
+        )
         return c
     except Exception as e:
         c.fail(f"Cannot read config: {e}")
@@ -391,8 +440,9 @@ def _check_config_file(label: str, config_path: Path, *, required: bool) -> Chec
     if not entry:
         if required:
             c.fail(
-                f"'{SERVER_KEY}' entry missing in mcpServers",
+                f"{LENS}가 아직 AI 앱에 등록되지 않았어요.",
                 fix=f"telegramlens-setup --target {label_to_target(label)}",
+                action=_ACT_REGISTER,
             )
         else:
             c.info(f"'{SERVER_KEY}' entry not present (target not in use — OK)")
@@ -414,18 +464,22 @@ def _check_config_file(label: str, config_path: Path, *, required: bool) -> Chec
         if Path(cmd).exists():
             c.ok("Command points to existing file")
         else:
-            c.fail(f"Command file missing: {cmd}", fix="telegramlens-setup")
+            c.info(f"Command file missing: {cmd}")
+            c.fail(_REGISTERED_EXE_MISSING, fix="telegramlens-setup", action=_ACT_REGISTER)
     else:
         resolved = shutil.which(cmd)
         if resolved:
             c.ok(f"Command resolvable via PATH: {resolved}")
         else:
-            c.fail(
-                f"Command '{cmd}' not in PATH — client will fail to launch the server",
-                fix="telegramlens-setup",
-            )
+            c.info(f"Command '{cmd}' not in PATH — client will fail to launch the server")
+            c.fail(_REGISTERED_EXE_MISSING, fix="telegramlens-setup", action=_ACT_REGISTER)
 
     return c
+
+
+# 등록은 돼 있는데 가리키는 실행 파일이 없다 — 재설치·경로 변경 뒤에 생긴다. 원래 영어
+# 원문(경로 포함)은 details 줄에 남기고, 화면 한 줄은 고객 말로.
+_REGISTERED_EXE_MISSING = "AI 앱에 등록된 TelegramLens 실행 파일을 찾을 수 없어요."
 
 
 def check_config_desktop() -> Check:
@@ -455,7 +509,11 @@ def _check_config_toml_file(label: str, config_path: Path, *, required: bool) ->
 
     if not config_path.exists():
         if required:
-            c.fail("Config file does not exist", fix="telegramlens-setup --target codex")
+            c.fail(
+                f"{LENS}가 아직 AI 앱에 등록되지 않았어요.",
+                fix="telegramlens-setup --target codex",
+                action=_ACT_REGISTER,
+            )
         else:
             c.info("Config file does not exist (target not in use — OK)")
             c.status = "info-skip"
@@ -476,7 +534,11 @@ def _check_config_toml_file(label: str, config_path: Path, *, required: bool) ->
 
     if not entry:
         if required:
-            c.fail(f"'{SERVER_KEY}' entry missing in mcp_servers", fix="telegramlens-setup --target codex")
+            c.fail(
+                f"{LENS}가 아직 AI 앱에 등록되지 않았어요.",
+                fix="telegramlens-setup --target codex",
+                action=_ACT_REGISTER,
+            )
         else:
             c.info(f"'{SERVER_KEY}' entry not present (target not in use — OK)")
             c.status = "info-skip"
@@ -497,16 +559,15 @@ def _check_config_toml_file(label: str, config_path: Path, *, required: bool) ->
         if Path(cmd).exists():
             c.ok("Command points to existing file")
         else:
-            c.fail(f"Command file missing: {cmd}", fix="telegramlens-setup --target codex")
+            c.info(f"Command file missing: {cmd}")
+            c.fail(_REGISTERED_EXE_MISSING, fix="telegramlens-setup --target codex", action=_ACT_REGISTER)
     else:
         resolved = shutil.which(cmd)
         if resolved:
             c.ok(f"Command resolvable via PATH: {resolved}")
         else:
-            c.fail(
-                f"Command '{cmd}' not in PATH — client will fail to launch the server",
-                fix="telegramlens-setup --target codex",
-            )
+            c.info(f"Command '{cmd}' not in PATH — client will fail to launch the server")
+            c.fail(_REGISTERED_EXE_MISSING, fix="telegramlens-setup --target codex", action=_ACT_REGISTER)
 
     return c
 
@@ -519,8 +580,9 @@ def check_at_least_one_config(*configs: Check) -> Check:
         c.ok(f"{len(registered)} target(s) configured")
         return c
     c.fail(
-        "telegramlens not registered in any MCP client (Claude Desktop / Code / Codex)",
+        f"{LENS}가 아직 AI 앱에 등록되지 않았어요.",
         fix="telegramlens-setup --target {claude-desktop|claude-code|both|codex}",
+        action=_ACT_REGISTER,
     )
     return c
 
@@ -560,6 +622,31 @@ def license_summary() -> dict:
     return {"status": "active", "license_id_masked": masked}
 
 
+# 라이선스 상태별 (summary, action). 세 Lens 공통 기준 문구(사양 2-2)를 Lens 이름만 바꿔 쓴다.
+_LICENSE_COPY = {
+    "missing": (
+        "라이선스 키가 아직 없어요.",
+        "TelegramLens 카드의 [활성화]를 눌러 메일로 받은 키를 넣어주세요.",
+    ),
+    "invalid": (
+        "저장된 라이선스 키를 확인할 수 없어요.",
+        "TelegramLens 카드의 [활성화]를 눌러 메일로 받은 키를 다시 넣어주세요.",
+    ),
+    "expired": (
+        "사용 기간이 끝났어요.",
+        "TelegramLens 카드의 [구매]를 누르고, 받은 키를 [활성화]로 넣어주세요.",
+    ),
+    "revoked": (
+        "이 라이선스 키는 사용이 중지돼 있어요.",
+        "착오라면 상단 [지원 문의]를 눌러주세요.",
+    ),
+    "clock": (
+        "이 컴퓨터의 날짜가 실제보다 과거로 되어 있어요.",
+        "날짜와 시간을 오늘로 맞춘 뒤 [진단]을 다시 눌러주세요.",
+    ),
+}
+
+
 def check_license() -> Check:
     """라이선스 활성화 여부. 키 원문·전체 license_id는 노출하지 않는다."""
     c = Check("License")
@@ -570,26 +657,13 @@ def check_license() -> Check:
         return c
 
     summary = license_summary()
-    if summary["status"] in ("expired", "revoked", "clock"):
+    status = summary["status"]
+    if status in _LICENSE_COPY:
+        msg, action = _LICENSE_COPY[status]
         c.fail(
-            {
-                "expired": "License has expired",
-                "revoked": "License has been revoked",
-                "clock": "System clock is set in the past",
-            }[summary["status"]],
-            fix="telegramlens-activate <라이선스-키>" if summary["status"] == "expired" else None,
-        )
-        return c
-    if summary["status"] == "missing":
-        c.fail(
-            "No license key found (env or license.key)",
-            fix="telegramlens-activate <라이선스-키>",
-        )
-        return c
-    if summary["status"] == "invalid":
-        c.fail(
-            "Stored key is invalid",
-            fix="telegramlens-activate <라이선스-키>",
+            msg,
+            fix="telegramlens-activate <라이선스-키>" if status in ("expired", "missing", "invalid") else None,
+            action=action,
         )
         return c
 
@@ -601,8 +675,11 @@ def check_license() -> Check:
 # ── 런타임 진단 ──────────────────────────────────────────────────────
 
 
-async def _check_real_connection() -> tuple[bool, str]:
+async def _check_real_connection() -> tuple[bool, str, str | None]:
     """실제로 Telegram 에 연결해 is_user_authorized() 까지 확인.
+
+    반환: (성공 여부, 원문, 원인 분류) — 원문은 details 줄용, 분류는 _error_class 이름
+    (성공이면 None, 인증 안 됨이면 "auth").
 
     호출자(check_telegram_login)가 데몬이 세션을 쓰고 있지 않을 때만 부른다 — 같은
     .session 파일을 데몬과 동시에 열면 SQLite 락 경합이 날 수 있어서다.
@@ -617,17 +694,21 @@ async def _check_real_connection() -> tuple[bool, str]:
     try:
         client = make_client()
     except NoCredentialsError as e:
-        return False, str(e)
+        return False, str(e), "auth"
     try:
         await connect_with_timeout(client, timeout=15)
         authorized = await client.is_user_authorized()
         if authorized:
-            return True, "실제 연결 및 인증 확인 성공"
-        return False, "연결은 됐지만 인증되어 있지 않습니다(세션 만료 가능성) — SESSION_INVALID"
+            return True, "실제 연결 및 인증 확인 성공", None
+        return False, "연결은 됐지만 인증되어 있지 않습니다(세션 만료 가능성) — SESSION_INVALID", "auth"
     except Exception as e:  # noqa: BLE001 — 진단 자체가 죽으면 안 됨
-        return False, f"{type(e).__name__}: {e}"
+        return False, f"{type(e).__name__}: {e}", classify_exception(e)
     finally:
         await disconnect_safely(client)
+
+
+# 한 번 로그인했다가 풀린 경우(세션 만료·다른 기기에서 해제). "아직"이 아니라 "풀려"다.
+_LOGIN_EXPIRED = "텔레그램 로그인이 풀려 있어요."
 
 
 def check_telegram_login(daemon_running: bool) -> Check:
@@ -641,17 +722,21 @@ def check_telegram_login(daemon_running: bool) -> Check:
 
     api_id, api_hash = tl_config.get_credentials()
     if not api_id or not api_hash:
+        c.info("No Telegram API credentials found (TELEGRAM_API_ID / TELEGRAM_API_HASH)")
         c.fail(
-            "No Telegram API credentials found (TELEGRAM_API_ID / TELEGRAM_API_HASH)",
+            "텔레그램 api_id와 api_hash가 아직 없어요.",
             fix="telegramlens-login",
+            action="TelegramLens 카드의 [텔레그램 로그인]을 눌러 넣어주세요.",
         )
         return c
     c.info(f"API_ID:     {api_id}")
 
     if not tl_config.is_logged_in():
+        c.info("Credentials present but no session file — not logged in yet")
         c.fail(
-            "Credentials present but no session file — not logged in yet",
+            "텔레그램 로그인이 아직 안 돼 있어요.",
             fix="telegramlens-login",
+            action=_ACT_LOGIN,
         )
         return c
     c.info(f"Path:       {tl_config.session_path().with_suffix('.session')}")
@@ -664,14 +749,25 @@ def check_telegram_login(daemon_running: bool) -> Check:
         return c
 
     try:
-        ok, detail = asyncio.run(_check_real_connection())
+        ok, detail, category = asyncio.run(_check_real_connection())
     except Exception as e:  # noqa: BLE001
-        c.warn(f"실 연결 확인 중 오류: {type(e).__name__}: {e}")
+        category = classify_exception(e)
+        c.info(f"실 연결 확인 중 오류: {type(e).__name__}: {e} (분류 {category})")
+        c.warn("텔레그램 연결을 확인하지 못했어요.", action=action_for(category, LENS))
         return c
     if ok:
         c.ok(detail)
+        return c
+    # 원문(예외 이름 포함)은 details 줄에만. 화면 한 줄은 원인 분류로 고른다.
+    c.info(f"{detail} (분류 {category})")
+    if category == "auth":
+        c.fail(_LOGIN_EXPIRED, fix="telegramlens-login (세션 재발급)", action=action_for("auth", LENS))
     else:
-        c.fail(detail, fix="telegramlens-login (세션 재발급)")
+        c.fail(
+            "텔레그램 서버에 연결하지 못했어요.",
+            fix="telegramlens-login (세션 재발급)",
+            action=action_for(category or "other", LENS),
+        )
     return c
 
 
@@ -700,13 +796,16 @@ def check_daemon() -> Check:
     else:
         c.info("상태 파일이 아직 없습니다.")
 
+    # problem_code 는 데몬이 떠 있을 때(락 보유)만 나온다 — 그때 Manager 카드에 [복구]가 뜬다
+    # (main 의 daemon_repairable 과 같은 조건).
     fix = "telegramlens-doctor --repair daemon" if health["problem_code"] else None
+    action = _ACT_REPAIR if health["problem_code"] else None
     if health["health"] == "healthy":
         c.ok(health["message"])
     elif health["health"] == "degraded":
-        c.warn(health["message"], fix=fix)
+        c.warn(health["message"], fix=fix, action=action)
     else:
-        c.fail(health["message"], fix=fix)
+        c.fail(health["message"], fix=fix, action=action)
     return c
 
 
@@ -731,9 +830,13 @@ def check_data() -> Check:
         conn = sqlite3.connect(str(path), timeout=2.0)
         conn.row_factory = sqlite3.Row
     except sqlite3.OperationalError as e:
+        # DATA_SQLITE 는 repairable 이 아니라 카드에 [복구]가 안 뜰 수 있다 — Claude 를
+        # 껐다 켜는 단계가 있는 [문제 해결]로 보낸다.
+        c.info(f"DB 락으로 접속 실패(2초 대기 후 포기): {e}")
         c.fail(
-            f"DB 락으로 접속 실패(2초 대기 후 포기): {e}",
+            "데이터 파일이 다른 작업에 잠겨 있어요.",
             fix="telegramlens-doctor --repair daemon (멎은 데몬이 락을 쥐고 있을 수 있습니다)",
+            action="상단 [문제 해결]을 눌러주세요. 그래도 같으면 상단 [지원 문의]를 눌러주세요.",
         )
         return c
 
@@ -778,16 +881,18 @@ def check_backfill() -> Check:
 
     if state == "interrupted":
         c.warn(
-            "이전 백필이 중단된 채로 남아 있습니다.",
+            "이전에 지난 기록을 가져오다가 멈춘 채로 남아 있어요.",
             fix="telegram_collect_history(days=...) 로 다시 요청하세요.",
+            action="Claude에게 지난 텔레그램 기록을 다시 가져와 달라고 말해주세요.",
         )
         return c
 
     age = procstate.heartbeat_age_sec(bf, "last_progress_at")
     if age is not None and age > 300:
         c.fail(
-            f"백필 진행이 {int(age)}초째 멈춰 있습니다.",
+            f"지난 기록 가져오기가 {int(age)}초째 멈춰 있어요.",
             fix="telegramlens-doctor --repair daemon",
+            action=_ACT_REPAIR,
         )
     else:
         c.active("지난 기록을 가져오는 중")
@@ -830,6 +935,112 @@ def _backfill_progress(bf: dict) -> dict | None:
         except (ValueError, TypeError):
             pass
     return progress
+
+
+_RECENT_HOURS = 48
+_RECENT_DETAIL_MAX_LINES = 8
+_RECENT_DETAIL_CHARS = 120
+# 지원 번들로 나가는 줄이라 키·토큰처럼 보이는 긴 덩어리는 가린다. _metrics._error_detail 이
+# 쿼리스트링·전화번호는 이미 지우지만, 예외 메시지에 세션 해시·api_hash 가 실릴 수 있다.
+_SECRET_CHUNK_RE = re.compile(r"\b(?:[0-9a-fA-F]{16,}|[A-Z2-7]{16,})\b")
+
+
+def check_recent_tool_failures(records: list[dict] | None = None, now=None) -> Check:
+    """RECENT_TOOL_FAILURES — AI 앱이 최근 48시간 동안 도구를 부르다 실패했는지(세 Lens 공통).
+
+    입력은 도구 호출 기록(metrics JSONL). 네트워크를 타지 않는다. 판정은 "지금 막혀 있나"
+    기준이다 — 실패가 있었어도 같은 도구가 그 뒤에 성공했으면 풀린 것으로 본다.
+
+    한계: 도구가 예외 없이 "⚠️ …" 문자열을 돌려준 실패는 metrics 에 에러로 안 남아서 못 본다.
+    데몬의 백그라운드 수집 실패도 여기 안 남는다(DAEMON_COLLECTOR 가 본다).
+    """
+    c = Check("Recent tool failures")
+    c.critical = False  # 이 항목 하나로 카드가 "사용 불가"가 되면 안 된다
+    if records is None:
+        from telegram_lens._metrics import load_metrics
+
+        records = load_metrics(hours=_RECENT_HOURS, now=now)
+
+    if not records:
+        c.ok(f"최근 이틀 동안 AI 앱이 {LENS}를 쓴 기록이 없어요.")
+        return c
+
+    total = len(records)
+    per_tool: dict[str, dict] = {}
+    failures = 0
+    for rec in records:  # 시간순
+        tool = str(rec.get("tool") or "unknown")
+        err = rec.get("error")
+        slot = per_tool.setdefault(tool, {"fails": 0, "cancelled": 0, "last": None, "last_ok": None})
+        if not err:
+            slot["last_ok"] = True
+            continue
+        category = classify_error(err, rec.get("error_detail"))
+        if category == "cancelled":
+            # AI 앱이 기다리다 취소한 것 — 실패도 성공도 아니다. 마지막 결과를 바꾸지 않는다.
+            slot["cancelled"] += 1
+            slot["cancel_rec"] = rec
+            continue
+        failures += 1
+        slot["fails"] += 1
+        slot["last"] = (rec, category)
+        slot["last_ok"] = False
+
+    unresolved = {t: s for t, s in per_tool.items() if s["last_ok"] is False}
+
+    # 지원용 줄: 아직 막힌 도구 먼저, 그 안에서는 최근 실패 먼저. 최대 8줄.
+    rows = []
+    for tool, s in per_tool.items():
+        if s["fails"]:
+            rec, category = s["last"]
+            n = s["fails"]
+        elif s["cancelled"]:
+            rec, category = s["cancel_rec"], "cancelled"
+            n = s["cancelled"]
+        else:
+            continue
+        rows.append((tool not in unresolved, tool, n, rec, category))
+    # 안정 정렬 두 번 — timestamp 는 같은 형식의 ISO 문자열이라 글자순이 곧 시간순이다.
+    rows.sort(key=lambda r: str(r[3].get("timestamp") or ""), reverse=True)
+    rows.sort(key=lambda r: r[0])
+    for _, tool, n, rec, category in rows[:_RECENT_DETAIL_MAX_LINES]:
+        c.info(_failure_line(tool, n, rec, category))
+
+    if not failures:
+        c.ok(f"최근 이틀 동안 조회 {total}번이 모두 정상이었어요.")
+        return c
+    if not unresolved:
+        c.ok(f"최근 이틀 동안 조회 {total}번 중 {failures}번이 실패했지만, 그 뒤에는 정상이었어요.")
+        return c
+
+    # 대표 분류: 아직 막혀 있는 도구들의 마지막 실패 분류 중 가장 많은 것(같으면 판정 순서 앞쪽).
+    counts: dict[str, int] = {}
+    for s in unresolved.values():
+        counts[s["last"][1]] = counts.get(s["last"][1], 0) + 1
+    lead = max(counts, key=lambda cat: (counts[cat], -CATEGORIES.index(cat)))
+    c.error_code = f"RECENT_TOOL_FAILURES_{lead.upper()}"
+    c.warn(
+        f"최근 조회 중 아직 실패로 남아 있는 것이 {len(unresolved)}가지 있어요.",
+        action=action_for(lead, LENS),
+    )
+    return c
+
+
+def _failure_line(tool: str, n: int, rec: dict, category: str) -> str:
+    ts = rec.get("_ts")
+    if ts is None:
+        try:
+            from datetime import datetime
+
+            ts = datetime.fromisoformat(str(rec.get("timestamp")))
+        except (TypeError, ValueError):
+            ts = None
+    when = ts.strftime("%H:%M") if ts is not None else "?"
+    err = str(rec.get("error") or "")
+    detail = str(rec.get("error_detail") or "")[:_RECENT_DETAIL_CHARS]
+    raw = f"{err}: {detail}" if detail else err
+    raw = _SECRET_CHUNK_RE.sub("<가림>", raw)
+    return f"{tool}: 실패 {n}번, 마지막 {when}, 분류 {category}, {raw}"
 
 
 # ── 복구 ────────────────────────────────────────────────────────────
@@ -1027,6 +1238,7 @@ def main():
         ("daemon", daemon_check),
         ("data", check_data()),
         ("backfill", backfill_check),
+        ("recent_failures", check_recent_tool_failures()),
     ]
     checks = [c for _, c in check_pairs]
 

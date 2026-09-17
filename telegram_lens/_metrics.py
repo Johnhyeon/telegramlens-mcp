@@ -54,6 +54,42 @@ def get_metrics_file() -> Path:
     return get_metrics_dir() / f"metrics_{datetime.now():%Y%m%d}.jsonl"
 
 
+def load_metrics(hours: float = 48, now: datetime | None = None) -> list[dict]:
+    """최근 `hours` 시간의 도구 호출 기록(시간순). StockLens `load_metrics` 와 같은 읽기 방식.
+
+    읽기만 한다 — get_metrics_dir() 는 폴더를 만들기 때문에 쓰지 않는다(doctor 는 읽기
+    전용이어야 한다). 파일 이름이 로컬 날짜라 48시간이면 사흘치 파일을 열어야 한다.
+    """
+    from datetime import timedelta
+
+    now = now or datetime.now()
+    cutoff = now - timedelta(hours=hours)
+    folder = data_dir() / "logs"
+    days = int(hours // 24) + 1
+    records: list[dict] = []
+    for i in range(days + 1):
+        path = folder / f"metrics_{now - timedelta(days=i):%Y%m%d}.jsonl"
+        if not path.exists():
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        rec = json.loads(line)
+                        ts = datetime.fromisoformat(rec["timestamp"])
+                    except (ValueError, KeyError, TypeError):
+                        continue
+                    if ts.tzinfo is not None:
+                        ts = ts.astimezone().replace(tzinfo=None)
+                    if cutoff <= ts <= now:
+                        rec["_ts"] = ts
+                        records.append(rec)
+        except OSError:
+            continue  # 못 읽는 파일 하나 때문에 전체가 실패하면 안 된다
+    records.sort(key=lambda r: r["_ts"])
+    return records
+
+
 # 값이 길거나 민감할 수 있는 인자는 이름만 남기고 값은 버린다.
 _DROP_KEYS = {"phone", "code", "password", "session", "api_hash", "api_id", "token"}
 _VALUE_MAX = 80

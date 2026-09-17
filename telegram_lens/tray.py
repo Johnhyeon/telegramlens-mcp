@@ -5,7 +5,7 @@ daemon_status.json 과 procstate.compute_health() 를 그대로 재사용해, �
 telegram_status 가 쓰는 것과 동일한 기준으로 색만 입힌다.
 
 초록(healthy) / 노랑(degraded) / 빨강(failed) / 회색(확인 불가)을 몇 초마다 갱신하고,
-우클릭 메뉴(또는 더블클릭)로 진행상황 상세 창·즉시 새로고침·`telegramlens-doctor` 실행·
+우클릭 메뉴(또는 더블클릭)로 진행상황 상세 창·즉시 새로고침·LeetKit Manager 열기·
 종료를 제공한다.
 
 스레드 모델(중요 — macOS 호환을 위한 설계):
@@ -84,22 +84,84 @@ def current_health() -> dict:
         status = procstate.read_json(daemon_status_path())
         return procstate.compute_health(status, held)
     except Exception as e:  # noqa: BLE001
-        return {"health": "unknown", "problem_code": None, "message": f"상태 확인 실패: {e}"}
+        return {"health": "unknown", "problem_code": None, "message": f"상태를 확인하지 못했어요: {e}"}
 
 
-def _run_doctor(icon) -> None:
-    """telegramlens-doctor 를 별도 콘솔에 띄운다(Windows). 그 외 OS는 백그라운드 실행."""
+def find_manager_launcher() -> "tuple[str, str] | None":
+    """LeetKit Manager 를 여는 방법. ("shortcut", 경로) / ("command", 실행 파일) / None.
+
+    예전 메뉴는 콘솔 창을 띄워 telegramlens-doctor 를 돌렸다. 주 고객층에게 까만 창은
+    막다른 길이고, 진단·복구·문의는 전부 Manager 에 있다 — 그래서 Manager 를 연다.
+
+    찾는 순서는 Manager 가 스스로 바로가기를 찾는 규칙(leetkit_manager/shortcut.py
+    existing_shortcut)과 같다: 사용자가 고른 폴더(~/.leetkit-manager/shortcut_created 에
+    적힌 경로) → 바탕화면. exe 판(PyInstaller)은 어디에 두었는지 알 길이 바로가기뿐이다.
+    바로가기가 없으면 `uv tool install` 판의 leetkit-manager 실행 파일을 본다.
+    """
+    from pathlib import Path
+
+    home = Path.home()
+    dirs = []
     try:
-        if sys.platform == "win32":
-            subprocess.Popen(
-                ["cmd", "/k", "telegramlens-doctor"],
-                creationflags=subprocess.CREATE_NEW_CONSOLE,
+        recorded = (home / ".leetkit-manager" / "shortcut_created").read_text(encoding="utf-8").strip()
+        if recorded and recorded != "1":  # "1" = 위치를 안 적던 시절의 표시
+            dirs.append(Path(recorded))
+    except OSError:
+        pass
+    dirs.append(home / "Desktop")
+
+    if sys.platform == "win32":
+        names = ("LeetKit Manager.lnk",)
+    elif sys.platform == "darwin":
+        names = ("LeetKit Manager.app",)
+    else:
+        names = ()
+    for folder in dirs:
+        for name in names:
+            try:
+                candidate = folder / name
+                if candidate.exists():
+                    return ("shortcut", str(candidate))
+            except OSError:
+                continue
+
+    for bin_dir in (home / ".local" / "bin", home / ".cargo" / "bin"):
+        for name in ("leetkit-manager.exe", "leetkit-manager"):
+            candidate = bin_dir / name
+            if candidate.exists():
+                return ("command", str(candidate))
+    return None
+
+
+def _open_manager(icon) -> None:
+    """트레이 메뉴 [LeetKit Manager 열기]. Manager 는 중복 실행을 스스로 막는다."""
+    launcher = find_manager_launcher()
+    try:
+        if launcher is None:
+            icon.notify(
+                "LeetKit Manager를 찾지 못했어요. 바탕화면이나 설치한 폴더에서 직접 열어주세요.",
+                "TelegramLens",
             )
+            return
+        kind, target = launcher
+        if kind == "shortcut":
+            if sys.platform == "win32":
+                import os
+
+                os.startfile(target)  # noqa: S606 — Manager 가 만든 바로가기만 연다
+            else:
+                subprocess.Popen(["open", target])
         else:
-            subprocess.Popen(["telegramlens-doctor"])
-    except Exception as e:  # noqa: BLE001 — 실행 실패가 트레이 앱을 죽이면 안 됨
+            kwargs: dict = {}
+            if sys.platform == "win32":
+                kwargs["creationflags"] = 0x08000000  # CREATE_NO_WINDOW — 콘솔 창을 안 띄운다
+            subprocess.Popen([target, "gui"], **kwargs)
+    except Exception:  # noqa: BLE001 — 실행 실패가 트레이 앱을 죽이면 안 됨
         try:
-            icon.notify(f"doctor 실행 실패: {e}", "TelegramLens")
+            icon.notify(
+                "LeetKit Manager를 열지 못했어요. 바탕화면이나 설치한 폴더에서 직접 열어주세요.",
+                "TelegramLens",
+            )
         except Exception:  # noqa: BLE001 — notify 미지원 플랫폼일 수 있음
             pass
 
@@ -282,7 +344,7 @@ def _build_menu(state: dict):
         # 이 항목과 같은 동작을 한다. 미지원 백엔드에서는 그냥 평범한 메뉴 항목.
         pystray.MenuItem("진행상황 보기", _open_status_window, default=True),
         pystray.MenuItem("지금 새로고침", lambda icon, item: _refresh(icon, state)),
-        pystray.MenuItem("telegramlens-doctor 실행", lambda icon, item: _run_doctor(icon)),
+        pystray.MenuItem("LeetKit Manager 열기", lambda icon, item: _open_manager(icon)),
         pystray.MenuItem("종료", lambda icon, item: _quit(icon)),
     )
 
@@ -396,7 +458,7 @@ def _run(pystray) -> None:
     # tk가 None이면 아래 폴백이 정확히 그 모양(icon.run이 메인 스레드)으로 돈다.
     #
     # 잃는 것은 '진행상황 보기' 창 하나뿐이고, 같은 내용은 telegram_status 도구와
-    # telegramlens-doctor로 볼 수 있다.
+    # LeetKit Manager [진단]으로 볼 수 있다.
 
     state: dict = {"summary": "상태 확인 중..."}
     icon = pystray.Icon(

@@ -45,25 +45,24 @@ def _purchase_line(prefix: str = "· 구매: ") -> str:
     return f"\n{prefix}{PURCHASE_URL}" if PURCHASE_URL else ""
 
 
+# 안내는 LeetKit Manager 버튼 하나로 보낸다. 예전엔 `telegramlens-activate <키>` 터미널
+# 명령을 적었는데, 주 고객층(40-50대)은 터미널을 열지 못해 거기서 멈추고 문의로 왔다.
+# 버튼 이름은 Manager 화면 글자 그대로 쓴다 — 세 Lens 가 같은 문장이어야 한다.
 LOCKED_MESSAGE = (
-    "🔒 TelegramLens는 유료 라이선스가 필요합니다.\n"
+    "🔒 TelegramLens를 쓰려면 라이선스 키가 필요해요.\n"
     "\n"
-    "구매 시 발송된 라이선스 키로 활성화하세요:\n"
-    "    telegramlens-activate <라이선스-키>\n"
-    "\n"
-    "· 키는 결제 완료 후 이메일로 발송됩니다."
-    + _purchase_line()
+    "LeetKit Manager의 TelegramLens 카드에서 [활성화]를 눌러 메일로 받은 키를 넣어주세요.\n"
+    "그래도 같으면 LeetKit Manager 상단 [지원 문의]를 눌러주세요."
 )
 
 # 폐기된 키 전용 안내. LOCKED_MESSAGE와 달리 "키를 넣으세요"라고 하면 안 된다 —
 # 이 사람은 키를 갖고 있고, 그 키가 중지된 것이다. 할 일은 연락이지 재입력이 아니다.
+# 연락처는 이메일 주소가 아니라 [지원 문의] 버튼이다(진단 파일이 같이 붙는다).
 REVOKED_MESSAGE = (
-    "🔒 이 라이선스 키는 현재 사용이 중지되어 있습니다.\n"
+    "🔒 이 라이선스 키는 지금 사용이 중지돼 있어요.\n"
     "\n"
-    "환불 또는 결제 취소된 키로 확인됩니다.\n"
-    "착오라고 생각되시면 알려주세요 — 확인 후 바로 풀어드리겠습니다.\n"
-    "\n"
-    "· 문의: osy980315@gmail.com"
+    "환불이나 결제 취소로 중지된 키예요.\n"
+    "착오라면 LeetKit Manager 상단 [지원 문의]를 눌러 알려주세요. 확인하고 바로 풀어드릴게요."
 )
 
 # 기간이 끝난 키 전용 안내. LOCKED_MESSAGE("키를 넣으세요")도, REVOKED_MESSAGE
@@ -71,10 +70,10 @@ REVOKED_MESSAGE = (
 # 할 일은 구매다. 체험이 끝난 사람에게 가장 자주 보일 문구라 사과나 경고가 아니라
 # 다음 걸음을 적는다.
 EXPIRED_MESSAGE = (
-    "🔒 TelegramLens 사용 기간이 끝났습니다.\n"
+    "🔒 TelegramLens 사용 기간이 끝났어요.\n"
     "\n"
-    "계속 쓰시려면 라이선스를 구매하신 뒤 받으신 키로 활성화하세요:\n"
-    "    telegramlens-activate <라이선스-키>"
+    "계속 쓰시려면 LeetKit Manager의 TelegramLens 카드에서 [구매]를 누르고, "
+    "받은 키를 같은 카드의 [활성화]로 넣어주세요."
     + _purchase_line()
 )
 
@@ -83,10 +82,11 @@ EXPIRED_MESSAGE = (
 # 두 경우 모두에게 맞는 한 가지 할 일만 적는다. "부정 사용"이라고 썼다가 배터리가
 # 닳은 정직한 사용자를 범인 취급하면 그 손해가 훨씬 크다.
 CLOCK_MESSAGE = (
-    "🔒 이 컴퓨터의 날짜가 실제보다 과거로 설정되어 있어 TelegramLens를 열 수 없습니다.\n"
+    "🔒 이 컴퓨터의 날짜가 실제보다 과거로 되어 있어서 TelegramLens를 열 수 없어요.\n"
     "\n"
-    "날짜와 시간을 현재에 맞춘 뒤 다시 시도해주세요.\n"
-    "(Windows: 설정 → 시간 및 언어 / Mac: 시스템 설정 → 일반 → 날짜 및 시간)"
+    "날짜와 시간을 오늘로 맞춘 뒤 다시 물어봐 주세요.\n"
+    "(Windows: 설정 → 시간 및 언어 / Mac: 시스템 설정 → 일반 → 날짜 및 시간)\n"
+    "그래도 같으면 LeetKit Manager 상단 [지원 문의]를 눌러주세요."
 )
 
 _licensed_cache = False  # 한 번 유효하면 프로세스 동안 재검증 생략
@@ -357,24 +357,58 @@ def _clock_turned_back(expiry: "date | None") -> bool:
     return False
 
 
+# verify_key 의 실패 사유. 지원용 원문이라 터미널 출력·진단 details 에만 쓰고, Manager
+# 활성화 창에는 _ACTIVATION_COPY 의 고객 문구로 바꿔 보낸다("서명 불일치"는 고객이
+# 할 일을 알려주지 못한다).
+_REASON_PUBKEY = "공개키 설정 오류"
+_REASON_MALFORMED = "형식 오류(깨진 키)"
+_REASON_WRONG_PRODUCT = "이 제품의 키가 아님"
+_REASON_BAD_SIGNATURE = "서명 불일치(위조/변조)"
+
+_ACTIVATION_COPY = {
+    _REASON_MALFORMED: (
+        "TelegramLens 라이선스 키로 읽을 수 없어요. 메일로 받은 키를 앞뒤 공백 없이 그대로 붙여넣어 주세요. "
+        "그래도 같으면 상단 [지원 문의]를 눌러주세요."
+    ),
+    _REASON_WRONG_PRODUCT: (
+        "TelegramLens 키가 아니에요. 메일에서 TelegramLens 키를 찾아 그대로 붙여넣어 주세요. "
+        "그래도 같으면 상단 [지원 문의]를 눌러주세요."
+    ),
+    _REASON_BAD_SIGNATURE: (
+        "TelegramLens 라이선스 키로 확인되지 않아요. 메일로 받은 키를 그대로 다시 붙여넣어 주세요. "
+        "그래도 같으면 상단 [지원 문의]를 눌러주세요."
+    ),
+    _REASON_PUBKEY: "키를 확인하는 중에 문제가 생겼어요. 상단 [지원 문의]를 눌러주세요.",
+}
+
+
+def activation_failure_message(res: dict) -> str:
+    """활성화 실패를 Manager [활성화] 창에 보여줄 한 덩어리 문구로.
+
+    save_key 가 직접 만든 사유(체험 재사용·기간 끝남·중지)는 이미 고객 문구라 그대로 쓴다.
+    """
+    reason = str(res.get("reason") or "")
+    return _ACTIVATION_COPY.get(reason, reason)
+
+
 def verify_key(key_str: str) -> dict:
     """키 문자열이 '판매자가 서명한 이 제품의 진짜 키'인지 검증."""
     try:
         pub = Ed25519PublicKey.from_public_bytes(base64.b64decode(_PUBLIC_KEY_B64))
     except Exception:
-        return {"valid": False, "reason": "공개키 설정 오류"}
+        return {"valid": False, "reason": _REASON_PUBKEY}
     try:
         raw = _decode(key_str)
     except Exception:
-        return {"valid": False, "reason": "형식 오류(깨진 키)"}
+        return {"valid": False, "reason": _REASON_MALFORMED}
     payload_len = len(raw) - _SIG_LEN
     if payload_len not in (_PAYLOAD_LEN, _PAYLOAD_LEN_WITH_EXPIRY) or raw[:4] != PRODUCT:
-        return {"valid": False, "reason": "이 제품의 키가 아님"}
+        return {"valid": False, "reason": _REASON_WRONG_PRODUCT}
     payload, sig = raw[:payload_len], raw[payload_len:]
     try:
         pub.verify(sig, payload)
     except InvalidSignature:
-        return {"valid": False, "reason": "서명 불일치(위조/변조)"}
+        return {"valid": False, "reason": _REASON_BAD_SIGNATURE}
     # 만료일은 서명 안에 들어 있다 — 고쳐 쓰면 서명이 깨지므로 위 검증에서 걸린다.
     return {
         "valid": True,
@@ -547,12 +581,13 @@ def save_key(key_str: str) -> dict:
     # 우리는 이 PC 가 예전에 어떤 체험 키를 썼는지 이미 적어두고 있다(체험 시작일 기록).
     already = _other_trial_used(res)
     if already:
+        # 이 사유는 Manager [활성화] 창에 그대로 뜬다. 문의처는 메일 주소가 아니라 버튼이다.
         return {
             "valid": False,
             "reason": (
-                "이 컴퓨터에서는 이미 체험판을 사용하셨습니다.\n"
-                "체험은 한 대에 한 번만 드립니다. 계속 쓰시려면 정식 라이선스를 구매해주세요.\n"
-                "착오라고 생각되시면 osy980315@gmail.com 으로 알려주세요."
+                "이 컴퓨터에서는 이미 체험판을 사용하셨어요. 체험은 한 대에 한 번만 드려요.\n"
+                "계속 쓰시려면 TelegramLens 카드의 [구매]를 눌러주세요. "
+                "착오라면 상단 [지원 문의]를 눌러주세요."
             ),
         }
 
@@ -560,9 +595,13 @@ def save_key(key_str: str) -> dict:
     # 행위가 활성화이므로, 그날이 창의 첫날로 기록된다.
     expiry = effective_expiry(res)
     if _is_expired(expiry):
-        return {"valid": False, "reason": "사용 기간이 끝난 키입니다", "expires_on": expiry}
+        return {
+            "valid": False,
+            "reason": "사용 기간이 끝난 키예요. TelegramLens 카드의 [구매]를 누르고, 받은 키를 [활성화]로 넣어주세요.",
+            "expires_on": expiry,
+        }
     if is_revoked(res.get("license_id", "")):
-        return {"valid": False, "reason": "현재 사용이 중지된 키입니다"}
+        return {"valid": False, "reason": "지금 사용이 중지된 키예요. 착오라면 상단 [지원 문의]를 눌러주세요."}
 
     p = _license_path()
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -692,7 +731,11 @@ def activate_cli() -> None:
         sys.exit(0)
 
     if args.json:
-        print(json.dumps({"ok": False, "status": "invalid", "reason": res["reason"]}, ensure_ascii=False))
+        # --json 은 Manager [활성화] 창이 읽는다 — 고객 문구로 바꿔 보낸다.
+        print(json.dumps(
+            {"ok": False, "status": "invalid", "reason": activation_failure_message(res)},
+            ensure_ascii=False,
+        ))
         sys.exit(1)
     print(f"활성화 실패 ❌  — {res['reason']}\n")
     print("· 결제 후 발송된 키를 공백 없이 정확히 붙여넣었는지 확인하세요.")

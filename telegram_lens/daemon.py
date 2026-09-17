@@ -27,7 +27,12 @@ from logging.handlers import RotatingFileHandler
 from telethon import events
 
 from telegram_lens import commands, db, procstate
-from telegram_lens.client import connect_with_timeout, disconnect_safely, make_client
+from telegram_lens.client import (
+    LOGIN_REQUIRED_MESSAGE,
+    connect_with_timeout,
+    disconnect_safely,
+    make_client,
+)
 from telegram_lens.config import data_dir, secure_data_files
 from telegram_lens.sync import run_sync
 
@@ -408,7 +413,8 @@ async def _drain_send_request(client) -> None:
     result = {"req_id": req.get("req_id"), "ok": False, "sent": 0}
     try:
         if not await client.is_user_authorized():
-            result["error"] = "로그인이 필요합니다 (`telegramlens-login`)."
+            # telegram_send_me 가 이 문장을 Claude 답변에 그대로 싣는다.
+            result["error"] = LOGIN_REQUIRED_MESSAGE
         else:
             sent = 0
             for msg in req["messages"]:

@@ -454,7 +454,10 @@ class TestOneTrialPerMachine:
         second = signer(_today() + timedelta(days=30))   # 다른 이메일로 받은 다른 키
         res = L.save_key(second)
         assert res["valid"] is False
-        assert "이미 체험판을 사용" in res["reason"]
+        assert "이미 체험판을" in res["reason"]
+        # 문의처는 이메일 주소가 아니라 Manager 버튼이다(활성화 창에 그대로 뜬다).
+        assert "[지원 문의]" in res["reason"]
+        assert "@" not in res["reason"]
 
     def test_same_key_can_be_pasted_again(self, signer):
         """재설치·키 재입력은 정상이다 — 같은 키까지 막으면 멀쩡한 사람이 갇힌다."""

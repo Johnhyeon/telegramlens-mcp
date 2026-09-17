@@ -29,7 +29,7 @@ from telegram_lens.classify import run_classification
 from telegram_lens._metrics import track_metrics
 from telegram_lens import _result_meta as rmeta
 from telegram_lens.config import data_dir, is_logged_in, secure_data_files
-from telegram_lens.client import NoCredentialsError, NotLoggedInError
+from telegram_lens.client import LOGIN_REQUIRED_MESSAGE, NoCredentialsError, NotLoggedInError
 from telegram_lens.licensing import is_licensed, locked_message
 from telegram_lens.extract import reset_index
 from telegram_lens.stocks import (
@@ -204,25 +204,18 @@ async def _terminate_child(child, label: str = "자식") -> None:
         _LOG.warning("%s 강제 종료 실패: %s: %s", label, type(e).__name__, e)
 
 
-def _support_hint() -> str:
-    """safe_tool 의 '예상 못한 오류' 버킷에서만 붙이는 자가진단 안내.
-
-    이미 원인이 명확한 예외(라이선스/로그인/자격증명 등)엔 안 붙인다 — 사소한 것까지
-    문의로 유도하면 노이즈만 늘어난다.
-
-    예전엔 여기서 OS별 zip 명령을 띄워 "Claude 로그를 직접 압축해 메일로 보내라"고
-    안내했다. 그대로 따라 보내온 문의(2026-09-11)를 받아보니, 손으로 만든 zip에는
-    LeetKit Manager 번들이 넣어주는 것이 통째로 빠져 있었다 — 3-Lens 온라인 진단
-    요약도, metrics 기록에서 센 최근 호출 실패 집계도, 홈 경로·키 마스킹도. 받는
-    쪽은 원인을 좁힐 재료가 없고, 보내는 쪽은 마스킹 안 된 로그를 그대로 내보낸다.
-    안내하는 길은 하나로 둔다.
-    """
-    return (
-        "\n\n계속되면:\n"
-        "1) Claude 완전 종료 후 재시작 → 다시 시도\n"
-        "2) 그래도 안 되면 LeetKit Manager를 열고 [지원 문의]를 눌러주세요 "
-        "(진단 로그 zip과 메일 초안이 자동으로 만들어집니다)."
-    )
+# safe_tool 의 '예상 못한 오류' 버킷에서만 쓰는 안내. 이미 원인이 명확한 예외(라이선스/
+# 로그인/자격증명 등)엔 안 쓴다 — 사소한 것까지 문의로 유도하면 노이즈만 늘어난다.
+#
+# 예전엔 OS별 zip 명령을 띄워 "Claude 로그를 직접 압축해 메일로 보내라"고 했는데, 그렇게
+# 온 문의(2026-09-11)에는 Manager 번들이 넣어주는 3-Lens 온라인 진단 요약·최근 호출 실패
+# 집계·키 마스킹이 통째로 빠져 있었다. 안내하는 길은 [지원 문의] 하나로 둔다.
+# 할 일도 하나만(2026-09-17 토스 원칙 점검): 원인을 모르는 오류를 고객 입력 탓으로 돌리지
+# 않고, 가장 쉬운 재시도 → 그래도 같으면 [지원 문의]. 세 Lens 가 같은 문장이다.
+_UNKNOWN_ERROR_MESSAGE = (
+    "조회 중 문제가 생겼어요. 같은 질문을 한 번 더 해보고, "
+    "그래도 같으면 LeetKit Manager 상단 [지원 문의]를 눌러주세요."
+)
 
 
 _QUERY_RE = re.compile(r"\?[^\s'\"]*")
@@ -263,7 +256,8 @@ def safe_tool(func):
         except NotLoggedInError as e:
             return f"⚠️ {e}"
         except Exception as e:  # noqa: BLE001
-            return f"⚠️ 처리 중 오류: {_cause_text(e)}" + _support_hint()
+            # 예외 원문은 둘째 줄에 남겨 Claude 와 지원 문의가 원인을 좁힐 수 있게 한다.
+            return f"⚠️ {_UNKNOWN_ERROR_MESSAGE}\n(원인: {_cause_text(e)})"
         # 새 버전이 나오면 Claude 응답 안에서 알린다 — 사람들은 Manager를 잘 안 열어서
         # 거기에만 표시하면 옛 버전을 계속 쓰게 된다(StockLens·DartLens와 같은 동작).
         try:
@@ -613,8 +607,10 @@ trending·momentum 결과의 수치는 '무엇이 얼마나 언급됐나'(빈도
 async def telegram_status() -> str:
     """로그인·수집 상태와 백그라운드 수집 데몬 상태를 반환합니다.
 
-    status(healthy/degraded/failed)와 last_error.code 를 보고 문제가 있으면
-    recovery.instruction/command 를 사용자에게 안내하세요(예: telegramlens-doctor).
+    status(healthy/degraded/failed)와 last_error.code 를 보고, 문제가 있으면
+    recovery.instruction 을 사용자에게 그대로 전하세요.
+    문제가 있으면 LeetKit Manager의 [진단]이나 상단 [지원 문의]를 안내하세요.
+    터미널 명령은 안내하지 마세요.
     """
     from telegram_lens import procstate
     from telegram_lens.daemon import lock_path, status_path
@@ -640,14 +636,16 @@ async def telegram_status() -> str:
     s["last_synced"] = queries._to_kst(s.get("last_synced"))
     s["baselines_computed"] = queries._to_kst(s.get("baselines_computed"))
 
+    # recovery 에 command(터미널 명령) 키를 두지 않는다. 이 JSON 은 Claude 답변으로
+    # 옮겨지는데, 명령이 있으면 Claude 가 그걸 고객에게 그대로 안내했다. Manager 는
+    # 이 도구 출력을 읽지 않는다(2026-09-17 leetkit-manager 저장소 확인).
     if not logged_in:
         s["status"] = "failed"
-        s["summary"] = "텔레그램 로그인이 되어 있지 않습니다."
-        s["last_error"] = {"code": "NOT_LOGGED_IN", "message": "세션 파일이 없습니다."}
+        s["summary"] = "텔레그램 로그인이 아직 안 돼 있어요."
+        s["last_error"] = {"code": "NOT_LOGGED_IN", "message": "이 컴퓨터에 텔레그램 로그인 기록이 없어요."}
         s["recovery"] = {
             "automatic": False,
-            "command": "telegramlens-login",
-            "instruction": "터미널에서 telegramlens-login 을 실행해 로그인하세요.",
+            "instruction": LOGIN_REQUIRED_MESSAGE,
         }
         return _json(s)
 
@@ -712,8 +710,10 @@ async def telegram_status() -> str:
         s["last_error"] = last_error
         s["recovery"] = {
             "automatic": False,
-            "command": "telegramlens-doctor --repair daemon",
-            "instruction": "명령을 실행한 뒤 Claude 를 완전히 종료하고 다시 실행하세요.",
+            "instruction": (
+                "LeetKit Manager의 TelegramLens 카드에서 [복구]를 눌러주세요. "
+                "그래도 같으면 LeetKit Manager 상단 [지원 문의]를 눌러주세요."
+            ),
         }
 
     # 7일(자동 백필 상한)을 넘는 공백이 감지되면, 더 수집할지 사용자에게 제안.

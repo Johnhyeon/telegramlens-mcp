@@ -166,11 +166,9 @@ async def run_sync(
         # (이전엔 connect()가 try 밖이라 연결 실패 시 정리 경로를 못 타는 문제가 있었음).
         await connect_with_timeout(client)
         if not await client.is_user_authorized():
-            from telegram_lens.client import NotLoggedInError
+            from telegram_lens.client import LOGIN_REQUIRED_MESSAGE, NotLoggedInError
 
-            raise NotLoggedInError(
-                "로그인되어 있지 않습니다. `telegramlens-login` 을 먼저 실행하세요."
-            )
+            raise NotLoggedInError(LOGIN_REQUIRED_MESSAGE)
         # 수집 client 에 '!' 명령 핸들러 등록(fetch 도중에도 즉답 — 명령 데드존 제거).
         if on_client_ready is not None:
             try:

@@ -17,7 +17,7 @@ from datetime import datetime, timezone
 from telethon.tl.types import Channel, Chat
 
 from telegram_lens import db
-from telegram_lens.client import NotLoggedInError, make_client
+from telegram_lens.client import LOGIN_REQUIRED_MESSAGE, NotLoggedInError, make_client
 from telegram_lens.config import tracked_path
 from telegram_lens.extract import extract_mentions, reset_index
 
@@ -62,9 +62,7 @@ async def run_classification(
     await client.connect()
     try:
         if not await client.is_user_authorized():
-            raise NotLoggedInError(
-                "로그인되어 있지 않습니다. `telegramlens-login` 을 먼저 실행하세요."
-            )
+            raise NotLoggedInError(LOGIN_REQUIRED_MESSAGE)
 
         scored: list[dict] = []
         async for dialog in client.iter_dialogs():

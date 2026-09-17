@@ -42,6 +42,20 @@ class NoCredentialsError(RuntimeError):
     pass
 
 
+# 두 예외의 메시지는 safe_tool 을 거쳐 Claude 답변에 그대로 실린다. 예전엔 터미널
+# 로그인 명령을 실행하라고 적었는데, 주 고객층은 터미널을 열지 못한다 —
+# 로그인은 LeetKit Manager 의 [텔레그램 로그인] 한 길로 안내한다(세 곳에 흩어져 있던
+# 문장을 여기 하나로 모았다).
+LOGIN_REQUIRED_MESSAGE = (
+    "텔레그램 로그인이 필요해요. "
+    "LeetKit Manager의 TelegramLens 카드에서 [텔레그램 로그인]을 눌러주세요."
+)
+NO_CREDENTIALS_MESSAGE = (
+    "텔레그램 api_id와 api_hash가 아직 없어요. "
+    "LeetKit Manager의 TelegramLens 카드에서 [텔레그램 로그인]을 눌러 넣어주세요."
+)
+
+
 async def connect_with_timeout(client: TelegramClient, timeout: float = 30) -> None:
     """client.connect() 를 시간제한 안에서 시도. 실패 시 예외를 그대로 올린다 —
 
@@ -79,10 +93,7 @@ async def disconnect_safely(client: TelegramClient, timeout: float = 10) -> None
 def make_client() -> TelegramClient:
     api_id, api_hash = get_credentials()
     if not api_id or not api_hash:
-        raise NoCredentialsError(
-            "Telegram API 자격증명이 없습니다. https://my.telegram.org 에서 "
-            "API_ID / API_HASH 발급 후 `telegramlens-login` 으로 등록하세요."
-        )
+        raise NoCredentialsError(NO_CREDENTIALS_MESSAGE)
     client = TelegramClient(str(session_path()), api_id, api_hash)
     # 짧은 FloodWait(60초 이하)는 Telethon 이 알아서 잠깐 자고 재시도한다. 그보다 긴
     # 대기는 예외로 올라오고, fetch_recent 가 채널별로 잡아 '이 사이클만 스킵'한다

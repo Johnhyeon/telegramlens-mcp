@@ -96,22 +96,24 @@ def compute_health(status: dict | None, lock_held: bool, interval_min: int | Non
         # 실제로는 다시 켤 때 공백을 감지해 수집 창을 그만큼 늘려 메운다
         # (daemon._catchup_window, --max-window 기본 10080분 = 7일). 그 사실을 같이
         # 말해줘야 "지금 꺼져 있음"이 손실로 읽히지 않는다.
-        catchup = "꺼져 있는 동안 올라온 메시지는 다시 열 때 최대 7일치까지 자동으로 메웁니다."
+        # 아래 메시지는 telegram_status 답변·Manager 진단·트레이에 그대로 뜬다 — 해요체로
+        # 쓴다(세 Lens 고객 문구 규칙, 2026-09-17).
+        catchup = "꺼져 있는 동안 올라온 메시지는 다시 열 때 최대 7일치까지 자동으로 메워요."
         consecutive = (status or {}).get("consecutive_failures") or 0
         if consecutive >= 3:
             return {
                 "health": "degraded",
                 "problem_code": None,
                 "message": (
-                    f"데몬이 지금 꺼져 있습니다. 마지막 실행에서 연속 {consecutive}회 수집 실패가 "
-                    f"있었습니다 — Claude를 열어 다시 확인해보세요. {catchup}"
+                    f"데몬이 지금 꺼져 있어요. 마지막 실행에서 수집이 연속 {consecutive}번 "
+                    f"실패했어요. Claude를 열어 다시 확인해 보세요. {catchup}"
                 ),
             }
         return {
             "health": "healthy",
             "problem_code": None,
             "message": (
-                "데몬이 지금 실행 중이지 않습니다(Claude Desktop을 열어야 동작합니다 — 정상입니다). "
+                "데몬이 지금 실행 중이 아니에요(Claude Desktop을 열어야 동작해요. 정상이에요). "
                 + catchup
             ),
         }
@@ -119,7 +121,7 @@ def compute_health(status: dict | None, lock_held: bool, interval_min: int | Non
         return {
             "health": "degraded",
             "problem_code": "STATUS_FILE_CORRUPTED",
-            "message": "데몬은 살아있지만 상태 파일을 읽을 수 없습니다.",
+            "message": "데몬은 살아 있지만 상태 파일을 읽을 수 없어요.",
         }
 
     hb_age = heartbeat_age_sec(status, "heartbeat_at")
@@ -127,7 +129,7 @@ def compute_health(status: dict | None, lock_held: bool, interval_min: int | Non
         return {
             "health": "failed",
             "problem_code": "DAEMON_STALLED",
-            "message": f"데몬 하트비트가 {int(hb_age)}초째 멎어 있습니다.",
+            "message": f"데몬 하트비트가 {int(hb_age)}초째 멎어 있어요.",
         }
 
     consecutive = status.get("consecutive_failures") or 0
@@ -156,41 +158,41 @@ def compute_health(status: dict | None, lock_held: bool, interval_min: int | Non
         return {
             "health": "failed",
             "problem_code": "SYNC_TIMEOUT",
-            "message": f"연속 {consecutive}회 수집에 실패했습니다.",
+            "message": f"수집이 연속 {consecutive}번 실패했어요.",
         }
     if lag_sec is not None and lag_sec > lag_threshold_sec:
         return {
             "health": "failed",
             "problem_code": "COLLECTION_LAGGING",
-            "message": f"마지막 성공 수집 이후 {int(lag_sec / 60)}분이 지났습니다.",
+            "message": f"마지막으로 수집에 성공한 뒤 {int(lag_sec / 60)}분이 지났어요.",
         }
     if backfill_stalled:
         return {
             "health": "failed",
             "problem_code": "BACKFILL_STALLED",
-            "message": "백필 진행이 5분 이상 멈춰 있습니다.",
+            "message": "백필 진행이 5분 넘게 멈춰 있어요.",
         }
 
     if 1 <= consecutive <= 2:
         return {
             "health": "degraded",
             "problem_code": "SYNC_TIMEOUT",
-            "message": f"최근 {consecutive}회 수집 실패(재시도 중).",
+            "message": f"최근 수집이 {consecutive}번 실패해서 다시 시도하고 있어요.",
         }
     channels = status.get("channels") or {}
     if channels.get("failed"):
         return {
             "health": "degraded",
             "problem_code": "CHANNEL_TIMEOUT",
-            "message": f"이번 사이클 채널 {channels['failed']}개 수집 실패.",
+            "message": f"이번 수집에서 채널 {channels['failed']}개를 받지 못했어요.",
         }
     # 백필이 정체 없이(backfill_stalled 아님) 진행 중인 건 정상 동작이지 문제가 아니다 —
     # 여기서 daemon 전체 health를 degraded로 깎지 않는다. 진행 상황 자체는
     # doctor.py의 BACKFILL 체크(OK 상태 + Processed/Fetched 상세)가 이미 보여준다.
     if backfill.get("state") == "running":
-        return {"health": "healthy", "problem_code": None, "message": "정상 가동 중(백필 진행 중)."}
+        return {"health": "healthy", "problem_code": None, "message": "정상으로 돌고 있어요(백필 진행 중)."}
 
-    return {"health": "healthy", "problem_code": None, "message": "정상 가동 중."}
+    return {"health": "healthy", "problem_code": None, "message": "정상으로 돌고 있어요."}
 
 
 def _kill(pid: int) -> None:
