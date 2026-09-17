@@ -159,6 +159,18 @@ def _resolve_targets(arg: str) -> list[str]:
     raise ValueError(f"Invalid target: {arg}")
 
 
+def _write_text_keep_newline(path: Path, text: str) -> None:
+    """줄바꿈은 원래 파일 것을 지킨다.
+
+    write_text 는 Windows 에서 LF 를 CRLF 로 바꿔 쓴다. LF 였던 config.toml 352줄이
+    통째로 CRLF 가 됐다(2026-09-17 대표 PC 실측). 내용은 같아도 diff 가 전부 바뀐 것처럼
+    보이고, 다른 도구가 그 파일을 만지면 두 줄바꿈이 섞인다. 없던 파일은 LF 로 만든다.
+    """
+    original = path.read_bytes() if path.exists() else b""
+    newline = "\r\n" if b"\r\n" in original else "\n"
+    path.write_text(text, encoding="utf-8", newline=newline)
+
+
 def _configure_toml_target(config_path: Path, label: str, *, command: str, quiet: bool = False) -> dict:
     """Codex처럼 TOML(`[mcp_servers.<name>]`)로 MCP 서버를 등록하는 클라이언트용.
 
@@ -203,7 +215,7 @@ def _configure_toml_target(config_path: Path, label: str, *, command: str, quiet
     server_table["default_tools_approval_mode"] = "auto"
     doc["mcp_servers"][SERVER_KEY] = server_table
 
-    config_path.write_text(tomlkit.dumps(doc), encoding="utf-8")
+    _write_text_keep_newline(config_path, tomlkit.dumps(doc))
 
     if not quiet:
         print(f"  [OK] Config updated (key: {SERVER_KEY})")
@@ -320,7 +332,7 @@ def _remove_one_target(config_path, label: str) -> dict:
                 if servers.pop(key, None) is not None:
                     result["removed"] = True
         if result["removed"]:
-            config_path.write_text(tomlkit.dumps(doc), encoding="utf-8")
+            _write_text_keep_newline(config_path, tomlkit.dumps(doc))
         return result
 
     try:
