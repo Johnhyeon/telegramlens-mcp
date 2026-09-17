@@ -97,6 +97,31 @@ def test_classification_skips_what_we_do_not_read(home):
     assert pay["status"] == links.ST_TITLE_ONLY and pay["fail_reason"] == "paywall"
 
 
+def test_preview_url_without_www_merges_into_text_row(home):
+    """텔레그램 미리보기는 www. 와 끝 슬래시를 뗀 주소를 준다 — 실사용에서 같은 링크가 두 행으로 갈라졌다."""
+    with db.connect() as conn:
+        rid = _msg(
+            conn, "기사 https://www.forbes.com/sites/x/2026/09/17/story/",
+            extra=[{"url": "https://forbes.com/sites/x/2026/09/17/story", "source": "preview",
+                    "title": "Forbes 제목", "site": "Forbes"}],
+        )
+        rows = _rows(conn, rid)
+    assert len(rows) == 1
+    assert rows[0]["url"] == "https://www.forbes.com/sites/x/2026/09/17/story/"
+    assert rows[0]["title"] == "Forbes 제목" and rows[0]["source"] == "text"
+
+
+def test_extract_stops_at_copyright_and_related_articles():
+    html = ("<html><body><article><p>첫 문단은 기사 본문이고 충분히 길다. 두 번째 문장도 있다.</p>"
+            "<p>둘째 문단도 기사 본문이며 이 역시 충분히 길게 이어진다.</p>"
+            "<p>&lt;저작권자 (c) 연합인포맥스, 무단전재 및 재배포 금지&gt;</p>"
+            "<p>스냅, AR 글래스로 B2B시장 진출…엔비디아·세일즈포스와 협력</p>"
+            "<p>아마존, 비상발전기 업체 신주인수권 확보…주가 40% 상승 소식</p></article></body></html>")
+    body = links.extract_html(html)["body"]
+    assert "둘째 문단" in body
+    assert "저작권자" not in body and "스냅, AR" not in body
+
+
 def test_old_messages_get_expired_not_pending(home):
     with db.connect() as conn:
         rid = _msg(conn, "https://example.com/old", when=_now() - timedelta(days=10))

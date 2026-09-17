@@ -111,8 +111,21 @@ def _host_in(host: str, domains: tuple[str, ...]) -> bool:
 
 
 def dedupe_key(url: str) -> str:
-    """같은 글 안의 같은 주소를 하나로 보는 키 — 프래그먼트(#…)만 뗀다."""
-    return clean_url(url).split("#", 1)[0]
+    """같은 주소를 하나로 보는 키. 텔레그램 미리보기는 주소를 정규화해서 준다(www. 없음,
+    끝 슬래시 없음) — 본문의 https://www.forbes.com/a/ 와 미리보기의 https://forbes.com/a 가
+    한 행이 되게 스킴·호스트 소문자, www. 제거, 끝 슬래시·프래그먼트 제거."""
+    u = clean_url(url).split("#", 1)[0]
+    try:
+        parts = urlsplit(u)
+    except ValueError:
+        return u
+    host = (parts.hostname or "").lower()
+    if host.startswith("www."):
+        host = host[4:]
+    if parts.port:
+        host = f"{host}:{parts.port}"
+    path = parts.path.rstrip("/")
+    return f"{parts.scheme.lower()}://{host}{path}" + (f"?{parts.query}" if parts.query else "")
 
 
 def classify(url: str) -> dict:
@@ -280,6 +293,11 @@ _BLOCK_RE = re.compile(
 )
 _TAG_RE = re.compile(r"<[^>]+>")
 _TITLE_TAG_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.S | re.I)
+# 본문이 끝났다는 표식 — 여기부터는 저작권 고지·관련기사 목록이라 발췌에서 뗀다.
+_BODY_END_RE = re.compile(
+    r"^(<?\s*저작권자|Copyright|ⓒ|©|\(c\)\s|무단\s?전재|무단\s?복제|관련\s?기사|함께\s?보면|인기\s?기사|많이\s?본)",
+    re.I,
+)
 
 # 본문 그릇을 찾는 표식 — 앞에 있을수록 우선. 네이버뉴스(dic_area)·다음(article_view)·
 # 국내 언론 CMS 들의 흔한 이름·schema.org articleBody·HTML5 article/main 순.
@@ -337,6 +355,10 @@ def extract_html(html: str) -> dict:
         lines = [l for l in _to_lines(fragment) if len(l) >= 25]
     else:
         lines = [l for l in _to_lines(body_html) if len(l) >= 40]
+    for i, l in enumerate(lines):
+        if _BODY_END_RE.match(l):
+            lines = lines[:i]
+            break
     body = "\n".join(lines).strip()
     if len(body) > BODY_MAX:
         cut = body[:BODY_MAX]
