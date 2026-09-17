@@ -515,6 +515,10 @@ mcp = LensFastMCP(
     ),
     instructions="""TelegramLens — 텔레그램 채널의 종목 내러티브를 구조화해 제공합니다.
 
+질문 → 도구: "요즘/오늘 텔레그램에서 뭐 도나"·"볼 만한 글/링크 추려줘" → telegram_briefing(순위+읽을거리,
+기사 제목 포함) / "OO 왜 오르나·OO 얘기" → telegram_stock_buzz / "OO 관련 글 찾아줘" → telegram_search
+(기사 내용까지) / "이 링크 내용" → telegram_link_content
+
 먼저 `telegram_sync` 로 최근 메시지를 수집한 뒤 조회 도구를 쓰세요.
 - telegram_trending : 기간 내 언급량 상위 종목
 - telegram_momentum : 언급 급증(스파이크) 종목 — 새 내러티브 포착
@@ -1083,46 +1087,78 @@ def _list_noise_density(hours: float, codes: list[str]) -> dict:
         return {}
 
 
-def _reading_list(hours: float, limit: int = 8) -> list[dict]:
-    """그 시간대 '보면 좋은 글'(확산 높은 심층글)·첨부 리포트(document)를 링크와 함께 모은다.
+# 읽을거리 후보로 칠 링크 상태 — 제목이 있어야 사람이 고를 수 있다.
+_READABLE_LINK_STATUSES = ("ok", "title_only")
+# 읽을거리에 한 채널이 차지할 수 있는 최대 줄 수. 공시 정리 봇처럼 확산이 큰 채널 하나가
+# 다섯 줄을 다 먹으면 "볼 만한 글 추려줘"의 답이 아니다(실측: AWAKE 가 8줄 중 5줄).
+_READING_PER_CHANNEL = 2
 
-    모바일에서 원문으로 바로 점프하라고 브리핑에 붙인다. forwards(확산)가 핵심 신호.
-    잡담(gossip) 티어·짧은 글·인라인 사진(photo)은 제외.
+
+def _reading_list(hours: float, limit: int = 8) -> list[dict]:
+    """그 시간대 '보면 좋은 글'을 링크와 함께 모은다 — 확산 높은 심층글, 첨부 리포트(document),
+    그리고 **기사 제목이 읽힌 링크 글**(본문은 주소 한 줄이어도).
+
+    모바일에서 원문으로 바로 점프하라고 브리핑에 붙인다. forwards(확산)·views 가 핵심 신호.
+    잡담(gossip) 티어·인라인 사진만 있는 짧은 글은 제외. 링크 글은 텔레그램 본문 대신
+    기사 제목을 snippet 으로 쓴다 — 스몰인사이트·기화가거처럼 링크만 던지는 채널의 글이
+    예전엔 '120자 미만' 필터에 통째로 빠져 읽을거리에 한 번도 못 올랐다.
     """
     cut = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
     try:
         with db.connect() as conn:
             rows = conn.execute(
-                """
+                f"""
                 SELECT m.text, m.msg_id, m.channel_id, m.media_type, m.file_name,
-                       m.forwards, c.title channel, c.username, t.tier
+                       m.forwards, m.views, c.title channel, c.username, t.tier,
+                       l.title AS link_title, l.site AS link_site, l.kind AS link_kind,
+                       COALESCE(l.final_url, l.url) AS article_url
                 FROM messages m
                 LEFT JOIN channels c ON c.id = m.channel_id
                 LEFT JOIN channel_tier t ON t.channel_id = m.channel_id
+                LEFT JOIN message_links l ON l.id = (
+                    SELECT l2.id FROM message_links l2
+                    WHERE l2.message_id = m.id
+                      AND l2.status IN ({','.join('?' * len(_READABLE_LINK_STATUSES))})
+                      AND COALESCE(l2.title, '') != ''
+                    ORDER BY l2.id LIMIT 1
+                )
                 WHERE m.date >= ? AND m.text != ''
-                  AND (LENGTH(m.text) > 120 OR m.media_type = 'document')
+                  AND (LENGTH(m.text) > 120 OR m.media_type = 'document' OR l.id IS NOT NULL)
                   AND (t.tier IS NULL OR t.tier != 'gossip')
-                ORDER BY m.forwards DESC
+                ORDER BY m.forwards DESC, m.views DESC
                 LIMIT ?
                 """,
-                (cut, limit),
+                (*_READABLE_LINK_STATUSES, cut, limit * 6),
             ).fetchall()
     except Exception:  # noqa: BLE001
         return []
     out = []
+    per_channel: dict = {}
     for r in rows:
+        if len(out) >= limit:
+            break
         link = queries._tg_link(r["username"], r["channel_id"], r["msg_id"])
         if not link:
             continue
+        if per_channel.get(r["channel_id"], 0) >= _READING_PER_CHANNEL:
+            continue
+        per_channel[r["channel_id"]] = per_channel.get(r["channel_id"], 0) + 1
         is_doc = r["media_type"] == "document"
+        text = " ".join((r["text"] or "").split())
+        link_title = r["link_title"]
+        # 본문이 짧고 기사 제목이 있으면 제목이 곧 내용. 긴 글은 본문 앞부분이 더 그 글답다.
+        use_title = bool(link_title) and len(text) <= 120
         out.append(
             {
-                "snippet": " ".join((r["text"] or "").split())[:60],
+                "snippet": link_title if use_title else text[:60],
                 "channel": r["channel"],
                 "forwards": r["forwards"],
                 "has_file": bool(r["file_name"]) and is_doc,
                 "file_name": r["file_name"] if is_doc else None,
                 "link": link,
+                "link_title": link_title,
+                "link_site": r["link_site"] if link_title else None,
+                "article_url": r["article_url"] if link_title else None,
             }
         )
     return out
@@ -1289,7 +1325,9 @@ def _format_briefing_ready(
         for r in reading[:5]:
             lines.append(f" · {r.get('snippet', '')}")
             fn = f" [{r.get('file_name')}]" if r.get("has_file") else ""
-            lines.append(f"   {r.get('channel', '')}{fn} {r.get('link', '')}")
+            # 기사 링크 글은 어느 매체 기사인지 붙인다(제목만 보고 고르는 사람에게 출처가 단서).
+            site = f" · {str(r.get('link_site'))[:20]}" if r.get("link_site") else ""
+            lines.append(f"   {r.get('channel', '')}{fn}{site} {r.get('link', '')}")
 
     return "\n".join(lines).rstrip()
 
