@@ -12,7 +12,7 @@ import re
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
-from telegram_lens import db
+from telegram_lens import db, links
 from telegram_lens.stocks import load_etf_codes
 
 _KST = ZoneInfo("Asia/Seoul")
@@ -94,7 +94,6 @@ def _take_per_segment(rows, top: int, key=lambda r: r["code"], name_key=None):
     return [r for s in SEGMENTS for r in buckets[s]]
 
 # 본문 속 URL. 공백·닫는 괄호·따옴표에서 끊고, 흔한 꼬리 구두점은 제거.
-_URL_RE = re.compile(r"https?://[^\s)\]>\"'》」』]+")
 
 
 def _tg_link(username: str | None, channel_id, msg_id) -> str | None:
@@ -116,17 +115,23 @@ def _media_field(media_type, file_name):
 
 
 def _extract_urls(text: str | None, limit: int = 5) -> list[str]:
-    """본문에서 URL 목록(중복 제거, 순서 보존). 샘플 텍스트가 잘려도 링크는 살아남게 별도 노출."""
-    if not text:
-        return []
-    out: list[str] = []
-    for u in _URL_RE.findall(text):
-        u = u.rstrip(".,;…·")
-        if u not in out:
-            out.append(u)
-        if len(out) >= limit:
-            break
-    return out
+    """본문에서 URL 목록(중복 제거, 순서 보존). 샘플 텍스트가 잘려도 링크는 살아남게 별도 노출.
+    링크 내용(제목·발췌)은 link_content 로 따로 붙는다(links.py)."""
+    return links.urls_in_text(text, limit=limit)
+
+
+def _attach_link_content(conn, items: list[dict], body_chars: int = 0) -> None:
+    """items(각각 '_rowid' 키를 가진 dict)에 link_content 를 붙이고 '_rowid' 를 뗀다.
+
+    링크가 없는 글은 빈 목록. body_chars>0 이면 발췌까지, 0 이면 제목·설명과
+    has_excerpt 만(목록 응답이 커지지 않게)."""
+    ids = [d.get("_rowid") for d in items]
+    try:
+        found = links.links_for_messages(conn, ids, body_chars=body_chars)
+    except Exception:  # noqa: BLE001 — 링크 조회 실패가 원문 조회를 막으면 안 됨
+        found = {}
+    for d in items:
+        d["link_content"] = found.get(d.pop("_rowid", None), [])
 
 
 def _cutoff(hours: float) -> str:
@@ -208,7 +213,7 @@ def _recent_snippets(
     params.append(n)
     rows = conn.execute(
         f"""
-        SELECT m.date, m.text, m.sentiment, m.msg_type, m.views, m.forwards,
+        SELECT m.id AS _rowid, m.date, m.text, m.sentiment, m.msg_type, m.views, m.forwards,
                m.fwd_from_chat_title, m.msg_id, m.channel_id, m.media_type, m.file_name,
                c.title AS channel, c.username
         FROM mentions men
@@ -226,6 +231,7 @@ def _recent_snippets(
             text = text[:180] + "…"
         out.append(
             {
+                "_rowid": r["_rowid"],
                 "date": _to_kst(r["date"]),
                 "channel": r["channel"],
                 "text": text,
@@ -239,6 +245,7 @@ def _recent_snippets(
                 "forwarded_from": r["fwd_from_chat_title"],
             }
         )
+    _attach_link_content(conn, out)
     return out
 
 
@@ -433,7 +440,7 @@ def stock_buzz(code: str, name: str, hours: float = 24, samples: int = 8) -> dic
 
         sample_rows = conn.execute(
             """
-            SELECT m.date, m.text, m.sentiment, m.msg_type, m.views, m.forwards,
+            SELECT m.id AS _rowid, m.date, m.text, m.sentiment, m.msg_type, m.views, m.forwards,
                    m.fwd_from_chat_title, m.msg_id, m.channel_id, m.media_type,
                    m.file_name, c.title AS channel, c.username
             FROM mentions men
@@ -446,19 +453,21 @@ def stock_buzz(code: str, name: str, hours: float = 24, samples: int = 8) -> dic
             (code, cut, samples),
         ).fetchall()
 
+        samples = []
+        for r in sample_rows:
+            d = dict(r)
+            d["date"] = _to_kst(d["date"])
+            d["links"] = _extract_urls(d.get("text"))
+            d["telegram_link"] = _tg_link(d.pop("username"), d.pop("channel_id"), d.pop("msg_id"))
+            d["media"] = _media_field(d.pop("media_type"), d.pop("file_name"))
+            samples.append(d)
+        _attach_link_content(conn, samples)
+
     summary = dict(agg) if agg else {}
     if summary:
         summary["spread_copies"] = summary["raw_messages"] - summary["independent"]
         summary["first_seen"] = _to_kst(summary.get("first_seen"))
         summary["last_seen"] = _to_kst(summary.get("last_seen"))
-    samples = []
-    for r in sample_rows:
-        d = dict(r)
-        d["date"] = _to_kst(d["date"])
-        d["links"] = _extract_urls(d.get("text"))
-        d["telegram_link"] = _tg_link(d.pop("username"), d.pop("channel_id"), d.pop("msg_id"))
-        d["media"] = _media_field(d.pop("media_type"), d.pop("file_name"))
-        samples.append(d)
     return {
         "code": code,
         "name": name,
@@ -912,12 +921,13 @@ def recent_messages(
     channel_username: str | None = None,
     hours: float = 6,
     limit: int = 30,
+    link_body: bool = False,
 ) -> list[dict]:
-    """원문 메시지 drill-down."""
+    """원문 메시지 drill-down. link_body=True 면 링크 발췌(본문)까지 싣는다."""
     cut = _cutoff(hours)
     with db.connect() as conn:
         cols = (
-            "m.date, m.text, m.sentiment, m.msg_type, m.views, m.forwards, "
+            "m.id AS _rowid, m.date, m.text, m.sentiment, m.msg_type, m.views, m.forwards, "
             "m.fwd_from_chat_title, m.msg_id, m.channel_id, m.media_type, m.file_name, "
             "c.title AS channel, c.username"
         )
@@ -941,15 +951,16 @@ def recent_messages(
                 """,
                 (cut, limit),
             ).fetchall()
-    out = []
-    for r in rows:
-        d = dict(r)
-        d["date"] = _to_kst(d["date"])
-        d["forwarded_from"] = d.pop("fwd_from_chat_title")
-        d["links"] = _extract_urls(d.get("text"))
-        d["telegram_link"] = _tg_link(d.pop("username"), d.pop("channel_id"), d.pop("msg_id"))
-        d["media"] = _media_field(d.pop("media_type"), d.pop("file_name"))
-        out.append(d)
+        out = []
+        for r in rows:
+            d = dict(r)
+            d["date"] = _to_kst(d["date"])
+            d["forwarded_from"] = d.pop("fwd_from_chat_title")
+            d["links"] = _extract_urls(d.get("text"))
+            d["telegram_link"] = _tg_link(d.pop("username"), d.pop("channel_id"), d.pop("msg_id"))
+            d["media"] = _media_field(d.pop("media_type"), d.pop("file_name"))
+            out.append(d)
+        _attach_link_content(conn, out, body_chars=links.BODY_MAX if link_body else 0)
     return out
 
 
@@ -962,17 +973,71 @@ def _fts_match_expr(tokens: list[str]) -> str:
     return " AND ".join('"' + t.replace('"', '""') + '"' for t in tokens)
 
 
+def _like_esc(t: str) -> str:
+    """LIKE 패턴용 이스케이프 — 와일드카드(%,_)를 문자 그대로 찾게 한다."""
+    return t.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+_SEARCH_COLS = (
+    "m.id AS _rowid, m.date, m.text, m.msg_id, m.channel_id, m.media_type, "
+    "m.file_name, c.title AS channel, c.username"
+)
+
+
+def _search_links(conn, tokens: list[str], cut: str, channel: str | None, limit: int,
+                  use_fts: bool):
+    """링크의 제목·설명·발췌에서 키워드가 맞는 글(messages 행). 본문 검색과 같은 규칙."""
+    if use_fts:
+        sql = f"""
+            SELECT DISTINCT {_SEARCH_COLS}
+            FROM links_fts f
+            JOIN message_links l ON l.id = f.rowid
+            JOIN messages m ON m.id = l.message_id
+            LEFT JOIN channels c ON c.id = m.channel_id
+            WHERE links_fts MATCH ? AND m.date >= ?
+        """
+        params: list = [_fts_match_expr(tokens), cut]
+    else:
+        sql = f"""
+            SELECT DISTINCT {_SEARCH_COLS}
+            FROM message_links l
+            JOIN messages m ON m.id = l.message_id
+            LEFT JOIN channels c ON c.id = m.channel_id
+            WHERE m.date >= ?
+        """
+        params = [cut]
+        for t in tokens:
+            pat = f"%{_like_esc(t)}%"
+            sql += (
+                " AND (COALESCE(l.title, '') LIKE ? ESCAPE '\\'"
+                " OR COALESCE(l.description, '') LIKE ? ESCAPE '\\'"
+                " OR COALESCE(l.body, '') LIKE ? ESCAPE '\\')"
+            )
+            params += [pat, pat, pat]
+    if channel:
+        sql += " AND c.username = ?"
+        params.append(channel)
+    sql += " ORDER BY m.date DESC LIMIT ?"
+    params.append(limit)
+    return conn.execute(sql, params).fetchall()
+
+
 def search_messages(
     query: str,
     hours: float = 72,
     limit: int = 30,
     channel: str | None = None,
+    in_links: bool = True,
+    link_body: bool = False,
 ) -> dict:
     """원문 메시지를 키워드로 전문검색. 종목 언급이 없는 거시·산업·테마 글도 잡힌다.
 
     토큰(공백 분리) 전부 3글자 이상이면 trigram FTS(인덱스, 빠름)를 쓰고,
     2글자 이하 토큰이 하나라도 있으면(금리·환율·관세 등) LIKE 폴백으로 정확성을
     지킨다. 여러 토큰은 모두 포함(AND)해야 매칭된다.
+
+    in_links=True 면 글에 붙은 링크의 제목·설명·발췌까지 뒤진다 — 본문은 제목 한 줄이고
+    내용은 기사 안에 있는 글을 잡는다. 결과의 matched_in 이 어디서 맞았는지 말한다.
     """
     tokens = query.split()
     if not tokens:
@@ -983,9 +1048,8 @@ def search_messages(
 
     with db.connect() as conn:
         if use_fts:
-            sql = """
-                SELECT m.date, m.text, m.msg_id, m.channel_id, m.media_type,
-                       m.file_name, c.title AS channel, c.username
+            sql = f"""
+                SELECT {_SEARCH_COLS}
                 FROM messages_fts f
                 JOIN messages m ON m.id = f.rowid
                 LEFT JOIN channels c ON c.id = m.channel_id
@@ -1000,12 +1064,10 @@ def search_messages(
             rows = conn.execute(sql, params).fetchall()
         else:
             # LIKE 폴백 — 토큰별 '%token%' AND. 와일드카드(%,_)는 ESCAPE 로 무력화.
-            def _esc(t: str) -> str:
-                return t.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            _esc = _like_esc
 
-            sql = """
-                SELECT m.date, m.text, m.msg_id, m.channel_id, m.media_type,
-                       m.file_name, c.title AS channel, c.username
+            sql = f"""
+                SELECT {_SEARCH_COLS}
                 FROM messages m
                 LEFT JOIN channels c ON c.id = m.channel_id
                 WHERE m.date >= ?
@@ -1021,29 +1083,45 @@ def search_messages(
             params.append(limit)
             rows = conn.execute(sql, params).fetchall()
 
-    from telegram_lens.extract import extract_mentions
+        # 본문에서 맞은 글 + 링크 내용에서 맞은 글을 합쳐 최신순 limit 개. 둘 다 맞으면 본문.
+        by_id: dict[int, tuple] = {}
+        for r in rows:
+            by_id[r["_rowid"]] = (r, "text")
+        if in_links:
+            try:
+                link_rows = _search_links(conn, tokens, cut, channel, limit, use_fts)
+            except Exception:  # noqa: BLE001 — 링크 검색 실패가 본문 검색을 막으면 안 됨
+                link_rows = []
+            for r in link_rows:
+                by_id.setdefault(r["_rowid"], (r, "link"))
+        merged = sorted(by_id.values(), key=lambda x: x[0]["date"], reverse=True)[:limit]
 
-    out = []
-    codes: list[str] = []  # 검색 결과에 등장한 종목코드(첫 등장 순서, 중복 제거)
-    for r in rows:
-        full = r["text"] or ""
-        for code, _ in extract_mentions(full):
-            if code not in codes:
-                codes.append(code)
-        text = " ".join(full.split())
-        if len(text) > 300:
-            text = text[:300] + "…"
-        out.append(
-            {
-                "date": _to_kst(r["date"]),
-                "channel": r["channel"],
-                "username": r["username"],
-                "text": text,
-                "links": _extract_urls(full),
-                "telegram_link": _tg_link(r["username"], r["channel_id"], r["msg_id"]),
-                "media": _media_field(r["media_type"], r["file_name"]),
-            }
-        )
+        from telegram_lens.extract import extract_mentions
+
+        out = []
+        codes: list[str] = []  # 검색 결과에 등장한 종목코드(첫 등장 순서, 중복 제거)
+        for r, where in merged:
+            full = r["text"] or ""
+            for code, _ in extract_mentions(full):
+                if code not in codes:
+                    codes.append(code)
+            text = " ".join(full.split())
+            if len(text) > 300:
+                text = text[:300] + "…"
+            out.append(
+                {
+                    "_rowid": r["_rowid"],
+                    "date": _to_kst(r["date"]),
+                    "channel": r["channel"],
+                    "username": r["username"],
+                    "text": text,
+                    "matched_in": where,
+                    "links": _extract_urls(full),
+                    "telegram_link": _tg_link(r["username"], r["channel_id"], r["msg_id"]),
+                    "media": _media_field(r["media_type"], r["file_name"]),
+                }
+            )
+        _attach_link_content(conn, out, body_chars=links.BODY_MAX if link_body else 0)
     # 이어달리기용 코드 배열은 시장별로 나눈다 — 받는 쪽 도구가 다르다
     # (국내 6자리는 StockLens get_multi_stocks, 미국 티커는 get_us_multi_price).
     kr = [c for c in codes if market_of(c) == "KR"]

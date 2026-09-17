@@ -26,7 +26,13 @@ from logging.handlers import RotatingFileHandler
 
 from telethon import events
 
-from telegram_lens import commands, db, procstate
+# 링크 읽기(links.py)가 httpx 를 쓴다 — TLS 신뢰 기준(OS 인증서 저장소)을 먼저 세운다.
+# 서버 프로세스는 server.py 가 하지만 데몬은 별도 프로세스라 여기서 따로 해야 한다.
+from telegram_lens import _tls as _tls_bootstrap
+
+_tls_bootstrap.apply()
+
+from telegram_lens import commands, db, links, procstate  # noqa: E402
 from telegram_lens.client import (
     LOGIN_REQUIRED_MESSAGE,
     connect_with_timeout,
@@ -764,9 +770,10 @@ async def _loop(
             catching_up = await _run_cycle(
                 status, interval_min, min_window, max_window, per_channel_limit
             )
-            # 정상 사이클에서만 정리(백필/캐치업 중엔 부하 안 주기 위해 건너뜀).
+            # 정상 사이클에서만 정리·링크 읽기(백필/캐치업 중엔 부하 안 주기 위해 건너뜀).
             if not catching_up:
                 _run_maintenance()
+                await _fetch_links(status)
             await _idle_listen(interval_min)
     finally:
         # 종료 경로(정상완료/예외/SIGTERM) 어디서든 반드시: beat_task 정리 → 최종 상태 기록.
@@ -778,6 +785,40 @@ async def _loop(
         status["heartbeat_at"] = _now_iso()
         _persist_status(status)
         _LOG.info("데몬 종료.")
+
+
+async def _fetch_links(status: dict) -> None:
+    """정상 사이클 끝에 아직 안 읽은 링크를 읽어 제목·발췌를 채운다(links.fetch_pending).
+
+    별도 스레드에서 돌려 하트비트를 막지 않고, 상한(사이클당 개수·시간)을 넘기면 다음
+    사이클에 이어서 한다. 실패해도 수집·명령 처리에는 영향이 없다.
+    TELEGRAMLENS_LINK_FETCH=0 이면 끈다(외부 접속이 막힌 PC 등).
+    """
+    if os.environ.get("TELEGRAMLENS_LINK_FETCH", "1") == "0":
+        return
+
+    def _work() -> dict:
+        with db.connect() as conn:
+            return links.fetch_pending(conn)
+
+    try:
+        counts = await asyncio.wait_for(
+            asyncio.to_thread(_work), timeout=links.CYCLE_DEADLINE_SEC + 60
+        )
+    except asyncio.TimeoutError:
+        _LOG.warning("링크 읽기 — 제한 시간을 넘겨 중단(다음 사이클에 계속)")
+        return
+    except Exception as e:  # noqa: BLE001 — 링크 읽기 실패가 데몬을 죽이면 안 됨
+        _LOG.warning("링크 읽기 실패: %s: %s", type(e).__name__, e)
+        return
+    if counts.get("fetched"):
+        _LOG.info(
+            "링크 읽기 — %d개(발췌 %d·제목만 %d·실패 %d), 남은 %d",
+            counts["fetched"], counts["ok"], counts["title_only"], counts["failed"],
+            counts["remaining"],
+        )
+    status["links"] = {**counts, "at": _now_iso()}
+    _persist_status(status)
 
 
 def _install_signal_handlers() -> None:

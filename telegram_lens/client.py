@@ -16,10 +16,12 @@ from telethon.errors import FloodWaitError
 from telethon.tl.types import (
     Channel,
     Chat,
+    MessageEntityTextUrl,
     MessageMediaWebPage,
     PeerChannel,
     PeerChat,
     PeerUser,
+    WebPage,
 )
 
 from telegram_lens import db
@@ -371,6 +373,7 @@ async def _collect_one_channel(
                 "fwd_from_date": _iso(getattr(fwd, "date", None)),
                 "media_type": media_type,
                 "file_name": file_name,
+                "links": _link_meta(msg),
             }
         )
     return out
@@ -405,6 +408,35 @@ def _media_meta(msg) -> tuple[str | None, str | None]:
     except Exception:  # noqa: BLE001 — 미디어 메타 파싱 실패는 무시(텍스트 수집이 우선)
         pass
     return None, None
+
+
+def _link_meta(msg) -> list[dict]:
+    """글자 뒤에 숨은 링크(텍스트 엔티티 URL)와 링크 미리보기 메타(제목·설명·사이트명).
+
+    본문에 그대로 적힌 주소는 sync 가 본문에서 뽑으므로 여기선 안 다룬다. 다운로드 없음 —
+    Telethon 이 메시지와 함께 이미 준 것만 읽는다(links.record_message_links 의 extra).
+    """
+    out: list[dict] = []
+    try:
+        for ent in getattr(msg, "entities", None) or []:
+            if isinstance(ent, MessageEntityTextUrl) and getattr(ent, "url", None):
+                out.append({"url": ent.url, "source": "entity"})
+        media = getattr(msg, "media", None)
+        if isinstance(media, MessageMediaWebPage):
+            wp = getattr(media, "webpage", None)
+            if isinstance(wp, WebPage) and getattr(wp, "url", None):
+                out.append(
+                    {
+                        "url": wp.url,
+                        "source": "preview",
+                        "title": getattr(wp, "title", None),
+                        "description": getattr(wp, "description", None),
+                        "site": getattr(wp, "site_name", None),
+                    }
+                )
+    except Exception:  # noqa: BLE001 — 링크 메타 파싱 실패는 무시(텍스트 수집이 우선)
+        pass
+    return out
 
 
 def _iso(dt) -> str | None:

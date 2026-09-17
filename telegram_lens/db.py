@@ -30,7 +30,9 @@ from telegram_lens.config import db_path
 #   v2 = 포워드 메타·views/forwards·sentiment/msg_type 컬럼 + tier/baseline/views_log 테이블
 #   v3 = cluster_id/text_sig 컬럼(중복제거·원본추적) + 인덱스
 #   v4 = media_type/file_name 컬럼(첨부 파일·이미지 인지)
-_SCHEMA_VERSION = 4
+#   v5 = message_links 테이블 + links_fts(링크 제목·발췌 검색). 컬럼 추가 없음 —
+#        executescript 가 표를 만들고, 링크 행 백필은 sync 가 마커로 1회 한다.
+_SCHEMA_VERSION = 5
 
 # messages 에 v2 에서 추가된 컬럼(이름 → 선언). 신규 설치는 _SCHEMA 가, 기존 DB는
 # _migrate 의 ALTER 가 채운다. 한 곳에서 관리해 둘이 어긋나지 않게 한다.
@@ -173,6 +175,56 @@ CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE OF text ON messages BEGIN
     INSERT INTO messages_fts(messages_fts, rowid, text) VALUES('delete', old.id, old.text);
     INSERT INTO messages_fts(rowid, text) VALUES (new.id, new.text);
 END;
+
+-- v5: 글에 붙은 링크와 그 내용(links.py). 글 하나에 주소 하나가 한 행. 본문 발췌(body)는
+-- BODY_MAX 자 상한이고 보존창이 지나면 messages.text 처럼 비운다.
+--   source = text(본문 주소) | entity(글자 뒤 숨은 링크) | preview(미리보기만)
+--   kind   = article | dart | disclosure | telegram | video | social | file
+--   status = pending | ok | title_only | skipped | failed | expired
+CREATE TABLE IF NOT EXISTS message_links (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    message_id  INTEGER NOT NULL,
+    channel_id  INTEGER NOT NULL,
+    msg_date    TEXT NOT NULL,                -- messages.date 복제(최신 우선 읽기·보존 정리)
+    url         TEXT NOT NULL,
+    source      TEXT NOT NULL,
+    final_url   TEXT,                         -- 리다이렉트 끝(단축주소 풀린 곳)
+    kind        TEXT NOT NULL,
+    status      TEXT NOT NULL,
+    fail_reason TEXT,
+    site        TEXT,
+    title       TEXT,
+    description TEXT,
+    body        TEXT,
+    dart_rcp_no TEXT,
+    fetched_at  TEXT,
+    UNIQUE(message_id, url),
+    FOREIGN KEY(message_id) REFERENCES messages(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_links_status ON message_links(status, msg_date);
+CREATE INDEX IF NOT EXISTS idx_links_message ON message_links(message_id);
+CREATE INDEX IF NOT EXISTS idx_links_url ON message_links(url);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS links_fts USING fts5(
+    title, description, body,
+    content='message_links',
+    content_rowid='id',
+    tokenize='trigram'
+);
+CREATE TRIGGER IF NOT EXISTS links_ai AFTER INSERT ON message_links BEGIN
+    INSERT INTO links_fts(rowid, title, description, body)
+        VALUES (new.id, new.title, new.description, new.body);
+END;
+CREATE TRIGGER IF NOT EXISTS links_ad AFTER DELETE ON message_links BEGIN
+    INSERT INTO links_fts(links_fts, rowid, title, description, body)
+        VALUES('delete', old.id, old.title, old.description, old.body);
+END;
+CREATE TRIGGER IF NOT EXISTS links_au AFTER UPDATE OF title, description, body ON message_links BEGIN
+    INSERT INTO links_fts(links_fts, rowid, title, description, body)
+        VALUES('delete', old.id, old.title, old.description, old.body);
+    INSERT INTO links_fts(rowid, title, description, body)
+        VALUES (new.id, new.title, new.description, new.body);
+END;
 """
 
 
@@ -244,6 +296,10 @@ def prune_raw_content(retention_days: int, conn: sqlite3.Connection) -> int:
     )
     blanked = cur.rowcount
     conn.execute("DELETE FROM message_views_log WHERE captured_at < ?", (cutoff,))
+    # 링크 제목·발췌도 같은 창으로 비운다(행은 남김 — links.py).
+    from telegram_lens import links as _links
+
+    _links.prune_link_content(conn, cutoff)
     return blanked
 
 

@@ -101,7 +101,8 @@ MCP 서버)가 종료되면 함께 정리된다.
 | `telegram_momentum(hours, baseline_hours)` | 언급 급증 종목 — 새 내러티브 포착 |
 | `telegram_stock_buzz(query, hours)` | 특정 종목 언급 요약 + 원문 샘플 |
 | `telegram_messages(channel, hours)` | 원문 메시지 drill-down (채널·시간) |
-| `telegram_search(query, hours, channel)` | 원문 키워드 전문검색 — 종목 언급 없는 거시·산업·테마 글까지 |
+| `telegram_search(query, hours, channel)` | 원문 키워드 전문검색 — 종목 언급 없는 거시·산업·테마 글까지. 글에 붙은 링크의 제목·발췌까지 검색 |
+| `telegram_link_content(url)` | 글에 붙은 링크 하나의 제목·설명·본문 발췌(수집기가 미리 읽어 둠, 없으면 그 자리에서 읽음) |
 | `telegram_channels()` | 수집된 채널 목록 |
 | `telegram_status()` | 로그인·수집 상태 |
 

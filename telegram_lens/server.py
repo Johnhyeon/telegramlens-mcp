@@ -24,7 +24,7 @@ _tls_bootstrap.apply()
 
 from telegram_lens._tool_schema import LensFastMCP  # noqa: E402
 
-from telegram_lens import db, discover, market_clock, queries
+from telegram_lens import db, discover, links, market_clock, queries
 from telegram_lens.classify import run_classification
 from telegram_lens._metrics import track_metrics
 from telegram_lens import _result_meta as rmeta
@@ -523,7 +523,9 @@ mcp = LensFastMCP(
 - telegram_timeline : 특정 종목의 버즈 전개(최초 언급→시간대별 확산→베이스라인 배율)
 - telegram_stock_buzz : 특정 종목의 언급 요약 + 원문 샘플
 - telegram_messages : 원문 메시지 drill-down (채널·시간 범위)
-- telegram_search : 원문 키워드 전문검색 — 종목 언급이 없는 거시·산업·테마 글까지 찾음
+- telegram_search : 원문 키워드 전문검색 — 종목 언급이 없는 거시·산업·테마 글까지 찾음.
+  글에 붙은 링크의 제목·발췌까지 뒤진다(matched_in 이 "link"면 링크 내용에서 맞은 것)
+- telegram_link_content : 링크 하나의 제목·설명·본문 발췌(글에 붙은 기사·블로그를 열어 읽은 것)
 - telegram_channels : 추적 중인 채널 목록 (tier·weight 포함)
 - telegram_set_tier : 채널 성격(analyst/research/info/gossip) 수동 분류
 - telegram_status : 로그인·수집 상태 (backfill_offer 가 있으면 아래 참고)
@@ -536,6 +538,15 @@ mcp = LensFastMCP(
 - telegram_link: 그 메시지의 텔레그램 딥링크(t.me/...) — 원문·첨부를 바로 열어볼 수 있음
 - media: 첨부 인지 {type: photo|document|webpage, file_name}. 리포트 PDF·차트 이미지가 있으면
   표시되니, 본문에 안 담긴 내용은 telegram_link 로 안내하라(다운로드·본문읽기는 안 함)
+- link_content: 글에 붙은 링크마다 {url, kind, status, site, title, description, excerpt|has_excerpt,
+  dart_rcp_no}. 수집기가 링크를 열어 제목·설명·본문 발췌(최대 2,000자)를 미리 읽어 둔 것이다.
+  본문이 제목 한 줄뿐인 글은 여기가 내용이다 — '왜'를 답할 때 원문과 같은 자격의 근거로 쓴다.
+  · status: ok(발췌 있음) / title_only(제목만 — 유료벽·본문 못 찾음) / pending(아직 안 읽음,
+    10분 주기로 채워짐) / skipped(안 읽는 종류) / failed(읽기 실패) / expired(오래된 글)
+  · kind=dart 면 dart_rcp_no 가 있다 → 공시 내용은 DartLens get_disclosure_detail 로 읽어라.
+  · 목록 응답엔 excerpt 를 싣지 않고 has_excerpt 만 준다. 발췌가 필요하면 telegram_messages /
+    telegram_search 에 link_body=true 를 주거나, 링크 하나면 telegram_link_content(url).
+  · pending 인 링크를 지금 읽어야 하면 telegram_link_content(url) — 그 자리에서 읽어 저장한다.
 - baseline_ratio: 지금 창의 하루 평균 독립 언급 / 최근 7일 하루 평균 독립 언급(1 초과면 평소보다
   활발). 7일 평균은 실제로 수집된 날수(baseline_days_covered)로 나눈다. 3일 미만이면 null.
 - momentum 의 spike 는 배율이라 기준 구간에 언급이 없으면 null 이다. is_new=true 는 기준 구간을
@@ -1623,16 +1634,23 @@ async def telegram_stock_buzz(query: str, hours: float = 24, samples: int = 8) -
 @warn_if_collecting
 @track_metrics("telegram_messages")
 async def telegram_messages(
-    channel: str | None = None, hours: float = 6, limit: int = 30
+    channel: str | None = None, hours: float = 6, limit: int = 30, link_body: bool = False
 ) -> str:
     """원문 메시지를 그대로 조회합니다(drill-down).
+
+    글마다 link_content(글에 붙은 링크의 제목·설명, 발췌 유무)가 붙습니다.
 
     Args:
         channel: 채널 username(@ 제외). 생략 시 전체 채널.
         hours: 시간 범위(시간). 기본 6.
         limit: 최대 메시지 수. 기본 30.
+        link_body: true 면 링크 본문 발췌(최대 2,000자)까지 싣습니다. 기본 false(제목·설명만).
     """
-    return _json(queries.recent_messages(channel_username=channel, hours=hours, limit=limit))
+    return _json(
+        queries.recent_messages(
+            channel_username=channel, hours=hours, limit=limit, link_body=link_body
+        )
+    )
 
 
 @mcp.tool()
@@ -1640,21 +1658,86 @@ async def telegram_messages(
 @warn_if_collecting
 @track_metrics("telegram_search")
 async def telegram_search(
-    query: str, hours: float = 72, limit: int = 30, channel: str | None = None
+    query: str,
+    hours: float = 72,
+    limit: int = 30,
+    channel: str | None = None,
+    in_links: bool = True,
+    link_body: bool = False,
 ) -> str:
     """원문 메시지를 키워드/주제로 전문검색합니다('내용' 축 도구).
 
     종목코드가 안 붙은 거시·산업·테마 글도 본문 키워드로 찾습니다(예: "반도체 HBM",
     "금리 인하"). 여러 단어는 공백 구분 AND 매칭, 3글자 이상이 정확·빠름.
+    글에 붙은 링크의 제목·설명·발췌까지 함께 뒤집니다 — 본문은 제목 한 줄이고 내용은
+    기사 안에 있는 글도 잡힙니다(결과의 matched_in: "text" | "link").
 
     Args:
         query: 검색 키워드(여러 단어는 공백 구분, AND 매칭).
         hours: 검색 시간 범위(시간). 기본 72.
         limit: 최대 결과 수. 기본 30.
         channel: 특정 채널 username(@ 제외)으로 한정. 생략 시 전체.
+        in_links: 링크 내용(제목·설명·발췌)까지 검색. 기본 true.
+        link_body: true 면 결과에 링크 본문 발췌까지 싣습니다. 기본 false(제목·설명만).
     """
-    result = queries.search_messages(query=query, hours=hours, limit=limit, channel=channel)
+    result = queries.search_messages(
+        query=query, hours=hours, limit=limit, channel=channel,
+        in_links=in_links, link_body=link_body,
+    )
     result["_meta"] = _tl_meta(hours=hours)
+    return _json(result)
+
+
+@mcp.tool()
+@safe_tool
+@track_metrics("telegram_link_content")
+async def telegram_link_content(url: str) -> str:
+    """텔레그램 글에 붙은 링크 하나의 내용(제목·설명·본문 발췌)을 돌려줍니다.
+
+    수집기가 이미 읽어 둔 것이 있으면 그것을, 아직 안 읽은(pending) 링크나 처음 보는
+    주소면 지금 열어 읽습니다(몇 초). 발췌는 최대 2,000자이고 기사 전문이 아닙니다.
+    DART 공시 링크는 읽지 않고 dart_rcp_no 만 줍니다 → DartLens 로 읽으세요.
+    결과의 referenced_by 는 이 링크를 단 텔레그램 글(최근 5개)입니다.
+
+    Args:
+        url: 링크 주소(글의 links / link_content.url 에 있는 그대로).
+    """
+    target = links.clean_url(url)
+    if not target.startswith(("http://", "https://")):
+        return "⚠️ http(s):// 로 시작하는 주소를 주세요."
+
+    def _work() -> dict:
+        now_iso = datetime.now(timezone.utc).isoformat()
+        with db.connect() as conn:
+            row = links.link_by_url(conn, target)
+            fetched_now = False
+            if row is None or row["status"] == links.ST_PENDING:
+                res = links.fetch_url(target)
+                fetched_now = True
+                if row is not None:
+                    links.apply_result(conn, row["id"], res, now_iso)
+                    row = links.link_by_url(conn, target)
+                    content = links.public_view(row, links.BODY_MAX)
+                else:
+                    content = links.public_view({"url": target, **res}, links.BODY_MAX)
+            else:
+                content = links.public_view(row, links.BODY_MAX)
+            refs = []
+            for r in links.messages_referencing(conn, target):
+                refs.append(
+                    {
+                        "date": queries._to_kst(r["date"]),
+                        "channel": r["channel"],
+                        "text": " ".join((r["text"] or "").split())[:120],
+                        "telegram_link": queries._tg_link(
+                            r["username"], r["channel_id"], r["msg_id"]
+                        ),
+                    }
+                )
+        return {"url": target, "fetched_now": fetched_now, "content": content,
+                "referenced_by": refs}
+
+    result = await asyncio.to_thread(_work)
     return _json(result)
 
 

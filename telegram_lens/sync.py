@@ -18,7 +18,7 @@ from telegram_lens.client import (
     make_client,
     refresh_views,
 )
-from telegram_lens import cluster, db
+from telegram_lens import cluster, db, links
 from telegram_lens.config import data_dir
 from telegram_lens.extract import extract_mentions
 from telegram_lens.tagging import seed_channel_tiers, tag_msg_type, tag_sentiment
@@ -205,6 +205,7 @@ async def run_sync(
 
     new_messages = 0
     new_mentions = 0
+    new_links = 0
     new_channels = [c for c in channels_meta if c["id"] not in known_ids]
 
     with db.connect() as conn:
@@ -263,6 +264,14 @@ async def run_sync(
                     conn, msg_rowid, r["channel_id"], r["date"], mentions
                 )
                 new_mentions += len(mentions)
+            # 글에 붙은 링크 행(본문 주소·숨은 링크·미리보기 메타). 읽기는 데몬이 따로 한다.
+            try:
+                new_links += links.record_message_links(
+                    conn, msg_rowid, r["channel_id"], r["date"], r["text"],
+                    r.get("links"), now=now,
+                )
+            except Exception:  # noqa: BLE001 — 링크 기록 실패가 수집을 막으면 안 됨
+                pass
 
         # 업그레이드 이전 메시지 text_sig 1회 백필 + 그 구간 휴리스틱 병합(마커로 1회 게이트).
         sig_backfilled = 0
@@ -273,6 +282,22 @@ async def run_sync(
             cluster.merge_heuristic_duplicates(conn, window_min=30, since_iso=hist_since)
             try:
                 marker.write_text(
+                    datetime.now(timezone.utc).isoformat(), encoding="utf-8"
+                )
+            except OSError:
+                pass
+
+        # 업그레이드 이전 글의 본문 주소로 링크 행 1회 백필(읽기 대상 창만큼만).
+        links_backfilled = 0
+        lmarker = data_dir() / "links_backfilled"
+        if not lmarker.exists():
+            l_since = (now - timedelta(days=links.PENDING_MAX_AGE_DAYS)).isoformat()
+            try:
+                links_backfilled = links.backfill_from_messages(conn, l_since)
+            except Exception:  # noqa: BLE001 — 백필 실패가 수집을 막으면 안 됨
+                links_backfilled = 0
+            try:
+                lmarker.write_text(
                     datetime.now(timezone.utc).isoformat(), encoding="utf-8"
                 )
             except OSError:
@@ -301,6 +326,8 @@ async def run_sync(
         "fetched": len(rows),
         "new_messages": new_messages,
         "new_mentions": new_mentions,
+        "new_links": new_links,
+        "links_backfilled": links_backfilled,
         "channels": len(channels_meta),
         "channel_stats": channel_stats,
         "new_channels": len(new_channels),

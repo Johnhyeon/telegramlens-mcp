@@ -137,8 +137,8 @@ class CallThroughServerTests(unittest.IsolatedAsyncioTestCase):
             await mcp.call_tool("telegram_search", {"query": "반도체", "hours": 72, "limit": 12})
             await mcp.call_tool("telegram_search", {"query": "반도체", "channel": 12345})
         first, second = search.call_args_list
-        self.assertEqual(first.kwargs, {"query": "반도체", "hours": 72, "limit": 12,
-                                        "channel": None})
+        core = {k: first.kwargs[k] for k in ("query", "hours", "limit", "channel")}
+        self.assertEqual(core, {"query": "반도체", "hours": 72, "limit": 12, "channel": None})
         self.assertEqual(second.kwargs["channel"], "12345")
 
 if __name__ == "__main__":
