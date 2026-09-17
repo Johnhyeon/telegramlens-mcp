@@ -100,7 +100,7 @@ class UsExtractionTests(unittest.TestCase):
 class BuzzStatusTests(unittest.IsolatedAsyncioTestCase):
     """수용 2·요구 2: 지원 0건 / 미지원 / 사전 없음을 다른 상태로 돌려준다."""
 
-    async def _buzz(self, query):
+    async def _buzz(self, query, independent=0, raw_messages=0):
         from telegram_lens import server
 
         async def run():
@@ -108,14 +108,19 @@ class BuzzStatusTests(unittest.IsolatedAsyncioTestCase):
 
         # 라이선스 게이트·ETF 목록은 이 테스트의 대상이 아니다 - 깨끗한 환경
         # (라이선스 없음, 로컬 DB 없음)에서도 상태 구분 로직만 검증한다.
+        # 가짜 결과는 queries.stock_buzz 의 실제 모양을 따른다 - 건수는 summary 안에 있다.
+        # 예전 가짜는 건수를 최상위에 둬서, 서버가 엉뚱한 자리를 읽는 버그를 가렸다.
         with patch.object(server, "is_licensed", lambda: True), \
              patch.object(server, "_collecting_notice", lambda: None), \
              patch.object(server, "load_etf_codes", lambda: set()), \
              patch.object(server, "load_stocks", lambda: {"005930": "삼성전자"}), \
              patch.object(server.queries, "stock_buzz",
                           lambda code, name, hours, samples: {
-                              "code": code, "name": name,
-                              "independent": 0, "raw_messages": 0, "samples": []}):
+                              "code": code, "name": name, "window_hours": hours,
+                              "summary": {"independent": independent,
+                                          "raw_messages": raw_messages,
+                                          "channels": 1 if independent else 0},
+                              "samples": []}):
             return json.loads(await run())
 
     async def test_supported_us_zero_mentions_is_distinct(self):
@@ -123,6 +128,13 @@ class BuzzStatusTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(out["entity_status"], "supported_but_zero_mentions")
         self.assertEqual(out["market"], "US")
         self.assertIn("무언급", out["status_note"])
+
+    async def test_supported_with_mentions_is_not_zero(self):
+        """언급이 있으면 '무언급' 라벨이 붙으면 안 된다(실측: 20건인데 무언급으로 나감)."""
+        out = await self._buzz("005930", independent=20, raw_messages=21)
+        self.assertEqual(out["entity_status"], "supported")
+        self.assertNotIn("status_note", out)
+        self.assertEqual(out["summary"]["independent"], 20)
 
     async def test_unknown_name_is_entity_not_found(self):
         from telegram_lens import server

@@ -1479,7 +1479,10 @@ async def telegram_stock_buzz(query: str, hours: float = 24, samples: int = 8) -
     if isinstance(result, dict):
         result["is_etf"] = code in load_etf_codes()
         result["market"] = ent["market"]
-        zero = not (result.get("independent") or result.get("raw_messages"))
+        # 건수는 summary 안에 있다(queries.stock_buzz). 최상위에서 읽으면 늘 None 이라
+        # 언급이 수십 건인 종목도 '무언급'으로 나갔다.
+        summary = result.get("summary") or {}
+        zero = not (summary.get("independent") or summary.get("raw_messages"))
         if zero:
             # 지원 종목의 0건은 무언급이지 미지원이 아니다(수용 2).
             result["entity_status"] = "supported_but_zero_mentions"
